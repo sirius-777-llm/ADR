@@ -1,0 +1,16 @@
+# ADR (Automated Documentary Rendering)
+# V8.1 Whisper Velocity-Curve Cinematic Pipeline
+
+This skill describes the ADR V8.1 pipeline.
+- Script: Gemini 3.1 Flash Lite (Spielberg, 3x retry) + Gemini 3.1 Flash (Historian + Jiang Wen)
+- Voice Selection: Gemini 3.1 Flash picks speaker based on topic/emotion
+- Voiceover: WeryAI Podcast API (single master track, 5x retry)
+- Timeline: Whisper ASR (base, auto-download) → char_time_map → velocity-curve interpolation
+- Image: WeryAI GEMINI_3_1_FLASH_IMAGE (20-thread parallel, 3x retry)
+- BGM: WeryAI music generation (Gemini prompt)
+- Render: ffmpeg concat demuxer + ASS subtitles + J-Cut (-itsoffset)
+- Cinematic timing: image -> +0.2s subtitle -> +0.5s audio
+- Delivery: Telegram + AI social copy + one-click copy button
+
+To run:
+`python3 run_adr_v8.py "主题"`

@@ -1,0 +1,20 @@
+.env
+.env.*
+!.env.example
+*.pyc
+__pycache__/
+*.bak
+*.log
+/output/
+/tmp/
+# 密钥/token 类安全兜底（任何包含这些字符串的文件都不提交）
+*secret*
+*_token*
+*.key
+*.pem
+credentials.json
+# 历史实验脚本（硬编码风险）
+img2img_*.py
+gen_covers*.py
+tts_gen*.py
+_patch_*.py
