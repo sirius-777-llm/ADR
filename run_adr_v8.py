@@ -1105,10 +1105,11 @@ def step2_master_voice(script: list[dict], speaker_id: str = "liyan2-ef9401ec", 
     return voice_path
 
 
-# ── 第三步 + 第四步 + 第五步：时间轴计算（Whisper + 影视剪辑节奏）──────────
-# 影视三层感知节奏：画面先出 → 字幕跟上 → 配音响起
-AUDIO_DELAY = 0.5   # 配音比画面晚 0.5s（-itsoffset 控制）
-SUB_DELAY   = 0.2   # 字幕比画面晚 0.2s（比配音早 0.3s，给眼睛预读时间）
+# ── 第三步 + 第四步 + 第五步：时间轴计算（Whisper + 同步优先剪辑节奏）────────
+# 默认严格音画同步；如需电影感 J-Cut，可通过环境变量手动开启：
+#   ADR_AUDIO_DELAY=0.5 ADR_SUB_DELAY=0.2 python3 run_adr_v8.py "主题"
+AUDIO_DELAY = float(os.environ.get("ADR_AUDIO_DELAY", "0.0"))  # 配音延迟秒数（-itsoffset 控制）
+SUB_DELAY   = float(os.environ.get("ADR_SUB_DELAY", "0.0"))    # 字幕延迟秒数
 
 
 # ── silencedetect 校准工具 ──────────────────────────────────────────────
