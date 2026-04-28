@@ -1424,6 +1424,20 @@ def _wait_approval(idx: int, timeout: int = 300) -> bool:
     return True
 
 
+def _render_still_segment(scene: dict, timeout: int = 30) -> None:
+    """Render one still image into its timed video segment."""
+    dur = scene["vid_duration"]
+    ffmpeg(
+        "-loop", "1", "-framerate", "24", "-t", str(dur),
+        "-i", scene["img_path"],
+        "-vf", f"scale={VIDEO_W}:{VIDEO_H}:force_original_aspect_ratio=increase,crop={VIDEO_W}:{VIDEO_H},setsar=1",
+        "-c:v", "libx264", "-crf", "23", "-preset", "ultrafast",
+        "-pix_fmt", "yuv420p", "-an",
+        scene["vid_path"],
+        timeout=timeout,
+    )
+
+
 def generate_image(scene: dict, idx: int, _max_retries: int = 3) -> int:
     last_err = None
     for attempt in range(_max_retries):
@@ -1458,18 +1472,10 @@ def generate_image(scene: dict, idx: int, _max_retries: int = 3) -> int:
                 continue
             raise RuntimeError(f"图片 {idx+1} 重试 {_max_retries} 次仍失败：{last_err}")
 
-    dur = scene["vid_duration"]
     # ★ timeout=30s：单图转视频段超过 30s 即视为图损坏（如 img_13 PNG header 错误让 parser 死循环）
     # ★ ffmpeg 失败 → generate_image 抛 RuntimeError → step6 fallback 用相邻图顶替（不卡管线）
-    ffmpeg(
-        "-loop", "1", "-framerate", "24", "-t", str(dur),
-        "-i", scene["img_path"],
-        "-vf", f"scale={VIDEO_W}:{VIDEO_H}:force_original_aspect_ratio=increase,crop={VIDEO_W}:{VIDEO_H},setsar=1",
-        "-c:v", "libx264", "-crf", "23", "-preset", "ultrafast",
-        "-pix_fmt", "yuv420p", "-an",
-        scene["vid_path"],
-        timeout=30,
-    )
+    _render_still_segment(scene)
+    dur = scene["vid_duration"]
     tg(f"🖼 图片 {idx+1} 生成完毕（{scene['emotion']}）→ 转视频 {dur:.2f}s ✓")
     return idx
 
@@ -1556,8 +1562,9 @@ def step6_parallel(script: list[dict], topic: str) -> str | None:
 
     MAX_REDO = 3
     bgm_tone = script[0].get("tone", "中性") if script else "中性"
+    media_workers = max(2, min(20, int(os.environ.get("ADR_MEDIA_WORKERS", "6"))))
     # BGM 后台启动，不阻塞审批
-    with ThreadPoolExecutor(max_workers=20) as ex:
+    with ThreadPoolExecutor(max_workers=media_workers) as ex:
         bgm_fut = ex.submit(generate_bgm, topic, bgm_tone)
 
         # 图片：每张生成完立刻审批，不等全部完成
@@ -1600,6 +1607,7 @@ def step6_parallel(script: list[dict], topic: str) -> str | None:
                 dst = str(OUTPUT_DIR / f"img_{idx}.jpg")
                 try:
                     shutil.copy(src, dst)
+                    _render_still_segment(script[idx])
                     log(f"[fallback] img_{idx} 被审核/失败，复用 img_{fallback_idx} 兜底")
                     tg(f"⚠️ 图 {idx+1} 被审核拦截或失败，复用图 {fallback_idx+1} 兜底继续（主题建议避开敏感书名/人名/符号）")
                     completed[idx] = True
