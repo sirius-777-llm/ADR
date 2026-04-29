@@ -203,10 +203,40 @@ def tg(msg: str):
         log(f"TG 推送失败: {e}")
 
 
-# 全局节流：任意两次 WeryAI POST 请求间隔 >= 2s，防止多线程并发触发限流
+# 全局节流：任意两次 WeryAI POST 请求轻微错峰，避免多线程精确同一时刻打上游。
 _api_lock = threading.Lock()
 _api_last_ts = 0.0
 API_MIN_INTERVAL = 0.2  # 真并发：WeryAI 支持 20 并发，错峰 200ms 避免精确同时（vs 5.0 串行节流的 25× 加速）
+
+# 图片生成的限制点是 submit 请求频率，不是后台任务并发数。单独限制 text-to-image
+# 提交节奏，后续 poll/download/render 仍可并发跑。
+_image_submit_lock = threading.Lock()
+_image_last_submit_ts = 0.0
+IMAGE_SUBMIT_MIN_INTERVAL = float(os.environ.get("ADR_IMAGE_SUBMIT_INTERVAL", "2.5"))
+IMAGE_RATE_LIMIT_BACKOFF = float(os.environ.get("ADR_IMAGE_RATE_LIMIT_BACKOFF", "15"))
+
+
+def _wait_image_submit_slot(label: str = ""):
+    global _image_last_submit_ts
+    if IMAGE_SUBMIT_MIN_INTERVAL <= 0:
+        return
+    with _image_submit_lock:
+        elapsed = time.time() - _image_last_submit_ts
+        wait_s = max(0.0, IMAGE_SUBMIT_MIN_INTERVAL - elapsed)
+        if wait_s > 0:
+            log(f"{label} text-to-image submit 节流等待 {wait_s:.1f}s")
+            time.sleep(wait_s)
+        _image_last_submit_ts = time.time()
+
+
+def _is_rate_limited_error(exc: Exception) -> bool:
+    text = str(exc).lower()
+    return (
+        "rate limit" in text
+        or "请求频率" in text
+        or '"status": 1001' in text
+        or "'status': 1001" in text
+    )
 
 
 def req_post(path: str, payload: dict, timeout: int = 30) -> dict:
@@ -1443,6 +1473,7 @@ def generate_image(scene: dict, idx: int, _max_retries: int = 3) -> int:
     for attempt in range(_max_retries):
         try:
             _m, _ar, _extra = pick_image_model(ASPECT_RATIO)
+            _wait_image_submit_slot(f"图片 {idx+1}")
             r = req_post("/generation/text-to-image", {
                 "model":        _m,
                 "prompt":       scene["prompt"],
@@ -1468,7 +1499,12 @@ def generate_image(scene: dict, idx: int, _max_retries: int = 3) -> int:
         except Exception as e:
             last_err = e
             if attempt < _max_retries - 1:
-                log(f"图片 {idx+1} 失败（第 {attempt+1} 次）：{e}，重试...")
+                if _is_rate_limited_error(e):
+                    wait_s = IMAGE_RATE_LIMIT_BACKOFF * (attempt + 1)
+                else:
+                    wait_s = 3 * (attempt + 1)
+                log(f"图片 {idx+1} 失败（第 {attempt+1} 次）：{e}，{wait_s:.1f}s 后重试...")
+                time.sleep(wait_s)
                 continue
             raise RuntimeError(f"图片 {idx+1} 重试 {_max_retries} 次仍失败：{last_err}")
 
@@ -3048,6 +3084,7 @@ def _try_almanac_cover(topic: str, script: list | None = None) -> str | None:
         time.sleep(idx * 1.5)  # 错峰 0/1.5/3/4.5s 避免并发 burst 撞 SSL
         for attempt in range(3):
             try:
+                _wait_image_submit_slot(f"黄历封面候选 {idx+1}")
                 r = req_post("/generation/text-to-image", {
                     "model": _m,
                     "prompt": prompt,
@@ -3420,6 +3457,7 @@ def _generate_cover_image(topic: str, short_title: str, script: list[dict]) -> s
     # 调 WeryAI text-to-image
     try:
         _m, _ar, _extra = pick_image_model(aspect)
+        _wait_image_submit_slot("封面")
         resp = req_post(
             "/generation/text-to-image",
             {
