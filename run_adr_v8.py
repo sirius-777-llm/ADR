@@ -1069,13 +1069,17 @@ def step2_master_voice(script: list[dict], speaker_id: str = "liyan2-ef9401ec", 
         tg(f"✅ Edge TTS 音轨生成完毕，时长 {total_dur:.2f}s，{size_kb} KB")
         return voice_path
 
-    # Podcast task 级重试：text 成功但 audio-fail 时，也重建 task 再跑 audio。
+    # Podcast 分层重试：
+    # 1) 先拿 text task_id；
+    # 2) 同一 task 的 audio 失败先轻量重试；
+    # 3) 若状态已固定为 audio-fail，则重建 text task，避免死磕不可恢复 task。
     audio_data = None
     last_err = None
-    for attempt in range(MAX_RETRIES):
+    AUDIO_RETRIES_PER_TEXT = 2
+    for text_attempt in range(MAX_RETRIES):
+        tid = None
         try:
-            tg(f"🎙 Podcast 尝试 {attempt+1}/{MAX_RETRIES}：生成文本脚本...")
-            # query 用台词首句，给后台 LLM 有意义的输入
+            tg(f"🎙 Podcast text 尝试 {text_attempt+1}/{MAX_RETRIES}...")
             r1 = req_post("/generation/podcast/generate/text", {
                 "query": script[0]["text"],
                 "speakers": [speaker_id],
@@ -1084,26 +1088,45 @@ def step2_master_voice(script: list[dict], speaker_id: str = "liyan2-ef9401ec", 
             })
             tid = r1["data"]["task_id"]
             poll_podcast(tid, wait_for="text-success")
-            tg(f"✅ Podcast 文本生成成功（第 {attempt+1} 次）")
-
-            req_post(f"/generation/podcast/generate/{tid}/audio", {
-                "scripts": [{"speaker_id": speaker_id, "speaker_name": speaker_name, "content": s["text"]} for s in script],
-            })
-            tg(f"🎙 音频合成中（第 {attempt+1} 次）...")
-            audio_data = poll_podcast(tid, wait_for="audio-success")
-            tg(f"✅ Podcast 音频生成成功（第 {attempt+1} 次）")
-            break
+            tg(f"✅ Podcast 文本生成成功（task_id={tid}）")
         except Exception as e:
             last_err = e
-            if attempt < MAX_RETRIES - 1:
-                wait_s = 5 * (attempt + 1)
-                tg(f"⚠️ Podcast 第 {attempt+1}/{MAX_RETRIES} 次失败：{e}\n{wait_s}s 后重建任务重试...")
+            if text_attempt < MAX_RETRIES - 1:
+                wait_s = 5 * (text_attempt + 1)
+                tg(f"⚠️ Podcast text 第 {text_attempt+1}/{MAX_RETRIES} 次失败：{e}\n{wait_s}s 后重建 text task...")
                 time.sleep(wait_s)
                 continue
-            tg(f"⚠️ Podcast {MAX_RETRIES} 次全部失败，最后错误：{e}")
+            break
+
+        for audio_attempt in range(AUDIO_RETRIES_PER_TEXT):
+            try:
+                req_post(f"/generation/podcast/generate/{tid}/audio", {
+                    "scripts": [{"speaker_id": speaker_id, "speaker_name": speaker_name, "content": s["text"]} for s in script],
+                })
+                tg(
+                    f"🎙 Podcast audio 尝试 {audio_attempt+1}/{AUDIO_RETRIES_PER_TEXT} "
+                    f"（text task {text_attempt+1}/{MAX_RETRIES}, task_id={tid}）..."
+                )
+                audio_data = poll_podcast(tid, wait_for="audio-success")
+                tg(f"✅ Podcast 音频生成成功（task_id={tid}）")
+                break
+            except Exception as e:
+                last_err = e
+                if audio_attempt < AUDIO_RETRIES_PER_TEXT - 1:
+                    tg(f"⚠️ Podcast audio 失败：{e}\n5s 后复用同一 task 重试 audio...")
+                    time.sleep(5)
+                    continue
+                tg(f"⚠️ Podcast audio 在 task_id={tid} 上失败，重建 text task 再试：{e}")
+
+        if audio_data:
+            break
+        if text_attempt < MAX_RETRIES - 1:
+            wait_s = 5 * (text_attempt + 1)
+            tg(f"⏳ {wait_s}s 后重建 Podcast text task...")
+            time.sleep(wait_s)
 
     if not audio_data:
-        return _edge_fallback_with_report(f"Podcast {MAX_RETRIES} 次失败（{last_err}）")
+        return _edge_fallback_with_report(f"Podcast audio/text {MAX_RETRIES} 轮失败（{last_err}）")
 
     tr = audio_data.get("task_result") or {}
     audios = audio_data.get("audios") or tr.get("audios") or []
