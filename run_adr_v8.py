@@ -286,9 +286,17 @@ def poll(task_id: str, label: str = "") -> dict:
     raise RuntimeError(f"{label} 轮询超时")
 
 
-def poll_podcast(task_id: str, wait_for: str = "text-success") -> dict:
+PODCAST_TEXT_TIMEOUT = float(os.environ.get("ADR_PODCAST_TEXT_TIMEOUT", "200"))
+PODCAST_AUDIO_TIMEOUT = float(os.environ.get("ADR_PODCAST_AUDIO_TIMEOUT", "400"))
+PODCAST_TEXT_POLL_MAX = max(1, int(PODCAST_TEXT_TIMEOUT / POLL_INTERVAL))
+PODCAST_AUDIO_POLL_MAX = max(1, int(PODCAST_AUDIO_TIMEOUT / POLL_INTERVAL))
+
+
+def poll_podcast(task_id: str, wait_for: str = "text-success", max_polls: int | None = None) -> dict:
     """Podcast 专用轮询：按文档要求检查 content_status 而非 task_status。"""
-    for i in range(POLL_MAX):
+    if max_polls is None:
+        max_polls = POLL_MAX
+    for i in range(max_polls):
         time.sleep(POLL_INTERVAL)
         try:
             resp = req_get(f"/generation/{task_id}/status")
@@ -303,7 +311,7 @@ def poll_podcast(task_id: str, wait_for: str = "text-success") -> dict:
             raise
         except Exception as e:
             log(f"Podcast 轮询异常: {e}")
-    raise RuntimeError(f"Podcast 轮询超时（等待 {wait_for}）")
+    raise RuntimeError(f"Podcast 轮询超时（等待 {wait_for}, {max_polls * POLL_INTERVAL}s）")
 
 
 def chat(model: str, system: str, user: str, max_tokens: int = 4096, timeout: int = 180) -> str:
@@ -1096,7 +1104,7 @@ def step2_master_voice(script: list[dict], speaker_id: str = "liyan2-ef9401ec", 
                 "mode": "deep",
             })
             tid = r1["data"]["task_id"]
-            poll_podcast(tid, wait_for="text-success")
+            poll_podcast(tid, wait_for="text-success", max_polls=PODCAST_TEXT_POLL_MAX)
             tg(f"✅ Podcast 文本生成成功（task_id={tid}）")
         except Exception as e:
             last_err = e
@@ -1116,7 +1124,7 @@ def step2_master_voice(script: list[dict], speaker_id: str = "liyan2-ef9401ec", 
                     f"🎙 Podcast audio 尝试 {audio_attempt+1}/{AUDIO_RETRIES_PER_TEXT} "
                     f"（text task {text_attempt+1}/{MAX_RETRIES}, task_id={tid}）..."
                 )
-                audio_data = poll_podcast(tid, wait_for="audio-success")
+                audio_data = poll_podcast(tid, wait_for="audio-success", max_polls=PODCAST_AUDIO_POLL_MAX)
                 tg(f"✅ Podcast 音频生成成功（task_id={tid}）")
                 break
             except Exception as e:
