@@ -146,6 +146,15 @@ for _i, _arg in enumerate(sys.argv):
 if not BOTTOM_NOTE_OVERRIDE:
     BOTTOM_NOTE_OVERRIDE = os.environ.get("ADR_BOTTOM_NOTE", "").strip()
 
+# --short-title "xxx" 一次性覆盖封面短标题（也可 env ADR_SHORT_TITLE）
+SHORT_TITLE_OVERRIDE = ""
+for _i, _arg in enumerate(sys.argv):
+    if _arg == "--short-title" and _i + 1 < len(sys.argv):
+        SHORT_TITLE_OVERRIDE = sys.argv[_i + 1].strip()
+        break
+if not SHORT_TITLE_OVERRIDE:
+    SHORT_TITLE_OVERRIDE = os.environ.get("ADR_SHORT_TITLE", "").strip()
+
 # 根据横竖屏设置分辨率参数
 if IS_VERTICAL:
     ASPECT_RATIO = "9:16"
@@ -2644,6 +2653,9 @@ def _generate_caption(topic: str, script: list[dict]) -> tuple[str, str, str]:
                 best = (_c, _t, _h); best_score = score
 
         caption, short_title, hashtags = best
+        if SHORT_TITLE_OVERRIDE:
+            short_title = re.sub(r'[\#《》【】""""''()（）\[\]!！?？]', '', SHORT_TITLE_OVERRIDE).strip()[:16]
+            log(f"短标题 override → '{short_title}'")
         log(f"社媒文案最终选定：title_len={len(short_title)}, caption_len={len(caption)}, hashtag_count={len(hashtags.split())}")
     except Exception as e:
         log(f"社媒文案生成失败: {e}")
