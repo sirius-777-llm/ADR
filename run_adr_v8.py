@@ -1562,7 +1562,7 @@ def step6_parallel(script: list[dict], topic: str) -> str | None:
 
     MAX_REDO = 3
     bgm_tone = script[0].get("tone", "中性") if script else "中性"
-    media_workers = max(2, min(20, int(os.environ.get("ADR_MEDIA_WORKERS", "6"))))
+    media_workers = max(2, min(20, int(os.environ.get("ADR_MEDIA_WORKERS", "20"))))
     # BGM 后台启动，不阻塞审批
     with ThreadPoolExecutor(max_workers=media_workers) as ex:
         bgm_fut = ex.submit(generate_bgm, topic, bgm_tone)
