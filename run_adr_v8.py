@@ -1061,11 +1061,20 @@ def step2_master_voice(script: list[dict], speaker_id: str = "liyan2-ef9401ec", 
 
     tg(f"🎙 单次 Podcast 生成完整音轨（音色：{speaker_name}），{n} 句...")
 
-    # 单次 text → poll → audio → poll → 下载，text-fail 自动重试
-    podcast_ok = False
-    tid = None
+    def _edge_fallback_with_report(reason: str) -> str:
+        tg(f"⚠️ {reason}，自动切换 Edge TTS 兜底...")
+        voice_path = _edge_tts_fallback(script)
+        size_kb = os.path.getsize(voice_path) // 1024
+        total_dur = ffprobe_duration(voice_path)
+        tg(f"✅ Edge TTS 音轨生成完毕，时长 {total_dur:.2f}s，{size_kb} KB")
+        return voice_path
+
+    # Podcast task 级重试：text 成功但 audio-fail 时，也重建 task 再跑 audio。
+    audio_data = None
+    last_err = None
     for attempt in range(MAX_RETRIES):
         try:
+            tg(f"🎙 Podcast 尝试 {attempt+1}/{MAX_RETRIES}：生成文本脚本...")
             # query 用台词首句，给后台 LLM 有意义的输入
             r1 = req_post("/generation/podcast/generate/text", {
                 "query": script[0]["text"],
@@ -1076,40 +1085,25 @@ def step2_master_voice(script: list[dict], speaker_id: str = "liyan2-ef9401ec", 
             tid = r1["data"]["task_id"]
             poll_podcast(tid, wait_for="text-success")
             tg(f"✅ Podcast 文本生成成功（第 {attempt+1} 次）")
-            podcast_ok = True
-            break
-        except RuntimeError as e:
-            if "text-fail" in str(e) and attempt < MAX_RETRIES - 1:
-                tg(f"⚠️ text-fail（第 {attempt+1} 次），重试...")
-                continue
-            tg(f"⚠️ Podcast {MAX_RETRIES} 次全部失败，切换 Edge TTS 兜底")
+
+            req_post(f"/generation/podcast/generate/{tid}/audio", {
+                "scripts": [{"speaker_id": speaker_id, "speaker_name": speaker_name, "content": s["text"]} for s in script],
+            })
+            tg(f"🎙 音频合成中（第 {attempt+1} 次）...")
+            audio_data = poll_podcast(tid, wait_for="audio-success")
+            tg(f"✅ Podcast 音频生成成功（第 {attempt+1} 次）")
             break
         except Exception as e:
-            tg(f"⚠️ Podcast 异常：{e}，切换 Edge TTS 兜底")
-            break
+            last_err = e
+            if attempt < MAX_RETRIES - 1:
+                wait_s = 5 * (attempt + 1)
+                tg(f"⚠️ Podcast 第 {attempt+1}/{MAX_RETRIES} 次失败：{e}\n{wait_s}s 后重建任务重试...")
+                time.sleep(wait_s)
+                continue
+            tg(f"⚠️ Podcast {MAX_RETRIES} 次全部失败，最后错误：{e}")
 
-    if not podcast_ok:
-        tg(f"⚠️ Podcast {MAX_RETRIES} 次失败，自动切换 Edge TTS 兜底...")
-        voice_path = _edge_tts_fallback(script)
-        size_kb = os.path.getsize(voice_path) // 1024
-        total_dur = ffprobe_duration(voice_path)
-        tg(f"✅ Edge TTS 音轨生成完毕，时长 {total_dur:.2f}s，{size_kb} KB")
-        return voice_path
-
-    # Audio 阶段：同样要兜底（WeryAI Podcast 偶发 audio-fail: Unknown state）
-    try:
-        req_post(f"/generation/podcast/generate/{tid}/audio", {
-            "scripts": [{"speaker_id": speaker_id, "speaker_name": speaker_name, "content": s["text"]} for s in script],
-        })
-        tg("🎙 音频合成中...")
-        audio_data = poll_podcast(tid, wait_for="audio-success")
-    except Exception as e:
-        tg(f"⚠️ Podcast audio 阶段失败：{e}\n切换 Edge TTS 兜底...")
-        voice_path = _edge_tts_fallback(script)
-        size_kb = os.path.getsize(voice_path) // 1024
-        total_dur = ffprobe_duration(voice_path)
-        tg(f"✅ Edge TTS 音轨生成完毕（audio 阶段兜底），时长 {total_dur:.2f}s，{size_kb} KB")
-        return voice_path
+    if not audio_data:
+        return _edge_fallback_with_report(f"Podcast {MAX_RETRIES} 次失败（{last_err}）")
 
     tr = audio_data.get("task_result") or {}
     audios = audio_data.get("audios") or tr.get("audios") or []
@@ -1119,12 +1113,7 @@ def step2_master_voice(script: list[dict], speaker_id: str = "liyan2-ef9401ec", 
         or (audios[0].get("url") if audios and isinstance(audios[0], dict) else (audios[0] if audios else None))
     )
     if not audio_url:
-        tg(f"⚠️ Podcast audio 响应无 URL，切换 Edge TTS 兜底...")
-        voice_path = _edge_tts_fallback(script)
-        size_kb = os.path.getsize(voice_path) // 1024
-        total_dur = ffprobe_duration(voice_path)
-        tg(f"✅ Edge TTS 音轨生成完毕（audio URL 缺失兜底），时长 {total_dur:.2f}s，{size_kb} KB")
-        return voice_path
+        return _edge_fallback_with_report("Podcast audio 响应无 URL")
 
     voice_path = str(OUTPUT_DIR / "master_voice.mp3")
     urllib.request.urlretrieve(audio_url, voice_path)
@@ -3306,6 +3295,9 @@ def _try_almanac_cover(topic: str, script: list | None = None) -> str | None:
     return cover_path
 
 
+COVER_LAST_REASON = ""
+
+
 def _generate_cover_image(topic: str, short_title: str, script: list[dict]) -> str | None:
     """
     按 tone + 制片人准则生成专用封面图。
@@ -3313,6 +3305,10 @@ def _generate_cover_image(topic: str, short_title: str, script: list[dict]) -> s
     杂志封面级：先 AI 出底图（严格留出叠字干净区），再 Pillow 叠中文大字标题（TIME/BBC/儿童杂志三套模板）。
     返回本地 jpg 路径，失败返回 None。
     """
+    global COVER_LAST_REASON
+    COVER_LAST_REASON = ""
+    cover_started = time.time()
+
     # ★ 黄历日报专用模板短路（含"黄历/万年历/宜忌" + 日期时自动走季节 Kinfolk 模板）
     almanac_cover = _try_almanac_cover(topic, script)
     if almanac_cover:
@@ -3597,28 +3593,44 @@ def _generate_cover_image(topic: str, short_title: str, script: list[dict]) -> s
         task_id = data.get("task_id") or (data.get("task_ids") or [None])[0]
         if not task_id:
             log(f"封面任务提交失败: {resp}")
+            COVER_LAST_REASON = "submit_failed"
             return None
+        log(f"封面任务已提交 task_id={task_id}")
     except Exception as e:
         log(f"封面 API 提交失败: {e}")
+        COVER_LAST_REASON = "submit_failed"
         return None
 
-    # 轮询最多 3 分钟
-    for _ in range(36):
-        time.sleep(5)
+    # 封面图常比正片慢，实测可超过 220s；默认最多等 10 分钟，避免误判失败。
+    cover_timeout = int(os.environ.get("ADR_COVER_TIMEOUT", "600"))
+    poll_interval = 5
+    polls = max(1, cover_timeout // poll_interval)
+    last_status_log = 0.0
+    for poll_i in range(polls):
+        time.sleep(poll_interval)
+        elapsed = time.time() - cover_started
         try:
             s = req_get(f"/generation/{task_id}/status")
-        except Exception:
+        except Exception as e:
+            if elapsed - last_status_log >= 30:
+                log(f"封面轮询异常，已等待 {elapsed:.1f}s: {e}")
+                last_status_log = elapsed
             continue
         st = s.get("data", {}).get("task_status", "")
+        if elapsed - last_status_log >= 30:
+            log(f"封面生成中：poll {poll_i+1}/{polls}, status={st or 'unknown'}, elapsed={elapsed:.1f}s")
+            last_status_log = elapsed
         if st == "succeed":
             imgs = s.get("data", {}).get("images") or []
             if not imgs:
+                COVER_LAST_REASON = "no_image"
                 return None
             cover_path = str(OUTPUT_DIR / "cover.jpg")
             try:
                 urllib.request.urlretrieve(imgs[0], cover_path)
             except Exception as e:
                 log(f"封面下载失败: {e}")
+                COVER_LAST_REASON = "download_failed"
                 return None
             # 转真 JPG（weryai 默认 PNG；WeChat CDN 对大 PNG 上传差）
             try:
@@ -3636,11 +3648,14 @@ def _generate_cover_image(topic: str, short_title: str, script: list[dict]) -> s
                     log("封面走 Pillow 叠字兜底（ADR_COVER_FORCE_PILLOW=1）")
                 except Exception as e:
                     log(f"封面 Pillow 兜底失败（不致命，发送 AI 直出版）: {e}")
+            log(f"封面生成成功，耗时 {time.time() - cover_started:.1f}s → {cover_path}")
             return cover_path
         if st == "failed":
             log(f"封面生成 failed: {s}")
+            COVER_LAST_REASON = "failed"
             return None
-    log("封面轮询超时（3 分钟）")
+    COVER_LAST_REASON = "timeout"
+    log(f"封面轮询超时（{cover_timeout}s），task_id={task_id} 可能仍在后台继续生成")
     return None
 
 
@@ -3780,8 +3795,11 @@ def step10_deliver(final_path: str, topic: str, script: list[dict]):
         except Exception as e:
             log(f"专属封面发送失败: {e}")
     else:
-        # 封面生成失败兜底：fallback 用第一张分镜图（不再随机 2 张）
-        tg("⚠️ 专属封面生成失败，使用首张分镜图兜底")
+        # 封面兜底：只有接口明确 failed 才叫失败；timeout 只是后台未及时完成。
+        if COVER_LAST_REASON == "timeout":
+            tg("⚠️ 专属封面仍在生成但已超过等待上限，先使用首张分镜图兜底；封面任务可能稍后在后台完成")
+        else:
+            tg(f"⚠️ 专属封面生成未完成（reason={COVER_LAST_REASON or 'unknown'}），使用首张分镜图兜底")
         fallback = str(OUTPUT_DIR / "img_0.jpg")
         try:
             with open(fallback, "rb") as img_f:
