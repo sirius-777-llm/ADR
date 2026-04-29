@@ -2126,6 +2126,13 @@ def step8_subtitles(script: list[dict]) -> str:
 
     # 单字虚词：不应独立出现在行首或行尾
     _STICKY_WORDS = {"的", "地", "得", "与", "和", "或", "要", "在", "把", "被", "让", "从", "向", "往", "对", "是", "了", "着", "过"}
+    _PROTECTED_TERMS = [
+        "狸猫换太子", "宋仁宗", "仁宗盛治", "包拯", "范仲淹", "欧阳修",
+        "千古名篇", "黄金时代", "真天子", "大宋", "正史", "仁政",
+        "民间传说", "被后世误解", "心理防线",
+    ]
+    _BREAK_BEFORE = ("因为", "但是", "却", "可", "谁想", "原以为", "所有人", "历史", "所谓")
+    _BREAK_AFTER = ("才是", "不是", "而是", "换来的是", "留给历史的", "靠", "把")
 
     def _jieba_split(text: str, max_len: int) -> list[str]:
         """jieba 分词 + 虚词保护断行"""
@@ -2186,7 +2193,119 @@ def step8_subtitles(script: list[dict]) -> str:
         """去掉逗号、顿号、句号、冒号；只保留问号、感叹号"""
         return re.sub(r'[，、：。]', '', text).strip()
 
+    def _visual_width(text: str) -> float:
+        width = 0.0
+        for ch in text:
+            if ch in "!?！？":
+                width += 0.55
+            elif ch.isascii():
+                width += 0.55 if ch.isalnum() else 0.35
+            else:
+                width += 1.0
+        return width
+
+    def _tokenize_subtitle(text: str) -> list[str]:
+        """Tokenize for subtitle wrapping while keeping names/allusions intact."""
+        text = text.strip()
+        if not text:
+            return []
+        protected = sorted(_PROTECTED_TERMS, key=len, reverse=True)
+        spans: list[tuple[int, int, str]] = []
+        pos = 0
+        while pos < len(text):
+            match = next((term for term in protected if text.startswith(term, pos)), None)
+            if match:
+                spans.append((pos, pos + len(match), match))
+                pos += len(match)
+            else:
+                pos += 1
+        if spans:
+            tokens: list[str] = []
+            cursor = 0
+            for start, end, term in spans:
+                if start > cursor:
+                    tokens.extend(_tokenize_subtitle(text[cursor:start]))
+                tokens.append(term)
+                cursor = end
+            if cursor < len(text):
+                tokens.extend(_tokenize_subtitle(text[cursor:]))
+            return [t for t in tokens if t.strip()]
+        try:
+            import jieba
+            words = [w for w in jieba.cut(text) if w.strip()]
+        except Exception:
+            words = list(text)
+        tokens: list[str] = []
+        for w in words:
+            tokens.extend(ch for ch in w if ch.strip()) if len(w) > 6 else tokens.append(w)
+        return [t for t in tokens if t.strip()]
+
+    def _split_long_token(token: str, max_width: float) -> list[str]:
+        if _visual_width(token) <= max_width:
+            return [token]
+        chunks, buf = [], ""
+        for ch in token:
+            if buf and _visual_width(buf + ch) > max_width:
+                chunks.append(buf)
+                buf = ch
+            else:
+                buf += ch
+        if buf:
+            chunks.append(buf)
+        return chunks
+
+    def _rebalance_two_lines(lines: list[str], max_width: float) -> list[str]:
+        if len(lines) != 2:
+            return lines
+        a, b = lines
+        # If the second line is tiny, move the last token from line 1 down when it still fits.
+        if _visual_width(b) < 4 and _visual_width(a) > 5:
+            toks = _tokenize_subtitle(a)
+            if len(toks) >= 2:
+                moved = toks[-1] + b
+                kept = "".join(toks[:-1])
+                if _visual_width(moved) <= max_width and kept:
+                    return [kept, moved]
+        return lines
+
+    def _wrap_card(text: str, max_width: float | None = None, max_lines: int = 2) -> list[str]:
+        """Wrap into one subtitle card: semantic tokens, max two display lines."""
+        max_width = max_width or (9.0 if IS_VERTICAL else 14.5)
+        text = _clean_display(text)
+        if not text:
+            return []
+        for marker in _BREAK_BEFORE:
+            text = text.replace(marker, f"|{marker}")
+        for marker in _BREAK_AFTER:
+            text = text.replace(marker, f"{marker}|")
+        clauses = [c for c in text.split("|") if c.strip()]
+        lines: list[str] = []
+        current = ""
+        for clause in clauses:
+            for token in _tokenize_subtitle(clause):
+                for piece in _split_long_token(token, max_width):
+                    candidate = current + piece
+                    if not current or _visual_width(candidate) <= max_width:
+                        current = candidate
+                    else:
+                        if current:
+                            lines.append(current)
+                        current = piece
+        if current:
+            lines.append(current)
+
+        lines = _rebalance_two_lines(lines, max_width)
+
+        cards: list[str] = []
+        for i in range(0, len(lines), max_lines):
+            card_lines = lines[i:i + max_lines]
+            if card_lines:
+                cards.append(r"\N".join(card_lines))
+        return cards
+
     ass_path = OUTPUT_DIR / "subs.ass"
+    margin_l = 50 if IS_VERTICAL else 40
+    margin_r = 50 if IS_VERTICAL else 40
     margin_v = 180 if IS_VERTICAL else 50
     header = f"""\
 [Script Info]
@@ -2197,7 +2316,7 @@ ScaledBorderAndShadow: yes
 
 [V4+ Styles]
 Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
-Style: Default,Arial Unicode MS,{SUBTITLE_FONTSIZE},&H00FFFFFF,&H000000FF,&H00000000,&H80000000,-1,0,0,0,100,100,0,0,1,3,1,2,40,40,{margin_v},1
+Style: Default,Arial Unicode MS,{SUBTITLE_FONTSIZE},&H00FFFFFF,&H000000FF,&H00000000,&H80000000,-1,0,0,0,100,100,0,0,1,4,1,2,{margin_l},{margin_r},{margin_v},1
 
 [Events]
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
@@ -2234,14 +2353,19 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
                     else:
                         merged_segs.append(seg)
             segments = merged_segs if merged_segs else segments
+            segments = [
+                chunk
+                for seg in segments
+                for chunk in _wrap_card(seg)
+            ]
 
-            total_chars = sum(len(c) for c in segments) or 1
+            total_chars = sum(len(c.replace(r"\N", "")) for c in segments) or 1
             duration = t_end - t_start
             total_gaps = max(0, len(segments) - 1) * SUB_GAP
             content_dur = max(duration - total_gaps, duration * 0.5)
             cursor = t_start
             for seg in segments:
-                seg_dur = max(content_dur * len(seg) / total_chars, 0.8)
+                seg_dur = max(content_dur * len(seg.replace(r"\N", "")) / total_chars, 0.8)
                 seg_end = min(cursor + seg_dur, t_end)
                 if seg.strip():
                     f.write(
