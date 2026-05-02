@@ -1045,8 +1045,54 @@ THUMBNAIL_ANCHOR: 封面视觉锚，用 4~6 个短语描述：主体、主色（
 
 
 # ── 第二步：逐句生成音轨（WeryAI Podcast，线程池并发）─────────────────────────
+def _openai_tts_fallback(script: list[dict]) -> str:
+    """OpenAI gpt-4o-mini-tts 兜底——纪录片旁白质量优于 edge-tts。"""
+    api_key = os.environ.get("OPENAI_API_KEY", "").strip()
+    if not api_key:
+        raise RuntimeError("OPENAI_API_KEY 未设置")
+
+    VOICE = "onyx"
+    INSTRUCTIONS = (
+        "用中文纪录片旁白的语气朗读：低沉、缓慢、稳重，"
+        "句末适度下沉，关键词处适当停顿。不要做戏剧化处理。"
+    )
+
+    tg(f"🎙 启用 OpenAI TTS 兜底（gpt-4o-mini-tts, 音色：{VOICE}）...")
+
+    seg_paths = []
+    for i, s in enumerate(script):
+        p = OUTPUT_DIR / f"voice_{i}.mp3"
+        resp = requests.post(
+            "https://api.openai.com/v1/audio/speech",
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": "gpt-4o-mini-tts",
+                "voice": VOICE,
+                "input": s["text"],
+                "instructions": INSTRUCTIONS,
+            },
+            timeout=60,
+        )
+        resp.raise_for_status()
+        with open(p, "wb") as f:
+            f.write(resp.content)
+        seg_paths.append(str(p))
+
+    concat_list = OUTPUT_DIR / "voice_concat.txt"
+    with open(concat_list, "w") as f:
+        for p in seg_paths:
+            f.write(f"file '{p}'\n")
+
+    voice_path = str(OUTPUT_DIR / "master_voice.mp3")
+    ffmpeg("-f", "concat", "-safe", "0", "-i", str(concat_list), "-c", "copy", voice_path)
+    return voice_path
+
+
 def _edge_tts_fallback(script: list[dict]) -> str:
-    """Podcast 不可用时的 edge-tts 兜底方案。"""
+    """edge-tts 二级兜底——OpenAI 也失败时使用。"""
     import asyncio as _aio
     import edge_tts
 
@@ -1100,11 +1146,17 @@ def step2_master_voice(script: list[dict], speaker_id: str = "liyan2-ef9401ec", 
     tg(f"🎙 单次 Podcast 生成完整音轨（音色：{speaker_name}），{n} 句...")
 
     def _edge_fallback_with_report(reason: str) -> str:
-        tg(f"⚠️ {reason}，自动切换 Edge TTS 兜底...")
-        voice_path = _edge_tts_fallback(script)
+        tg(f"⚠️ {reason}，自动切换 TTS 兜底...")
+        try:
+            voice_path = _openai_tts_fallback(script)
+            tier = "OpenAI gpt-4o-mini-tts"
+        except Exception as e:
+            tg(f"⚠️ OpenAI TTS 兜底失败：{e}\n继续退到 Edge TTS...")
+            voice_path = _edge_tts_fallback(script)
+            tier = "Edge TTS"
         size_kb = os.path.getsize(voice_path) // 1024
         total_dur = ffprobe_duration(voice_path)
-        tg(f"✅ Edge TTS 音轨生成完毕，时长 {total_dur:.2f}s，{size_kb} KB")
+        tg(f"✅ {tier} 音轨生成完毕，时长 {total_dur:.2f}s，{size_kb} KB")
         return voice_path
 
     # Podcast 分层重试：
