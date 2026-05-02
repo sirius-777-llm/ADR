@@ -1051,9 +1051,9 @@ def _openai_tts_fallback(script: list[dict]) -> str:
     if not api_key:
         raise RuntimeError("OPENAI_API_KEY 未设置")
 
-    VOICE = "onyx"
+    VOICE = "coral"
     INSTRUCTIONS = (
-        "用中文纪录片旁白的语气朗读：低沉、缓慢、稳重，"
+        "用中文纪录片旁白的语气朗读：温柔、缓慢、稳重，"
         "句末适度下沉，关键词处适当停顿。不要做戏剧化处理。"
     )
 
