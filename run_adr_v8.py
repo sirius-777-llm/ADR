@@ -2738,9 +2738,10 @@ def _generate_caption(topic: str, script: list[dict]) -> tuple[str, str, str]:
     """用 LLM 生成 (文案主体, 短标题, 热门标签串)。按 tone 切爆款方法论。
     文案主体不含标签；标签串独立，便于 step10 分两条发送，绕过 Telegram 一键复制 256 字符限制。"""
     lines = "\n".join(s["text"] for s in script)
-    caption = f"ADR V8 — {topic}"
-    short_title = topic[:16]
-    hashtags = f"#{topic} #每日话题 #涨知识"
+    display_topic = _strip_topic_modifiers(topic)
+    caption = f"ADR V8 — {display_topic}"
+    short_title = display_topic[:16]
+    hashtags = f"#{display_topic} #每日话题 #涨知识"
     tone = script[0].get("tone", "中性") if script else "中性"
     producer_brief = script[0].get("historical_context", "") if script else ""
 
@@ -2834,7 +2835,7 @@ def _generate_caption(topic: str, script: list[dict]) -> tuple[str, str, str]:
         for _try_i in range(3):
             raw = chat("GEMINI_25_FLASH", "你是能出爆款的短视频文案策划师，熟悉视频号/抖音/小红书的点击钩子规律，会根据题材基调灵活切换受众和套路。",
                 f"为以下短视频生成文案 + 短标题：\n\n"
-                f"主题：{topic}\n"
+                f"主题：{display_topic}\n"
                 f"基调：{tone}\n"
                 f"台词摘要：\n{lines}\n"
                 f"{producer_block}\n"
@@ -2844,7 +2845,7 @@ def _generate_caption(topic: str, script: list[dict]) -> tuple[str, str, str]:
                 f"   {caption_struct}\n"
                 f"   语气：自然口语，不端着，带情绪感染力\n"
                 f"   {caption_examples}\n\n"
-                f"2. 短标题（封面大字，不超过 16 个中文字）：\n"
+                f"2. 短标题（封面大字，理想 10-13 个中文字，硬上限 14 字）：\n"
                 f"   {title_hook_rules}\n"
                 f"   {title_examples}\n"
                 f"   出 3 个候选，挑最吸引人的那个输出（只输出最终一个）\n\n"
@@ -2882,8 +2883,8 @@ def _generate_caption(topic: str, script: list[dict]) -> tuple[str, str, str]:
                     else:
                         t = re.sub(r'[\#《》【】""""''()（）\[\]!！]', '', t)
                         t = re.sub(r'[a-zA-Z]', '', t)
-                    t = t.strip()
-                    if t: _t = t[:10]
+                    t = _strip_topic_modifiers(t).strip()
+                    if t: _t = t[:14]
 
             # 质量评分
             cap_len = len(_c) if _c and not _c.startswith("ADR V8") else 0
@@ -3637,7 +3638,8 @@ def _generate_cover_image(topic: str, short_title: str, script: list[dict]) -> s
         _py, _pmo, _pd = int(_pm.group(1)), int(_pm.group(2)), int(_pm.group(3))
     else:
         _py, _pmo, _pd = _now.year, _now.month, _now.day
-    _pantone = _get_pantone_for_date(_py, _pmo, _pd)
+    # tone 优先：庄重 / 怀旧 用调性专属深色，避免节气色卡（如谷雨嫩芽绿）与悲剧题材冲突
+    _pantone = _TONE_PANTONE_OVERRIDE.get(tone) or _get_pantone_for_date(_py, _pmo, _pd)
     _p_hex, _p_code, _p_name = _pantone["hex"], _pantone["code"], _pantone["name"]
     _bottom_note = _get_bottom_note(topic, script)
     _date_tag = _get_date_tag(topic) or ""
