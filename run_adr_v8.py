@@ -412,6 +412,30 @@ def is_1919_global_topic(topic: str) -> bool:
     return any(k in topic for k in keys)
 
 
+# topic 里常带的提示性修饰词（如"严格按史实"），不应进入封面短标题
+_TOPIC_MODIFIERS = [
+    "严格按史实", "严格按历史", "按史实", "按照史实", "符合史实", "符合历史",
+    "真实历史", "真实事件", "详细介绍", "详细讲解", "完整版", "深度解析",
+]
+
+def _strip_topic_modifiers(text: str) -> str:
+    """剥离 topic 中给 LLM 的提示性修饰词，仅用于面向观众的展示场景（短标题/caption）。"""
+    if not text:
+        return text
+    out = text
+    for m in _TOPIC_MODIFIERS:
+        out = out.replace(m, "")
+    out = re.sub(r"\s+", " ", out).strip(" 　，,.、；;:：—-")
+    return out
+
+
+# tone → 封面 Pantone 色卡覆盖（庄重历史题材不再被节气色卡跳色干扰）
+_TONE_PANTONE_OVERRIDE = {
+    "庄重": {"hex": "#2C2C2C", "code": "MK-9.10", "name": "苍墨"},
+    "怀旧": {"hex": "#D4A642", "code": "GD-10.30", "name": "暖金"},
+}
+
+
 def apply_1919_global_guardrails(meta: dict) -> dict:
     """1919/五四全球史题材的历史视觉硬约束，避免新中国时期元素穿帮。"""
     updated = dict(meta)
