@@ -3590,185 +3590,62 @@ def _generate_cover_image(topic: str, short_title: str, script: list[dict]) -> s
     if almanac_cover:
         return almanac_cover
 
-    # 竖屏走 9:16，横屏走 3:4（视频号 / 小红书爱用 3:4 竖版大图）
-    aspect = "9:16" if IS_VERTICAL else "3:4"
+    # 万年历视频号统一 3:4 + Kinfolk Pantone 时令封面结构（所有非 1919 题材共用，不再按 tone 分支）
+    aspect = "3:4"
     tone = script[0].get("tone", "中性") if script else "中性"
     producer_brief = script[0].get("historical_context", "") if script else ""
-    # Kinfolk 时令现代版强制 3:4（小红书/视频号列表页黄金比例）
-    if tone in ("中性", "怀旧"):
-        aspect = "3:4"
-
-    if tone == "轻松":
-        persona = "你是国际顶级儿童/教育杂志封面设计师，参考 National Geographic Kids、TIME for Kids、Highlights、《少年时代》等刊物的封面视觉语言。"
-        audience_goal = (
-            "【受众】视频号/抖音泛用户，含学生家长、年轻职场人、学生本人\n"
-            "【目标】3 秒内让人眼前一亮，产生'这也太有趣了'或'给娃看看'的冲动\n"
-            "【标杆参考】NatGeo Kids 封面、TIME for Kids 年度人物封面、Highlights 周刊封面 —— 单一主体大特写 + 浓烈色彩 + 情绪爆发点\n"
-        )
-        title_style = (
-            f"【中文标题渲染要求（Nano Banana 2 直出）】\n"
-            f"• 渲染这串精准中文：「{short_title}」（一字不差，字形完整）\n"
-            f"• 字体：bold rounded Chinese heiti（黑体圆润版），粗壮饱满有童趣\n"
-            f"• 位置：bottom-center within bottom 25% of frame\n"
-            f"• 样式：white fill text with thick black outline, laid on a bright yellow or candy pink rounded-corner color bar\n"
-            f"• 大小：标题占画面宽度的 80%，字高约为画面高度的 10%\n"
-            f"• 绝对不要把标题拆字/错字/漏字，每个中文字必须清晰完整\n"
-        )
-        design_rules = (
-            "【设计原则 · 杂志封面级】\n"
-            "1. 主色：高饱和明亮（warm yellow / candy pink / sky blue / mint green 任选 2-3 色组合），禁 sepia / 深红金 / 灰暗\n"
-            "2. 主体：单一主体大特写（笑脸 / 夸张表情 / 惊喜瞬间 / 卡通萌角色 / 主题道具放大），占画面 55-70%，必须夺目\n"
-            "3. 光线：high-key soft light 或 rim light 打亮主体，主体和背景要强反差\n"
-            "4. 情绪钩子：惊喜 / 好奇 / 治愈 / 好玩，必须让人产生正面情绪共振\n"
-            "5. 风格：现代卡通插画 / storybook 绘本风 / 扁平向量 / 3D q 版渲染（任选）；禁写实老照片/油画/水墨\n"
-            "6. 辅助元素：闪光 / 星星 / 对话气泡 / 彩色粒子 / 表情 emoji 造型（非真 emoji），增强活力感\n"
-            "7. 构图铁律：主体聚焦画面上半部分，标题区在底部 25%，主体与标题区有清晰层次不重叠\n"
-        )
-    elif tone == "怀旧":
-        # 查主题匹配的底部文化注脚（4 级优先级：CLI > JSON > LLM > 硬编码）
-        _bottom_note = _get_bottom_note(topic, script)
-        # Kinfolk 现代骨架 + 怀旧暖色板（从老《读者》红金大字报升级到 editorial 质感）
-        persona = "你是 Kinfolk × LIFE 纪实的现代融合封面设计师，用 3:4 editorial 骨架 + 暖色怀旧质感，摆脱老 app 红金大字报的老气"
-        audience_goal = (
-            "【受众】50-75 岁中老年 + 35-55 岁怀旧升级客群；追求温暖但审美现代\n"
-            "【目标】3 秒唤起怀旧情感同时传达现代质感，不显老气\n"
-            "【标杆参考】Kinfolk editorial 骨架 + LIFE 纪实暖色 + 小红书日杂摄影 —— 简约克制 + 暖调泛黄 + 单一老物件特写\n"
-        )
-        _date_tag = _get_date_tag(topic)
-        _subtitle_line = f"• ★ 点题副标题（主标题正下方 5% 位置，硬性渲染不可缺）：small BOLD dark-sepia #3E2812 Chinese heiti text \"{_date_tag}\" on a thin cream pill background\n" if _date_tag else ""
-        title_style = (
-            f"【中文标题渲染要求（Nano Banana 2 直出）】\n"
-            f"• 渲染这串精准中文：「{short_title}」（一字不差，字形完整）\n"
-            f"• 字体：HEAVY-BOLD Chinese Song-ti serif（粗宋体），editorial 质感（非粗黑体）\n"
-            f"• 位置：画面中心 40% 区域，单行或 2x2 网格（按字数自适应）\n"
-            f"{_subtitle_line}"
-            f"• 样式：deep sepia brown #3E2812 字 + thin cream 2-3px 描边，HIGH CONTRAST 缩略图可读\n"
-            f"• 严禁《读者》风红金横条大字报；严禁整块红色底带\n"
-            f"• 顶部刘海屏品牌条：exactly ONE dark-sepia rounded pill capsule 居中靠顶，\n"
-            f"  38% 宽 × 4.5% 高，内含白色小字「中华万年历」+ 小老物件 icon（泛黄书/煤油灯/羽毛笔）\n"
-            f"• ⚠️ 反 double-notch bug：写 render exactly ONE notch capsule，并 Do NOT render any additional notches pills banners or English text outside the single capsule\n"
-            f"• 避免 BLACK 全大写（模型当文本渲染），用 dark-sepia / solid dark fill #3E2812\n"
-            f"• ★ 防字符截断（硬性）：所有中文文本（主标题/副标题/底部注脚）必须完整显示在画面内，不得被画面边缘裁切或被其他元素遮挡\n"
-            f"• ★ 主标题最多 6 字一行；超过 6 字自动拆成 2x2 网格或 2 行排列，每行字数相等或接近\n"
-            f"• ★ 点题副标题的 pill 托底色块宽度必须**宽于文本本身至少 10%**，左右各留 5% padding\n"
-            f"• ★ 标题文字的左右安全边距为画面宽度的 8%，绝不越界\n"
-            f"• ★ 自适应字号：如果标题字符数较多（>10），自动缩小字号保证全部字符清晰可见\n"
-            f"• 绝对不要把标题拆字/错字/漏字，每个中文字必须清晰完整\n"
-        )
-        design_rules = (
-            "【设计原则 · Kinfolk × 怀旧（3:4 尺寸强制）】\n"
-            "1. 主色：aged cream #F4E4C8 主背 + deep sepia brown #3E2812 字 + warm gold #D4A642 点缀 + 小块酒红 #8B2020（仅做小印章强调，不做大面积红底）\n"
-            "2. 背景：soft vertical gradient 奶油米 → 边缘深棕，watercolor/film grain 做旧质感\n"
-            "3. 主体（15-25% 画面占比，非主导）：单一怀旧老物件特写（泛黄厚书叠放 / 煤油灯柔光 / 老花镜叠书 / 黑白老照片微卷角）\n"
-            "4. 光线：暖黄 golden-hour candle-light 侧光，景深浅，背景柔焦暗\n"
-            "5. ★ 右上角 Pantone 色卡条（签名）：12% 宽 × 16% 高；上 70% 色块填 #D4A642 warm gold；下 30% 奶油白带含 line 1 深棕小字 SP-NSG；line 2 深棕中文「忆光」\n"
-            "6. 副标题位主标题下：BOLD dark sepia #3E2812 粗黑体 + 细奶油托底色块\n"
-            "7. 底部 15% 单线条手绘 ink 插画：泛黄老书 + 煤油灯 + 羽毛笔，sepia 线稿\n"
-            f"8. ★ 最底部文化注脚（MUST RENDER · 不可省略）：在画面最底部居中位置，用清晰可读的 sepia-brown #5A3E28 中文毛笔书法渲染 \"{_bottom_note}\"，左右各配一枚小红印章圆点装饰。字号约画面高度 4-5%（小而清晰可读，不要 tiny 到看不清）\n"
-            "9. 风格：Kinfolk editorial × LIFE 纪实 × 暖色怀旧；留白克制、layout 现代、字体 editorial；严禁《读者》App 红金大字报\n"
-            "10. 所有中文字必须 HIGH CONTRAST，缩略图也能看清\n"
-        )
-    elif tone == "庄重":
-        persona = "你是 TIME 时代周刊、National Geographic、LIFE 杂志级的封面视觉指导，熟悉人物封面、历史事件封面、年度事件封面的构图和情绪语言。"
-        audience_goal = (
-            "【受众】50-75 岁中老年 + 泛历史爱好者\n"
-            "【目标】3 秒内传达事件重量与年代感，产生点击想了解真相的冲动\n"
-            "【标杆参考】TIME Person of the Year 封面、NatGeo 历史事件封面、LIFE 纪实封面 —— 单一主体 + 戏剧性光影 + 沉重情绪张力\n"
-        )
-        title_style = (
-            f"【中文标题渲染要求（Nano Banana 2 直出）】\n"
-            f"• 渲染这串精准中文：「{short_title}」（一字不差，字形完整）\n"
-            f"• 字体：bold solemn Chinese heiti or 宋体 serif，刚正有力\n"
-            f"• 位置：bottom 22% 居中对齐\n"
-            f"• 样式：pure white fill on a black solid bar（TIME 杂志风），标题下方可加一条金色细线\n"
-            f"• 右上角额外渲染一个红色矩形色块 + 白色英文 'ADR' 小字（TIME LOGO 风格）\n"
-            f"• 大小：中文标题占画面宽度的 75-85%，字高约为画面高度的 9-11%\n"
-            f"• 绝对不要把标题拆字/错字/漏字，每个中文字必须清晰完整\n"
-        )
-        design_rules = (
-            "【设计原则 · 杂志封面级】\n"
-            "1. 主色：红色 + 金色 + 深黑（庄重/喜庆/沉痛），或灰蓝+土黄（战争/灾难），色调要厚重\n"
-            "2. 主体：标志性人物大特写 / 历史场景 / 考证过的服饰器物，占画面 50-65%，必须有张力\n"
-            "3. 光线：low-key dramatic lighting（chiaroscuro / 伦勃朗光 / 逆光剪影），让主体从黑暗中浮出\n"
-            "4. 情绪钩子：庄重 / 警示 / 悲怆 / 缅怀，按主题选一种并做到极致\n"
-            "5. 风格：写实油画 / 泛黄老照片 / 宣传海报 / 水墨印章；禁卡通或儿童插画\n"
-            "6. 传统中国元素（可选）：祥云 / 毛笔字痕迹 / 古纸肌理 / 印章 / 宫灯 / 竹简，选 1-2 个融入\n"
-        )
-    else:  # 中性 → Kinfolk 时令现代版（v7 模板）+ Pantone 节气色卡
-        # 植物元素（按月份粗粒度）
-        _now = datetime.now()
-        _m = _now.month
-        if _m in (3, 4, 5):
-            _season = "暮春 / 初夏"
-            _botanical_hint = "willow branches, Paulownia tung-flower petals, early butterflies, young green leaves"
-        elif _m in (6, 7, 8):
-            _season = "盛夏"
-            _botanical_hint = "lotus pond ripples, cicada silhouettes, bamboo shadows, summer afternoon light"
-        elif _m in (9, 10, 11):
-            _season = "金秋"
-            _botanical_hint = "maple leaves, ripe rice stalks, persimmons, autumn haze"
-        else:
-            _season = "寒冬 / 初春"
-            _botanical_hint = "plum blossoms, bare branches, light snow, misty mountain"
-
-        # 精准节气色卡（优先从 topic 提取日期；找不到用今天）
-        _pm = re.search(r'(\d{4})\D*(\d{1,2})\D*(\d{1,2})', topic)
-        if _pm:
-            _py, _pmo, _pd = int(_pm.group(1)), int(_pm.group(2)), int(_pm.group(3))
-        else:
-            _py, _pmo, _pd = _now.year, _now.month, _now.day
-        _pantone = _get_pantone_for_date(_py, _pmo, _pd)
-        _p_hex, _p_code, _p_name = _pantone["hex"], _pantone["code"], _pantone["name"]
-        _bottom_note = _get_bottom_note(topic, script)
-        _palette_hint = f"signature {_p_hex} ({_p_name}), cream #F7EFD6, ink #1A1A1A, charcoal #2C2C2C, sage #3D5A2D"
-
-        persona = f"你是 Kinfolk / MUJI / 日杂风现代中国时令杂志的封面设计师，当下是{_season}。你只输出英文 AI 绘图 prompt，严格遵循 5 REGION 模板，不额外说明。"
-        audience_goal = (
-            "【受众】泛知识 + 审美向年轻白领 + 中老年升级客群\n"
-            "【目标】3 秒传达时令感+文化深度，产生停留冲动\n"
-            "【标杆】Kinfolk 杂志 + 《读者》 + 小红书日杂摄影\n"
-        )
-        _date_tag = _get_date_tag(topic) or ""
-        title_style = (
-            f"【封面英文 prompt 模板（你只能填 <ILLUSTRATION> 部分，其余结构不变，严禁添加 R1/R2/REGION/MUST RENDER 之类的结构化标记或百分比等技术标注）】\n"
-            f"'A 3:4 vertical Chinese ink-wash watercolor magazine cover, Kinfolk editorial aesthetic. '\n"
-            f"'Background: cream #F7EFD6 fading to pale sage bottom, {{botanical}} softly scattered. '\n"
-            f"'Illustration (middle 50%): <ILLUSTRATION>. '\n"
-            f"'At the very top edge of the frame, HORIZONTALLY CENTERED (pill at exactly 50% of the frame width, NOT top-left, NOT offset): a single dark-charcoal rounded pill capsule in iPhone Dynamic Island style (solid dark fill, small horizontal pill shape), containing white Chinese text \"中华万年历\" + a tiny green-leaf icon. '\n"
-            f"'Top-right corner: a professional PANTONE-style color swatch chip (compact rectangular card) with thin cream border — upper 60% solid color block {_p_hex}, lower 40% cream-white strip with 3 small lines \"PANTONE\" / \"{_p_code}\" / \"{_p_name}\", side percentage labels \"12%\" \"70%\" \"30%\" in tiny gray text. '\n"
-            f"'Center (rows 2-3, 85% width): the main title, appearing only at the center and never duplicated elsewhere — render EXACTLY \"{short_title}\" once in heavy-bold Chinese Song-ti serif style with deep ink tone and soft cream outline. '\n"
-            f"'Directly below the main title: a small cream pill containing \"{_date_tag}\" in bold dark sepia-brown Chinese characters. '\n"
-            f"'Very bottom center: The cultural tagline at very bottom center is SMALL (about 2.8% of frame height, clearly smaller than the subtitle pill above, a subtle footer). Flank this tagline with traditional Chinese brush-flourish decorations: on the LEFT side a small painted red seal dot (think seal stamp circle), on the RIGHT side another small red seal dot — simple decorative accents around the calligraphy. The tagline itself: hand-drawn in warm sepia-brown tone \"{_bottom_note}\". '\n"
-            f"'Strict single-instance rule: every Chinese title, subtitle, and tagline must appear exactly once on the cover — never duplicate, mirror, or echo in the illustration, sky, scrolls, or anywhere else. '\n"
-            f"'Every Chinese character sharp and complete, 8% safe margin, no cropping. '\n"
-            f"'Do not render any structural region labels (like R1, R2) or workflow annotations. English letters and percentage numbers are ONLY allowed inside the Pantone card on the top-right. No stray percentage numbers anywhere else (no numbers floating beside the notch or in empty areas). No watermarks.'\n"
-            f"\n"
-            f"【你的任务】：\n"
-            f"1. 为 <ILLUSTRATION> 填 60-90 词英文描述（具体 Kinfolk/ink-wash 插画场景），禁重复主标题\n"
-            f"2. botanical 占位符处填 2-3 个当季植物元素（{_botanical_hint}）\n"
-            f"3. 输出完整英文 prompt 整段，不要加解释/前后缀/markdown/区域编号\n"
-        )
-        design_rules = ""  # 已在 title_style 模板里包含所有 design 指令
-
-
     producer_block = f"【制片人准则（请重点参考其 STYLE_KEY / PALETTE / THUMBNAIL_ANCHOR 字段）】\n{producer_brief}\n\n" if producer_brief else ""
+
+    # 通用变量：节气植物 / Pantone 色卡 / 日期 pill / 底部毛笔注脚
+    _now = datetime.now()
+    _m = _now.month
+    if _m in (3, 4, 5):
+        _botanical_hint = "willow branches, Paulownia tung-flower petals, early butterflies, young green leaves"
+    elif _m in (6, 7, 8):
+        _botanical_hint = "lotus pond ripples, cicada silhouettes, bamboo shadows, summer afternoon light"
+    elif _m in (9, 10, 11):
+        _botanical_hint = "maple leaves, ripe rice stalks, persimmons, autumn haze"
+    else:
+        _botanical_hint = "plum blossoms, bare branches, light snow, misty mountain"
+
+    _pm = re.search(r'(\d{4})\D*(\d{1,2})\D*(\d{1,2})', topic)
+    if _pm:
+        _py, _pmo, _pd = int(_pm.group(1)), int(_pm.group(2)), int(_pm.group(3))
+    else:
+        _py, _pmo, _pd = _now.year, _now.month, _now.day
+    _pantone = _get_pantone_for_date(_py, _pmo, _pd)
+    _p_hex, _p_code, _p_name = _pantone["hex"], _pantone["code"], _pantone["name"]
+    _bottom_note = _get_bottom_note(topic, script)
+    _date_tag = _get_date_tag(topic) or ""
+
+    # tone → 插画视觉调性映射（让 LLM 写匹配情绪的插画 + 也写进 Python 硬拼 prompt）
+    _tone_aesthetic = {
+        "庄重": "mournful and somber, low-key dark sepia ink-wash, restrained composition with negative space, gravitas",
+        "怀旧": "warm aged sepia tone, vintage paper texture, sentimental tender atmosphere",
+        "轻松": "bright pastel ink-wash, gentle hopeful palette, airy composition",
+        "中性": "contemplative kinfolk editorial, balanced soft tones",
+    }.get(tone, "contemplative kinfolk editorial, balanced soft tones")
 
     if is_1919_global_topic(topic):
         cover_prompt = build_1919_global_cover_prompt(short_title)
-        aspect = "3:4"
         log(f"1919 万年历结构专用封面 prompt 由 Python 硬拼完成，长度 {len(cover_prompt)} 字符")
-    # ★ 中性分支走 Python 硬拼模板（Gemini 只给 2 行插画描述），其他 tone 保留 Gemini 自由翻译
-    elif tone == "中性" or tone not in ("轻松", "怀旧", "庄重"):
+    else:
+        # LLM 只给插画描述（ILLUSTRATION + BOTANICAL），结构其余部分 100% 由 Python 硬锁
         first_line = script[0]["text"] if script else ""
         try:
             _raw_ill = chat(
                 "GEMINI_25_FLASH",
                 "你是中国水墨插画师，只按严格格式输出两行。",
                 (
-                    f"为短视频封面插画场景写英文描述。\n主题：{topic}\n短标题：{short_title}\n台词首句：{first_line}\n"
+                    f"为短视频封面插画场景写英文描述。\n"
+                    f"主题：{topic}\n"
+                    f"基调：{tone}（视觉调性：{_tone_aesthetic}）\n"
+                    f"短标题：{short_title}\n"
+                    f"台词首句：{first_line}\n"
                     f"{producer_block}"
+                    f"插画情绪必须严格匹配上述视觉调性，禁与基调冲突的色彩或元素。\n"
                     f"只输出两行，不加任何解释：\n"
-                    f"ILLUSTRATION: <60-90 词英文插画场景描述，Kinfolk/ink-wash 风格，具体场景，不要提主标题文字>\n"
+                    f"ILLUSTRATION: <60-90 词英文插画场景描述，Kinfolk/ink-wash 风格，具体场景，匹配视觉调性，不要提主标题文字>\n"
                     f"BOTANICAL: <2-3 个英文植物名，逗号分隔，从这些挑 [{_botanical_hint}]>"
                 ),
             )
@@ -3785,9 +3662,8 @@ def _generate_cover_image(topic: str, short_title: str, script: list[dict]) -> s
             _illustration = "soft Chinese ink-wash watercolor scene reflecting the topic"
             _botanical = _botanical_hint.split(",")[0].strip() if "," in _botanical_hint else _botanical_hint
 
-        # Python 硬拼最终英文 prompt（100% 锁结构，Gemini 无法干预）
         cover_prompt = (
-            f'A 3:4 vertical Chinese ink-wash watercolor magazine cover, Kinfolk editorial. '
+            f'A 3:4 vertical Chinese ink-wash watercolor magazine cover, Kinfolk editorial, {_tone_aesthetic}. '
             f'Background cream #F7EFD6 to pale sage bottom, {_botanical} scattered. '
             f'Illustration (middle 50%): {_illustration}. '
             f'At the top edge HORIZONTALLY CENTERED (pill at exactly 50% frame width, NOT top-left): a single dark-charcoal iPhone Dynamic Island pill (solid dark fill, small horizontal pill shape) with white Chinese "中华万年历" + green-leaf icon. '
@@ -3799,8 +3675,7 @@ def _generate_cover_image(topic: str, short_title: str, script: list[dict]) -> s
             f'Every Chinese character sharp and complete, 8% safe margin. '
             f'No R1/R2/REGION labels. English and percentages only inside Pantone card. No watermarks.'
         )
-        log(f"中性分支封面 prompt 由 Python 硬拼完成，长度 {len(cover_prompt)} 字符")
-        # WeryAI text-to-image 硬上限 2000 字符，Python 硬拼分支也必须截断
+        log(f"万年历统一封面 prompt 由 Python 硬拼完成（tone={tone}，长度 {len(cover_prompt)} 字符）")
         if len(cover_prompt) > 1900:
             cut = cover_prompt[:1900]
             for sep in (". ", ", ", " and "):
@@ -3809,50 +3684,7 @@ def _generate_cover_image(topic: str, short_title: str, script: list[dict]) -> s
                     cut = cut[:idx + 1]
                     break
             cover_prompt = cut.rstrip() + ' No watermarks. Every Chinese character sharp and complete.'
-            log(f"中性分支封面 prompt 超长已截断：{len(cover_prompt)} 字符")
-    else:
-        # 其他 tone 保留 Gemini 自由翻译
-        try:
-            first_line = script[0]["text"] if script else ""
-            raw = chat(
-                "GEMINI_25_FLASH",
-                persona,
-                (
-                    f"为下面这条短视频生成一张**封面图**的 AI 绘图提示词（英文，给 Nano Banana 2 / Gemini 3.1 Flash Image 使用）。\n\n"
-                    f"主题：{topic}\n"
-                    f"基调：{tone}\n"
-                    f"短标题：{short_title}\n"
-                    f"台词首句：{first_line}\n\n"
-                    f"{producer_block}"
-                    f"{audience_goal}"
-                    f"{design_rules}\n"
-                    f"{title_style}\n"
-                    f"输出要求：\n"
-                    f"• 1 段英文 prompt，200-260 词\n"
-                    f"• 必须把中文标题「{short_title}」作为精确字符串嵌在英文 prompt 里\n"
-                    f"• 直接输出 prompt 本身，不加解释"
-                ),
-            )
-            cover_prompt = (raw or "").strip()
-            if not cover_prompt:
-                return None
-        except Exception as e:
-            log(f"封面 prompt 生成失败: {e}")
-            return None
-        if not cover_prompt:
-            return None
-        # WeryAI text-to-image prompt 上限 2000 字符，硬截断留余量
-        MAX_COVER_PROMPT = 1900
-        if len(cover_prompt) > MAX_COVER_PROMPT:
-            cut = cover_prompt[:MAX_COVER_PROMPT]
-            # 尽量在句号/逗号处截断，保证可读
-            for sep in (". ", ", ", " and "):
-                idx = cut.rfind(sep)
-                if idx > MAX_COVER_PROMPT * 0.7:
-                    cut = cut[:idx + 1]
-                    break
-            cover_prompt = cut.rstrip() + f' render the exact Chinese title "{short_title}" with sharp readable heiti typography, high detail, no watermark'
-            log(f"封面 prompt 超长已截断：{len(cover_prompt)} 字符")
+            log(f"万年历封面 prompt 超长已截断：{len(cover_prompt)} 字符")
 
     # 调 WeryAI text-to-image
     try:
