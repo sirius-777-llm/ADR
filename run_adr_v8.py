@@ -442,27 +442,31 @@ def apply_1919_global_guardrails(meta: dict) -> dict:
 
 
 def build_1919_global_cover_prompt(short_title: str) -> str:
-    """1919 全球史专题封面：固定信息层级，避免通用庄重模板跑偏。"""
+    """1919 全球史题材封面：保留中华万年历视频号封面结构，只替换历史插画内容。"""
     return (
-        "A 9:16 vertical historical documentary magazine cover about 1919 global awakening, "
-        "archival editorial design, strict three-zone structure. "
-        "TOP 18%: clean aged-paper header with the exact Chinese title "
-        f"\"{short_title}\" in bold readable Chinese Song-ti serif, dark ink, centered, one time only; "
-        "small date line below: \"1919\". "
-        "MIDDLE 58%: a disciplined archival collage arranged like a museum wall, not chaotic: "
-        "center object is a torn 1919 newspaper spread and telegram ribbons over an old world map; "
-        "four restrained documentary vignettes around it: pre-1949 plain Tiananmen gate with Chinese students holding period petitions, "
-        "Paris Peace Conference diplomats at a long table in dark morning coats, Korean March First movement crowd in colonial-era Seoul, "
-        "Indian Amritsar 1919 street with colonial police line and civilians; optional small Cairo 1919 protest newspaper clipping. "
-        "BOTTOM 24%: dark charcoal index band with five neat small labels: "
-        "\"五四运动\" \"巴黎和会\" \"三一运动\" \"阿姆利则\" \"埃及革命\"; "
-        "labels must be small, aligned, readable, and never larger than the main title. "
-        "Color palette: sepia paper, charcoal black, oxidized red as small accent only, muted brass lines; "
-        "flat editorial lighting, old newspaper grain, real 1919 archival mood. "
-        "No huge bottom title bar, no single-person hero poster, no modern propaganda poster style. "
+        "A 3:4 vertical Chinese almanac video-account cover, Kinfolk editorial aesthetic, "
+        "must preserve the established Zhonghua Wannianli cover structure. "
+        "Background: warm aged cream paper #F7EFD6 fading to pale sage, subtle old newspaper grain, "
+        "restrained sepia ink-wash texture, generous negative space, elegant Chinese editorial layout. "
+        "At the very top edge, horizontally centered: exactly ONE dark-charcoal rounded iPhone Dynamic Island pill, "
+        "containing white Chinese text \"中华万年历\" and one tiny green-leaf icon. "
+        "Top-right corner: a compact PANTONE-style color swatch chip with thin cream border, "
+        "upper 60% muted brass #D4A642, lower 40% cream strip with small text \"PANTONE\" / \"1919\" / \"觉醒金\". "
+        "Center rows 2-3, 85% width: render the exact Chinese title "
+        f"\"{short_title}\" once only, heavy-bold Chinese Song-ti serif, deep ink #1A1A1A, soft cream outline, "
+        "balanced as one or two centered lines, never cropped. "
+        "Directly below the main title: a small cream pill with dark sepia text \"1919年5月4日 · 民国八年\". "
+        "Middle-lower illustration area: refined ink-wash archival vignette, not a poster collage: "
+        "a wooden desk with a 1919 newspaper, a telegram strip, a student petition, a small old world map, "
+        "and tiny sepia photo cuttings hinting at pre-1949 Tiananmen, Paris Peace Conference, Korea March First, "
+        "Amritsar and Cairo; all elements are secondary, soft, and integrated into the almanac layout. "
+        "Very bottom center: small warm sepia-brown Chinese brush calligraphy line \"风起五四，万里同声\", "
+        "flanked by two small red seal dots. "
+        "Strict structure rule: no dark bottom title bar, no full-page event index, no chaotic museum-wall collage, "
+        "no single-person hero poster, no TIME magazine logo, no ADR logo, no large black footer. "
         "Absolute historical accuracy: no Mao portrait, no PRC flag, no five-star flag, no People's Heroes Monument, "
         "no post-1949 Tiananmen decorations or slogans, no Communist-era uniforms, no Cultural Revolution imagery, "
-        "no modern cars, LED screens, skyscrapers, watermarks, random English text, duplicated title, cropped Chinese characters."
+        "no modern cars, LED screens, skyscrapers, watermarks, duplicated title, cropped Chinese characters."
     )
 
 
@@ -3751,8 +3755,8 @@ def _generate_cover_image(topic: str, short_title: str, script: list[dict]) -> s
 
     if is_1919_global_topic(topic):
         cover_prompt = build_1919_global_cover_prompt(short_title)
-        aspect = "9:16"
-        log(f"1919 全球史专用封面 prompt 由 Python 硬拼完成，长度 {len(cover_prompt)} 字符")
+        aspect = "3:4"
+        log(f"1919 万年历结构专用封面 prompt 由 Python 硬拼完成，长度 {len(cover_prompt)} 字符")
     # ★ 中性分支走 Python 硬拼模板（Gemini 只给 2 行插画描述），其他 tone 保留 Gemini 自由翻译
     elif tone == "中性" or tone not in ("轻松", "怀旧", "庄重"):
         first_line = script[0]["text"] if script else ""
