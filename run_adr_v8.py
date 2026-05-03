@@ -389,17 +389,56 @@ def detect_topic_meta(topic: str) -> dict:
         raw = chat("GEMINI_25_FLASH", "你是历史考证与电影视觉风格专家，只输出 JSON。", prompt, max_tokens=600)
         s = raw.find('{'); e = raw.rfind('}')
         meta = json.loads(raw[s:e+1])
+        if is_1919_global_topic(topic):
+            meta = apply_1919_global_guardrails(meta)
         log(f"题材分析：culture={meta.get('culture')} region={meta.get('region')} era={meta.get('era')} director={meta.get('director')}")
         return meta
     except Exception as ex:
         log(f"题材分析失败（fallback 到中国默认）: {ex}")
-        return {
+        meta = {
             "culture": "chinese", "region": "中国", "era": "",
             "director": "Zen contemplative cinematography, deep focus, soft warm tones, horizontal natural composition",
             "period_visual": "bamboo scroll, red lacquer, traditional Chinese architecture, ink wash",
             "period_costume": "Han Chinese people in traditional attire",
             "negative": "no Western figures, no Caucasian faces, no European architecture",
         }
+        if is_1919_global_topic(topic):
+            meta = apply_1919_global_guardrails(meta)
+        return meta
+
+
+def is_1919_global_topic(topic: str) -> bool:
+    keys = ("1919", "五四", "巴黎和会", "凡尔赛", "三一运动", "阿姆利则", "民族觉醒")
+    return any(k in topic for k in keys)
+
+
+def apply_1919_global_guardrails(meta: dict) -> dict:
+    """1919/五四全球史题材的历史视觉硬约束，避免新中国时期元素穿帮。"""
+    updated = dict(meta)
+    updated["culture"] = "global 1919 / Chinese Republican-era plus European and colonial contexts"
+    updated["region"] = "北京天安门广场、巴黎凡尔赛、朝鲜京城、印度旁遮普、埃及开罗"
+    updated["era"] = "1919年，一战结束后的民国八年与全球殖民地民族运动时期"
+    updated["director"] = (
+        "post-war archival documentary realism, muted monochrome sepia, newspaper texture, "
+        "crowd silhouettes, hand-held reportage tension"
+    )
+    updated["period_visual"] = (
+        "1919 student petitions, plain Tiananmen gate before 1949 decoration, Paris conference tables, "
+        "colonial police lines, newspapers, telegrams, cloth banners with period slogans"
+    )
+    updated["period_costume"] = (
+        "1919 Chinese students in long gowns, early Republican jackets and cloth shoes; "
+        "European diplomats in dark morning coats; Korean, Indian and Egyptian civilians in period-accurate local clothing"
+    )
+    extra_negative = (
+        "no Mao portrait, no PRC national flag, no five-star red flag, no People's Heroes Monument, "
+        "no modern Tiananmen decorations, no post-1949 red political slogans, no Communist-era uniforms, "
+        "no Cultural Revolution imagery, no modern LED screens, no modern cars, no skyscrapers, "
+        "no simplified post-1949 propaganda poster style"
+    )
+    old_negative = updated.get("negative", "")
+    updated["negative"] = f"{old_negative}, {extra_negative}" if old_negative else extra_negative
+    return updated
 
 
 def build_shot_blueprint(n: int) -> list[str]:
@@ -696,6 +735,7 @@ def step1_script(topic: str) -> list[dict]:
 • NEGATIVE（必须排除的错位元素）: {topic_meta.get('negative')}
 
 ⚠️ 所有后续字段（尤其是 SUBJECT_DETAILS / VISUAL_CONTINUITY / Hero Anchor）必须严格匹配上方铁律。本片 culture 是 {topic_meta.get('culture')}——如果是 western/japanese/other，严禁把主角画成中国人/东亚面孔；如果是 chinese，严禁画成西方/东欧面孔。张冠李戴即为本片废掉。
+{"\n★★★★ 1919 五四/全球史专项铁律 ★★★★\n本片发生在 1919 年，绝对不能出现新中国成立后的任何视觉元素：毛泽东画像、五星红旗、人民英雄纪念碑、1949 后天安门城楼装饰、现代红色政治标语、解放军/红卫兵/中山装集会、现代汽车和 LED 屏幕全部禁止。1919 的天安门必须是民国时期城楼与广场环境，允许学生布旗/纸质标语，但必须是当时语境（如外争主权、还我青岛、拒签和约），不能是新中国宣传视觉。\n" if is_1919_global_topic(topic) else ""}
 
 主题：「{topic}」
 基调：{tone}（庄重 / 轻松 / 中性）
@@ -884,6 +924,7 @@ THUMBNAIL_ANCHOR: 封面视觉锚，用 4~6 个短语描述：主体、主色（
   - ★ 开头强制引用制片人 VISUAL_CONTINUITY 里的 Style Anchor 短语（一字不差）+ Hero Anchor 外观（当画面里有主角时）作为前置描述，确保全片 {num_lines} 张图画风、主角、色板完全一致
   - ★★ 文化铁律（题材相关，已由系统预判）：本片文化背景 = **{topic_meta.get('culture')}** / 地域 = **{topic_meta.get('region')}** / 年代 = **{topic_meta.get('era')}**。人物形象铁律："{topic_meta.get('period_costume', '')}"。视觉母题池："{topic_meta.get('period_visual', '')}"。每张图必须严格符合该文化/地域/年代，严禁张冠李戴（中国题材画成欧美、西方题材画成东亚都是失败）
   - ★★ 反 cliché negative（题材相关）：英文 prompt 结尾必须含 "{topic_meta.get('negative', '')}"
+  - {'★★ 1919 专项禁令：每条英文 prompt 必须显式包含 "1919 Republican-era Beijing or post-WWI global setting; no Mao portrait, no PRC flag, no People Heroes Monument, no post-1949 Tiananmen decorations, no modern propaganda slogans"。' if is_1919_global_topic(topic) else ''}
   - 每张图必须使用制片人 PALETTE 指定的主色板，不得偏离
   - {'严格按照每句台词方括号内的板块主题设计画面' if almanac_data else '画面聚焦台词中的现代/校园/童趣场景，不使用历史元素' if tone == '轻松' else '严格符合上述历史参考中的年代、服饰、建筑、器物特征'}
   - {'中国传统美术风格，工笔画或水墨画质感，暖色调，高清' if almanac_data else '画风严格遵循制片人 STYLE_KEY，高清细腻' if tone == '轻松' else '写实老照片风格，sepia tone，高清'}
@@ -988,6 +1029,12 @@ THUMBNAIL_ANCHOR: 封面视觉锚，用 4~6 个短语描述：主体、主色（
         if style:
             parts.append(style)
         prompt = ", ".join(p for p in parts if p)
+        if is_1919_global_topic(topic):
+            prompt += (
+                ". Historical accuracy lock: 1919 Republican-era Beijing or post-WWI global setting; "
+                "Tiananmen must be pre-1949 without Mao portrait, without PRC flag, without People's Heroes Monument, "
+                "without modern Tiananmen decorations; use period student petitions, newspapers, telegrams, dark diplomatic coats, colonial-era streets"
+            )
         if neg_tag:
             prompt += f". Negative: {neg_tag}"
         script.append({"text": line, "emotion": emotion, "prompt": prompt, "historical_context": historical_context, "tone": tone})
@@ -1630,17 +1677,71 @@ def generate_image(scene: dict, idx: int, _max_retries: int = 3) -> int:
     return idx
 
 
+def _llm_bgm_description(topic: str, tone: str) -> str | None:
+    """LLM 主路径：根据主题+基调直接产出 BGM 英文 prompt。失败/质量异常返回 None，由调用方退回硬编码。"""
+    prompt = f"""为纪录片配乐生成 weryai 音乐 API 的英文 prompt（25-45 词）。
+
+主题：{topic}
+情感基调：{tone}
+
+要求：
+1. 必须包含 3-5 件具体乐器（如 low strings, muted piano, distant timpani, military snare, accordion）
+2. 必须包含 2-3 个情绪关键词（如 solemn, restrained, contemplative, melancholic, triumphant, hopeful, tense, reverent）
+3. 体现题材时代感（如 "1920s archival" / "post-WWI" / "Tang dynasty courtly" / "modern tech"），但不要直接抄具体片名/导演名
+4. 严禁人声/合唱/lyrics
+5. 不要包含 "starting at peak energy / minimal intro / no vocals"——这些由代码追加
+6. 纯英文一行，无引号、无 Markdown、无解释
+
+参考样式（仅供 vibe 参考，不要照抄措辞）：
+- 历史悲剧：Solemn reflective documentary score, slow strings and piano, distant funeral march, restrained mournful atmosphere, 1920s archival cold
+- 1919 战后：Restrained post-WWI score, low strings muted piano distant military snare, newspaper-press rhythm, cold archival grave
+- 怀旧 80 年代：Nostalgic warm instrumental, solo piano harmonica accordion music box, slow waltz tempo, sentimental tender
+- 航天史诗：Heroic epic orchestral, grand strings brass choir timpani, triumphant uplifting cosmic, cinematic exploration
+
+直接输出英文描述（一行）："""
+    try:
+        out = chat("GEMINI_3_1_FLASH_LITE", "你是纪录片配乐导演，精通电影配乐风格与乐器编排。", prompt, max_tokens=1000, timeout=45).strip()
+        out = out.strip('"').strip("'").strip()
+        out = out.split('\n')[0].strip()
+        word_count = len(out.split())
+        if word_count < 12 or word_count > 80:
+            log(f"BGM LLM 输出长度异常（{word_count} 词），退回硬编码")
+            return None
+        if not re.search(r'[a-zA-Z]', out):
+            log("BGM LLM 输出无英文，退回硬编码")
+            return None
+        return out
+    except Exception as e:
+        log(f"BGM LLM 描述生成失败: {e}，退回硬编码")
+        return None
+
+
 def generate_bgm(topic: str, tone: str = "中性") -> str | None:
     bgm_path = str(OUTPUT_DIR / "bgm.mp3")
     MAX_BGM_RETRY = 3
-    if tone == "轻松":
+    SUFFIX = ", starting directly at peak energy with minimal intro, no vocals"
+
+    # 主路径：LLM 直接生成描述（覆盖任意长尾主题）
+    llm_desc = _llm_bgm_description(topic, tone)
+    if llm_desc:
+        bgm_desc = f"{llm_desc}{SUFFIX}"
+        log(f"BGM 描述: LLM ({len(llm_desc.split())} 词) → {llm_desc[:120]}...")
+    elif tone == "轻松":
         bgm_desc = f"Cheerful upbeat children's background music for '{topic}', ukulele marimba glockenspiel whistle claps, warm playful hopeful mood, light and bouncy, family-friendly, starting directly at peak energy with minimal intro, no vocals"
     elif tone == "怀旧":
         bgm_desc = f"Nostalgic warm instrumental soundtrack for '{topic}', solo piano and harmonica and accordion and music box, slow waltz tempo, sentimental tender mood, like memories of 1980s China, starting directly at peak energy with minimal intro, no vocals"
     elif tone == "庄重":
         bgm_desc = f"Solemn reflective documentary soundtrack for '{topic}', slow strings and piano, restrained reverent atmosphere, starting directly at peak energy with minimal intro, no vocals"
     else:  # 中性 → 按主题关键词细分
-        if any(k in topic for k in ("航天", "太空", "卫星", "火箭", "东方红", "神舟", "嫦娥", "北斗", "天宫", "宇宙", "星辰")):
+        if is_1919_global_topic(topic):
+            bgm_desc = (
+                f"Restrained post World War I 1919 historical documentary score for '{topic}', "
+                "low strings, muted piano, distant military snare, newspaper-press rhythm, cold archival atmosphere, "
+                "grave but not triumphant, no guzheng, no erhu, no festive Chinese folk instruments, no heroic propaganda march, "
+                "starting directly with a tense pulse and minimal intro, no vocals"
+            )
+            log("BGM 细分: 1919战后民族觉醒")
+        elif any(k in topic for k in ("航天", "太空", "卫星", "火箭", "东方红", "神舟", "嫦娥", "北斗", "天宫", "宇宙", "星辰")):
             bgm_desc = f"Heroic epic orchestral soundtrack for '{topic}', grand strings brass choir and timpani, triumphant uplifting mood, space exploration cinematic like Interstellar and Apollo, starting directly at peak energy with minimal intro, no vocals"
             log("BGM 细分: 航天史诗")
         elif any(k in topic for k in ("AI", "人工智能", "科技", "互联网", "算法", "机器人", "智能")):
