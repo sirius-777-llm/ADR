@@ -441,6 +441,31 @@ def apply_1919_global_guardrails(meta: dict) -> dict:
     return updated
 
 
+def build_1919_global_cover_prompt(short_title: str) -> str:
+    """1919 全球史专题封面：固定信息层级，避免通用庄重模板跑偏。"""
+    return (
+        "A 9:16 vertical historical documentary magazine cover about 1919 global awakening, "
+        "archival editorial design, strict three-zone structure. "
+        "TOP 18%: clean aged-paper header with the exact Chinese title "
+        f"\"{short_title}\" in bold readable Chinese Song-ti serif, dark ink, centered, one time only; "
+        "small date line below: \"1919\". "
+        "MIDDLE 58%: a disciplined archival collage arranged like a museum wall, not chaotic: "
+        "center object is a torn 1919 newspaper spread and telegram ribbons over an old world map; "
+        "four restrained documentary vignettes around it: pre-1949 plain Tiananmen gate with Chinese students holding period petitions, "
+        "Paris Peace Conference diplomats at a long table in dark morning coats, Korean March First movement crowd in colonial-era Seoul, "
+        "Indian Amritsar 1919 street with colonial police line and civilians; optional small Cairo 1919 protest newspaper clipping. "
+        "BOTTOM 24%: dark charcoal index band with five neat small labels: "
+        "\"五四运动\" \"巴黎和会\" \"三一运动\" \"阿姆利则\" \"埃及革命\"; "
+        "labels must be small, aligned, readable, and never larger than the main title. "
+        "Color palette: sepia paper, charcoal black, oxidized red as small accent only, muted brass lines; "
+        "flat editorial lighting, old newspaper grain, real 1919 archival mood. "
+        "No huge bottom title bar, no single-person hero poster, no modern propaganda poster style. "
+        "Absolute historical accuracy: no Mao portrait, no PRC flag, no five-star flag, no People's Heroes Monument, "
+        "no post-1949 Tiananmen decorations or slogans, no Communist-era uniforms, no Cultural Revolution imagery, "
+        "no modern cars, LED screens, skyscrapers, watermarks, random English text, duplicated title, cropped Chinese characters."
+    )
+
+
 def build_shot_blueprint(n: int) -> list[str]:
     """按分镜号硬生成电影级镜头模板（景别+机位+光影+母题）。
     Python 层直接拼到每句 prompt 前，绕过 LLM 对镜头语法的软性遵从。"""
@@ -3028,6 +3053,24 @@ def _overlay_title_on_cover(cover_path: str, title: str, tone: str) -> str:
     return cover_path
 
 
+def _prepare_tg_photo(path: str, max_bytes: int = 9 * 1024 * 1024) -> str:
+    """Telegram sendPhoto 对尺寸/体积敏感；保留原图，必要时生成轻量预览图。"""
+    try:
+        if os.path.getsize(path) <= max_bytes:
+            return path
+        from PIL import Image
+
+        src = Path(path)
+        preview = src.with_name(f"{src.stem}_tg_preview.jpg")
+        im = Image.open(path).convert("RGB")
+        im.thumbnail((1080, 1920), Image.Resampling.LANCZOS)
+        im.save(preview, "JPEG", quality=88, optimize=True)
+        return str(preview)
+    except Exception as e:
+        log(f"Telegram 封面预览压缩失败，尝试发送原图: {e}")
+        return path
+
+
 # ═══ Pantone 节气色卡系统（24 节气 × 专属色）═══════════════════════════════
 # 每个节气从当天起到下个节气前一天都用这个色；给封面右上角做 Pantone 风色卡条签名
 PANTONE_JIEQI = {
@@ -3706,8 +3749,12 @@ def _generate_cover_image(topic: str, short_title: str, script: list[dict]) -> s
 
     producer_block = f"【制片人准则（请重点参考其 STYLE_KEY / PALETTE / THUMBNAIL_ANCHOR 字段）】\n{producer_brief}\n\n" if producer_brief else ""
 
+    if is_1919_global_topic(topic):
+        cover_prompt = build_1919_global_cover_prompt(short_title)
+        aspect = "9:16"
+        log(f"1919 全球史专用封面 prompt 由 Python 硬拼完成，长度 {len(cover_prompt)} 字符")
     # ★ 中性分支走 Python 硬拼模板（Gemini 只给 2 行插画描述），其他 tone 保留 Gemini 自由翻译
-    if tone == "中性" or tone not in ("轻松", "怀旧", "庄重"):
+    elif tone == "中性" or tone not in ("轻松", "怀旧", "庄重"):
         first_line = script[0]["text"] if script else ""
         try:
             _raw_ill = chat(
@@ -4008,7 +4055,8 @@ def step10_deliver(final_path: str, topic: str, script: list[dict]):
     cover_path = _generate_cover_image(topic, short_title, script)
     if cover_path:
         try:
-            with open(cover_path, "rb") as img_f:
+            cover_send_path = _prepare_tg_photo(cover_path)
+            with open(cover_send_path, "rb") as img_f:
                 requests.post(
                     f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendPhoto",
                     data={
@@ -4031,7 +4079,8 @@ def step10_deliver(final_path: str, topic: str, script: list[dict]):
             tg(f"⚠️ 专属封面生成未完成（reason={COVER_LAST_REASON or 'unknown'}），使用首张分镜图兜底")
         fallback = str(OUTPUT_DIR / "img_0.jpg")
         try:
-            with open(fallback, "rb") as img_f:
+            fallback_send_path = _prepare_tg_photo(fallback)
+            with open(fallback_send_path, "rb") as img_f:
                 requests.post(
                     f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendPhoto",
                     data={"chat_id": TG_CHAT_ID, "caption": "🖼 封面（兜底 · 首张分镜）"},
