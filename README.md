@@ -37,6 +37,7 @@ ADR 是一套全自动纪录片短视频生成管线。给一个主题，输出�
   │
   ├─ Step 6.5: 动态化（★ 新增，可选）
   │    触发：CLI `--with-motion` 或 tool 参数 `with_motion=true`
+  │    ADS 拟现场记者模式：CLI `--ads-reporter`（自动开启 `--with-motion`）
   │    WERYDANCE_2_0 × N 分镜并发（aspect 跟随 h/v）
   │    GEMINI_25_FLASH 为每分镜生成英文 motion prompt
   │    替换原 seg_N.mp4；per-scene 失败保留静态版，不中断流程
@@ -72,6 +73,7 @@ ADR 是一套全自动纪录片短视频生成管线。给一个主题，输出�
 - **历史顾问单独用 Claude Opus**：历史穿帮成本最高，用最强模型兜底；其他岗位用 Gemini 省钱
 - **Whisper 时间对齐**：从贪心合并改为语速曲线插值，准确度显著提升
 - **动态化可选**：WERYDANCE 模型把 PPT 切换感变电影感，成本 10x 速度 2x，默认关
+- **ADS 拟现场记者模式**：`--ads-reporter` 自动开启动态化，把剧本、分镜和 motion prompt 统一为第一人称历史现场报道；严禁现代直播设备穿帮
 - **专属封面独立生成**：Step 10 里从 9 张分镜里不是随机抽两张，而是专门出一张中老年优化封面
 
 ## 快速开始
@@ -87,6 +89,9 @@ pip install requests faster-whisper
 
 # 运行
 python3 run_adr_v8.py "1924年泰戈尔访华"
+
+# ADS 拟现场记者 + 动态化
+python3 run_adr_v8.py "1915年二十一条最后通牒与科技强权" v --ads-reporter
 ```
 
 ## 环境变量

@@ -125,6 +125,36 @@ if "--skip-approval" in sys.argv:
 WITH_MOTION = "--with-motion" in sys.argv  # 每分镜走 WERYDANCE_2_0 生成带运动视频，~2x 时长 + $0.3/scene
 NO_VOICE    = "--no-voice" in sys.argv    # 跳过 Podcast / TTS，用静音轨占位；成片只有画面 + 字幕 + BGM
 
+# --ads-reporter：把 ADS 的"拟现场第一人称记者感"并入 ADR 动态化。
+# 该模式自动开启 --with-motion，并约束剧本、分镜与 motion prompt；
+# 注意它是"拟现场报道"，不是现代直播，严禁手机/电视台/现代麦克风穿帮。
+ADS_REPORTER_MODE = (
+    "--ads-reporter" in sys.argv
+    or "--first-person-reporter" in sys.argv
+    or os.environ.get("ADR_ADS_REPORTER", "").strip().lower() in ("1", "true", "yes", "on")
+)
+if ADS_REPORTER_MODE:
+    WITH_MOTION = True
+
+ADS_REPORTER_SCRIPT_GUIDE = """
+
+【ADS 拟现场记者模式 · 最高优先级】
+• 全片采用第一人称拟现场报道口吻：我看到、我听见、我收到电报、我站在某处门外。
+• 必须明确这是历史拟现场报道，不得说成真实直播，不得出现穿越设定。
+• 每 2~3 句给出一个地点或消息来源：北京外交部外、码头电报局、报馆、战壕后方、新闻号外、电话局、世博会会场等。
+• 叙事像 1910 年代战地记者的 dispatch：短句、现场感、事实优先，避免现代主播腔。
+• 严禁出现现代直播、手机、电视台、无线麦、直播间、弹幕、镜头前家人们等现代语汇。
+• 最后必须落回主题的历史判断：我看到的不只是一个事件，而是现代强权体系压到现场。"""
+
+ADS_REPORTER_VISUAL_GUIDE = """
+
+★★★ ADS 拟现场记者视觉模式（最高优先级，启用 --ads-reporter 时必须执行）★★★
+全片必须像 1910 年代战地记者/新闻摄影师的拟现场报道：手持新闻摄影、新闻胶片颗粒、记者笔记本、电报纸、号外报纸、码头、战壕后方、电话局、报馆编辑室、外交衙门门外等待消息的人群。
+每条英文 prompt 必须至少包含一种现场报道锚点：POV first-person / handheld newsreel / reporter notebook / telegram sheet / newspaper extra / field correspondent.
+画面可以是第一人称视角的手、笔记本、皮箱、旧式相机、报纸、电报，不要反复生成同一个现代主持人。
+严禁现代直播设备、手机、电视台演播室、LED 屏、现代记者证、无线麦克风、摄影棚灯、现代耳返。
+如果主题跨地域，画面切换必须通过"电报/报纸/电话局/码头来信"串联，避免真实穿越感。"""
+
 # --speaker <id[:name]> 指定 Podcast 音色（覆盖 VDAR 默认晓曼 / LLM 自选）
 # 常用：gushijingling-720c0ae5:故事精灵（少儿）、chat-girl-105-cn:晓曼（温柔女声）、
 #       gaoqing3-bfb5c88a:高晴（明亮女声）、liyan2-ef9401ec:国栋（沉稳男声）
@@ -701,6 +731,7 @@ def step1_script(topic: str) -> list[dict]:
 • 严禁"让我们"、"众所周知"、"话说"这类纪录片套话
 {style_guide}
 • 如果涉及老黄历、彭祖百忌、宜忌等传统禁忌内容，必须用现代白话做安全化解读，不能照搬古文原句
+{ADS_REPORTER_SCRIPT_GUIDE if ADS_REPORTER_MODE else ""}
 • 只输出 {num_lines} 行纯台词，每行一句，不加编号不加标点以外的任何内容"""
 
     # 老黄历数据校验：从注入数据中提取必须出现在台词中的关键值
@@ -970,6 +1001,7 @@ THUMBNAIL_ANCHOR: 封面视觉锚，用 4~6 个短语描述：主体、主色（
 
 ★ 严禁词汇（任何一条 prompt 里出现以下词就是失败）：
 ❌ `centered composition` / `well-lit` / `clear visibility` / `standard shot` / `documentary style` / `normal angle` / `straightforward composition`
+{ADS_REPORTER_VISUAL_GUIDE if ADS_REPORTER_MODE else ""}
 
 为每句台词输出：
 • 情绪标签（从以下选一个）：{'欢快 / 希望 / 温暖 / 童趣 / 活力 / 惊喜' if tone == '轻松' else '悲壮 / 紧张 / 孤独 / 辉煌 / 压抑 / 释然'}
@@ -2103,6 +2135,12 @@ def step6_parallel(script: list[dict], topic: str) -> str | None:
 def _generate_motion_prompts(script: list[dict]) -> list[str]:
     """用 Gemini 为每个分镜生成英文 motion 描述（40-60 词）"""
     n = len(script)
+    reporter_motion_guide = """
+- ADS reporter mode is ON: make every motion feel like 1910s field-correspondent footage.
+- Prefer handheld newsreel sway, first-person POV movement, shoulder-level walking, quick rack focus to telegram sheets, reporter notebook, newspaper extra, trench parapet, dock smoke, telephone switchboard.
+- Use period-appropriate motion only; no smartphone livestream, no TV studio camera, no modern microphone, no LED screen.
+- Keep it immersive but historically plausible: a staged dispatch/newsreel, not a real modern live broadcast.
+""" if ADS_REPORTER_MODE else ""
     try:
         summary_lines = "\n".join(
             f"{i+1}. ({sc.get('dur', 5):.0f}s, emotion: {sc.get('emotion', 'neutral')}) {sc['text'][:80]}"
@@ -2121,6 +2159,7 @@ Rules:
 - Match emotion: tense → sharper moves; calm → slow; historical → steady.
 - End with ", cinematic atmosphere, smooth motion" for consistency.
 - Do NOT describe what's in the frame (that's already fixed).
+{reporter_motion_guide}
 
 Output strict JSON array of {n} strings:
 ["motion1", "motion2", ...]"""
@@ -2284,7 +2323,8 @@ def _motion_one_scene(idx: int, scene: dict, motion_prompt: str, aspect_ratio: s
 def step65_motion(script: list[dict]):
     """把静态 seg_N.mp4 替换为 WERYDANCE_2_0 动态版本（并发 + 单轮内失败自动重试 1 次）"""
     n = len(script)
-    tg(f"🎬 动态化启动：WERYDANCE_2_0 × {n} 分镜并发生成运动视频...")
+    reporter_tag = " · ADS拟现场记者" if ADS_REPORTER_MODE else ""
+    tg(f"🎬 动态化启动{reporter_tag}：WERYDANCE_2_0 × {n} 分镜并发生成运动视频...")
 
     # 1. 生成每个分镜的 motion prompt
     motion_prompts = _generate_motion_prompts(script)
