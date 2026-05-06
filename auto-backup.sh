@@ -7,11 +7,19 @@ cd /Users/wekoidubai/ADR || exit 1
 BACKUP_REMOTE="${ADR_BACKUP_REMOTE:-gitlab}"
 BACKUP_BRANCH="${ADR_BACKUP_BRANCH:-main}"
 
+push_backup() {
+    if ! git push "$BACKUP_REMOTE" "$BACKUP_BRANCH"; then
+        echo "[$(date '+%F %T')] WARN: git push $BACKUP_REMOTE $BACKUP_BRANCH failed"
+        return 1
+    fi
+}
+
 CHANGES=$(git diff --name-only -- '*.py' '*.md' '*.skill' '*.sh' 'skill/' 'openclaw-skill/')
 UNTRACKED=$(git ls-files --others --exclude-standard -- '*.py' '*.md' '*.skill' '*.sh')
 
 if [ -z "$CHANGES" ] && [ -z "$UNTRACKED" ]; then
-    exit 0
+    push_backup
+    exit $?
 fi
 
 git add -- '*.py' '*.md' '*.skill' '*.sh' 'skill/' 'openclaw-skill/' 2>/dev/null
@@ -25,7 +33,4 @@ fi
 
 MSG="auto-backup: $(echo $CHANGES $UNTRACKED | tr '\n' ' ' | sed 's/ *$//')"
 git commit -m "$MSG" --no-gpg-sign 2>/dev/null || exit 0
-if ! git push "$BACKUP_REMOTE" "$BACKUP_BRANCH"; then
-    echo "[$(date '+%F %T')] WARN: git push $BACKUP_REMOTE $BACKUP_BRANCH failed"
-    exit 1
-fi
+push_backup
