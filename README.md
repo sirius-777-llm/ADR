@@ -6,6 +6,10 @@ ADR 是一套全自动纪录片短视频生成管线。给一个主题，输出�
 - **HDAR**（默认 `h`）：1280×720 横屏 16:9
 - **VDAR**（`v`）：720×1280 竖屏 9:16（自动切女声晓曼，面向中老年视频号）
 
+扩展工作流：
+- **VADS**：`VDAR + --ads-reporter`，竖屏拟现场记者动态化短片（自动开启 WERYDANCE motion）
+- **HADS**：`HDAR + --ads-reporter`，横屏拟现场记者动态化纪录片（自动开启 WERYDANCE motion）
+
 ## 架构（截至本 README 更新日）
 
 ```
