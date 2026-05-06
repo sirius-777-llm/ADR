@@ -138,22 +138,49 @@ if ADS_REPORTER_MODE:
 
 ADS_REPORTER_SCRIPT_GUIDE = """
 
-【ADS 拟现场记者模式 · 最高优先级】
-• 全片采用第一人称拟现场报道口吻：我看到、我听见、我收到电报、我站在某处门外。
-• 必须明确这是历史拟现场报道，不得说成真实直播，不得出现穿越设定。
-• 每 2~3 句给出一个地点或消息来源：北京外交部外、码头电报局、报馆、战壕后方、新闻号外、电话局、世博会会场等。
-• 叙事像 1910 年代战地记者的 dispatch：短句、现场感、事实优先，避免现代主播腔。
-• 严禁出现现代直播、手机、电视台、无线麦、直播间、弹幕、镜头前家人们等现代语汇。
-• 最后必须落回主题的历史判断：我看到的不只是一个事件，而是现代强权体系压到现场。"""
+【ADS 第一人称电影感 POV 模式 · 最高优先级】
+• 全片采用第一人称沉浸式纪实口吻：我看到、我听见、我手里拿着、我站在某处。
+• 不是真实直播，不是综艺主播；是"现场目击者"的私人 dispatch 风。
+• 每 2~3 句给出一个具体地点或目击物（按主题时代适配）：
+  - 1900-1949 历史现场 → 外交部门外、码头电报局、报馆、战壕后方、外公墙下
+  - 1950-1999 → 编辑部、磁带间、长途电话亭、车间、广场
+  - 现代（2000+）→ 办公室窗边、白板前、走廊、咖啡馆、机场、屏幕前的笔记本
+• 叙事节奏：短句、现场感、事实优先；避免主播腔、综艺腔、PPT 念稿腔。
+• 严禁现代直播、手机自拍、电视台演播室、无线麦、直播间、弹幕、"家人们"等综艺语汇。
+• 最后一句要落回主题的判断/感受：我看到的不只是一个事件/产品/计划，而是 [更大的命题]。"""
 
 ADS_REPORTER_VISUAL_GUIDE = """
 
-★★★ ADS 拟现场记者视觉模式（最高优先级，启用 --ads-reporter 时必须执行）★★★
-全片必须像 1910 年代战地记者/新闻摄影师的拟现场报道：手持新闻摄影、新闻胶片颗粒、记者笔记本、电报纸、号外报纸、码头、战壕后方、电话局、报馆编辑室、外交衙门门外等待消息的人群。
-每条英文 prompt 必须至少包含一种现场报道锚点：POV first-person / handheld newsreel / reporter notebook / telegram sheet / newspaper extra / field correspondent.
-画面可以是第一人称视角的手、笔记本、皮箱、旧式相机、报纸、电报，不要反复生成同一个现代主持人。
-严禁现代直播设备、手机、电视台演播室、LED 屏、现代记者证、无线麦克风、摄影棚灯、现代耳返。
-如果主题跨地域，画面切换必须通过"电报/报纸/电话局/码头来信"串联，避免真实穿越感。"""
+★★★ ADS 第一人称电影感 POV 视觉模式（最高优先级，启用 --ads-reporter 时必须执行）★★★
+
+全片采用第一人称电影 POV 视角，沉浸式现场感。每条英文 prompt 必须同时包含 POV 锚点 + 电影摄影语言。
+
+【POV 锚点 · 至少含一项】
+• 第一人称镜头：POV first-person handheld / point-of-view shot / over-the-shoulder / through-viewfinder
+• 第一人称身体进画面：own hands holding [notebook/telegram/document/keyboard/paper], own boots walking, looking down at lap, looking up at ceiling/banner
+• 现场目击物占据前景：notebook page filling lower frame, camera viewfinder edge, window frame in foreground, hand reaching into frame, document edge
+
+【电影摄影语言 · 至少含 1-2 项】
+• 镜头：handheld shake, anamorphic lens flare, rack focus, dolly-in, push-in, whip-pan, slow zoom
+• 颗粒/质感：16mm film grain, 35mm celluloid texture, light leak, vignette, halation
+• 景深：shallow depth of field, foreground bokeh, in-focus subject mid-frame
+• 光线：natural window light, dust motes in beam, golden-hour rim, candlelight glow, single-key chiaroscuro
+
+【时代锚 · 按主题年代适配，不强行锁 1910 年代】
+• 1900-1949 历史现场 → 战地记者 dispatch（新闻胶片颗粒、记者笔记本、电报纸、号外、电话局、外交衙门门外人群）
+• 1950-1999 → 16mm 纪实风（手持胶片、监听电话、磁带、卷带打字机、长途电话亭、报刊亭）
+• 现代题材（2000 后）→ 现代纪实 POV（笔记本电脑屏幕反光、便签贴、白板涂鸦、咖啡杯入画、走廊脚步、玻璃幕墙倒影、键盘前手部特写、屏幕滚动条 POV）
+  现代场景**仍走 POV 第一人称纪实感**，绝不做主播大头出镜、综艺综艺综艺。
+
+【硬禁条目 · 不分时代】
+• 摄影棚灯、绿幕背景、PPT 切换感、卡通儿童插画、综艺背景板
+• 第三人称主播大头出镜（这是 ADS 的反面）
+• 现代直播设备特写（手机自拍杆、电视台 logo、直播按钮、弹幕滚动）
+• 任何"演播室录制"质感
+
+【跨地域/跨场景切换】
+通过 POV 道具串联：地图上的手指、票根、电报、信件、白板更新、屏幕滚动、笔记本翻页。
+让观众感觉是同一双眼睛在不同地方目击，而不是镜头在切。"""
 
 # --speaker <id[:name]> 指定 Podcast 音色（覆盖 VDAR 默认晓曼 / LLM 自选）
 # 常用：gushijingling-720c0ae5:故事精灵（少儿）、chat-girl-105-cn:晓曼（温柔女声）、
