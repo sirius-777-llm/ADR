@@ -254,6 +254,13 @@ _image_last_submit_ts = 0.0
 IMAGE_SUBMIT_MIN_INTERVAL = float(os.environ.get("ADR_IMAGE_SUBMIT_INTERVAL", "2.5"))
 IMAGE_RATE_LIMIT_BACKOFF = float(os.environ.get("ADR_IMAGE_RATE_LIMIT_BACKOFF", "15"))
 
+# WERYDANCE text-to-video 的 submit 频率限制比普通后台并发更敏感。
+# 单独节流 submit；后续 poll/download 仍并发，避免把 20 路 worker 全串行化。
+_motion_submit_lock = threading.Lock()
+_motion_last_submit_ts = 0.0
+MOTION_SUBMIT_MIN_INTERVAL = float(os.environ.get("ADR_MOTION_SUBMIT_INTERVAL", "10"))
+MOTION_RATE_LIMIT_BACKOFF = float(os.environ.get("ADR_MOTION_RATE_LIMIT_BACKOFF", "30"))
+
 
 def _wait_image_submit_slot(label: str = ""):
     global _image_last_submit_ts
@@ -266,6 +273,19 @@ def _wait_image_submit_slot(label: str = ""):
             log(f"{label} text-to-image submit 节流等待 {wait_s:.1f}s")
             time.sleep(wait_s)
         _image_last_submit_ts = time.time()
+
+
+def _wait_motion_submit_slot(label: str = ""):
+    global _motion_last_submit_ts
+    if MOTION_SUBMIT_MIN_INTERVAL <= 0:
+        return
+    with _motion_submit_lock:
+        elapsed = time.time() - _motion_last_submit_ts
+        wait_s = max(0.0, MOTION_SUBMIT_MIN_INTERVAL - elapsed)
+        if wait_s > 0:
+            log(f"{label} text-to-video submit 节流等待 {wait_s:.1f}s")
+            time.sleep(wait_s)
+        _motion_last_submit_ts = time.time()
 
 
 def _is_rate_limited_error(exc: Exception) -> bool:
@@ -2297,17 +2317,29 @@ def _motion_one_scene(idx: int, scene: dict, motion_prompt: str, aspect_ratio: s
         if len(full_prompt) > 2000:
             full_prompt = full_prompt[:2000]
 
-        r = req_post("/generation/text-to-video", {
-            "model": "WERYDANCE_2_0",
-            "prompt": full_prompt,
-            "negative_prompt": "no subtitles, no text overlay, no watermark, no captions, no burned-in text, no logo",
-            "duration": dur,
-            "aspect_ratio": aspect_ratio,
-            "resolution": "1080p",
-        }, timeout=30)
-        task_id = r.get("data", {}).get("task_id") or (r.get("data", {}).get("task_ids") or [None])[0]
-        if not task_id:
+        task_id = None
+        for submit_attempt in range(3):
+            _wait_motion_submit_slot(f"motion {idx+1}")
+            r = req_post("/generation/text-to-video", {
+                "model": "WERYDANCE_2_0",
+                "prompt": full_prompt,
+                "negative_prompt": "no subtitles, no text overlay, no watermark, no captions, no burned-in text, no logo",
+                "duration": dur,
+                "aspect_ratio": aspect_ratio,
+                "resolution": "1080p",
+            }, timeout=30)
+            task_id = r.get("data", {}).get("task_id") or (r.get("data", {}).get("task_ids") or [None])[0]
+            if task_id:
+                break
+            if _is_rate_limited_error(RuntimeError(r)):
+                wait_s = MOTION_RATE_LIMIT_BACKOFF * (submit_attempt + 1)
+                log(f"[motion {idx}] text-to-video submit 频率限制，退避 {wait_s:.1f}s 后重试: {r}")
+                time.sleep(wait_s)
+                continue
             log(f"[motion {idx}] text-to-video 提交失败: {r}")
+            return False
+        if not task_id:
+            log(f"[motion {idx}] text-to-video 3 次提交仍失败")
             return False
 
         # ★ 立即持久化：轮询任何阶段失败/超时，下次 rerun 都能复用
