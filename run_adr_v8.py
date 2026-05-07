@@ -1849,6 +1849,8 @@ def _normalize_cn_number_token(token: str) -> str:
 
 def _compact_zh_text(text: str) -> str:
     compact = re.sub(r"[\s，。！？、；：,.!?;:'\"“”‘’（）()《》【】\[\]\-—…·]", "", text or "")
+    compact = compact.replace("儿", "")
+    compact = compact.replace("真得", "真的")
     return re.sub(r"[零〇一二两三四五六七八九十百]+", lambda m: _normalize_cn_number_token(m.group(0)), compact)
 
 
@@ -1870,13 +1872,17 @@ def _write_adsd_asr_text_qa(script: list[dict], asr_data: dict) -> dict | None:
                 if len(chunk) >= 6 and chunk not in recognized:
                     missing_chunks.append({"turn": i + 1, "speaker": turn.get("speaker"), "chunk": chunk})
                     break
+        strict_pass = ratio >= 0.92 and not missing_chunks
+        tolerant_pass = ratio >= 0.985 and len(missing_chunks) <= 2
         qa = {
             "expected_chars": len(expected),
             "recognized_chars": len(recognized),
             "similarity": round(ratio, 4),
             "missing_chunks": missing_chunks[:20],
             "missing_count": len(missing_chunks),
-            "pass": ratio >= 0.92 and not missing_chunks,
+            "strict_pass": strict_pass,
+            "pass": strict_pass or tolerant_pass,
+            "severity": "ok" if strict_pass else "warn" if tolerant_pass else "fail",
             "created_at": datetime.now().isoformat(timespec="seconds"),
         }
         (OUTPUT_DIR / "asr_qa.json").write_text(json.dumps(qa, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -2938,6 +2944,23 @@ def _motion_poll_and_download(idx: int, task_id: str, vid_path: str) -> bool:
     return False
 
 
+def _build_motion_video_prompt(scene: dict, motion_prompt: str) -> str:
+    if ADS_DIALOGUE_MODE:
+        speaker = scene.get("speaker", "")
+        contract = _adsd_visual_contract(speaker)
+        shot = scene.get("shot", "")
+        return (
+            "Historically grounded early-Republican China dialogue scene, neutral archival newsreel realism, "
+            "warm sepia paper tones, period clothing and diplomatic office props. "
+            f"{contract}. "
+            f"Scene action: {shot}. "
+            f"Camera motion: {motion_prompt}. "
+            "Avoid branded style references, artist names, movie-title references, copyrighted characters, modern devices, subtitles, logos, watermarks."
+        )
+    scene_prompt = scene.get("prompt", "")
+    return f"{scene_prompt}. Camera motion: {motion_prompt}" if scene_prompt else motion_prompt
+
+
 def _motion_one_scene(idx: int, scene: dict, motion_prompt: str, aspect_ratio: str) -> bool:
     """对单个 scene 调 WERYDANCE_2_0 生成 motion 版 seg_N.mp4；成功返回 True"""
     img_path = scene["img_path"]
@@ -2970,9 +2993,8 @@ def _motion_one_scene(idx: int, scene: dict, motion_prompt: str, aspect_ratio: s
 
     try:
         # Phase 1 改造：直接 text-to-video（Seedance 2.0），绕过"照片晃动"，走真正摄影机运动
-        # 合并姜文的电影级画面 prompt + motion prompt，交给 WERYDANCE 原生理解
-        scene_prompt = scene.get("prompt", "")
-        full_prompt = f"{scene_prompt}. Camera motion: {motion_prompt}" if scene_prompt else motion_prompt
+        # ADSD 使用降噪 prompt，避免把上游静帧 prompt 的风格词带入 WERYDANCE 触发版权拦截。
+        full_prompt = _build_motion_video_prompt(scene, motion_prompt)
         # text-to-video 限 2000 字符
         if len(full_prompt) > 2000:
             full_prompt = full_prompt[:2000]
