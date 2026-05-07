@@ -2323,6 +2323,9 @@ def _extract_video_url(data: dict) -> str | None:
     return None
 
 
+_weryai_upload_lock = threading.Lock()
+
+
 def _upload_to_weryai(file_path: str) -> str:
     """Upload a local media file to WeryAI official storage and return its URL."""
     import mimetypes
@@ -2330,13 +2333,14 @@ def _upload_to_weryai(file_path: str) -> str:
     last_err = None
     for attempt in range(3):
         try:
-            with open(file_path, "rb") as f:
-                r = requests.post(
-                    f"{BASE_URL}/generation/upload-file",
-                    headers={"Authorization": f"Bearer {WERYAI_API_KEY}"},
-                    files={"file": (os.path.basename(file_path), f, mime)},
-                    timeout=(30, 180),
-                )
+            with _weryai_upload_lock:
+                with open(file_path, "rb") as f:
+                    r = requests.post(
+                        f"{BASE_URL}/generation/upload-file",
+                        headers={"Authorization": f"Bearer {WERYAI_API_KEY}"},
+                        files={"file": (os.path.basename(file_path), f, mime)},
+                        timeout=(30, 180),
+                    )
             r.raise_for_status()
             data = r.json()
             urls = (data.get("data") or {}).get("object_url_list") or []
