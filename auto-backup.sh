@@ -4,14 +4,21 @@
 
 cd /Users/wekoidubai/ADR || exit 1
 
-BACKUP_REMOTE="${ADR_BACKUP_REMOTE:-gitlab}"
+# 默认同时推 GitHub (origin) 和 GitLab (gitlab)；任一失败不影响另一个
+BACKUP_REMOTES="${ADR_BACKUP_REMOTES:-${ADR_BACKUP_REMOTE:-origin gitlab}}"
 BACKUP_BRANCH="${ADR_BACKUP_BRANCH:-main}"
 
 push_backup() {
-    if ! git push "$BACKUP_REMOTE" "$BACKUP_BRANCH"; then
-        echo "[$(date '+%F %T')] WARN: git push $BACKUP_REMOTE $BACKUP_BRANCH failed"
-        return 1
-    fi
+    local rc=0
+    for remote in $BACKUP_REMOTES; do
+        if git push "$remote" "$BACKUP_BRANCH"; then
+            echo "[$(date '+%F %T')] OK: git push $remote $BACKUP_BRANCH"
+        else
+            echo "[$(date '+%F %T')] WARN: git push $remote $BACKUP_BRANCH failed"
+            rc=1
+        fi
+    done
+    return $rc
 }
 
 CHANGES=$(git diff --name-only -- '*.py' '*.md' '*.skill' '*.sh' 'skill/' 'openclaw-skill/')
