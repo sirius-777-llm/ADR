@@ -1105,7 +1105,8 @@ def step1_script(topic: str) -> list[dict]:
     dialogue_turns: list[dict] = []
     if _OVERRIDE_FILE.exists() and _OVERRIDE_FILE.stat().st_size > 0:
         _override_lines = [l.strip() for l in _OVERRIDE_FILE.read_text(encoding="utf-8").splitlines() if l.strip()]
-        if 6 <= len(_override_lines) <= 22:
+        min_override_lines = 4 if ADS_DIALOGUE_MODE else 6
+        if min_override_lines <= len(_override_lines) <= 22:
             lines = _override_lines
             num_lines = len(lines)
             _script_injected = True
@@ -1122,8 +1123,8 @@ def step1_script(topic: str) -> list[dict]:
             _OVERRIDE_FILE.rename(_used_path)
             log(f"外部脚本已重命名为 {_used_path.name}")
         else:
-            log(f"⚠️ 外部脚本句数 {len(_override_lines)} 不在 6~22 范围内，忽略，走 LLM 生成")
-            tg(f"⚠️ 外部脚本句数 {len(_override_lines)} 不在 6~22 范围内，已忽略")
+            log(f"⚠️ 外部脚本句数 {len(_override_lines)} 不在 {min_override_lines}~22 范围内，忽略，走 LLM 生成")
+            tg(f"⚠️ 外部脚本句数 {len(_override_lines)} 不在 {min_override_lines}~22 范围内，已忽略")
 
     # ADSD：生成角色对白 turn；后续每个 turn 独立 TTS 并驱动画面/字幕。
     if ADS_DIALOGUE_MODE and not almanac_data and not _script_injected:
@@ -3962,9 +3963,13 @@ def _write_adsd_delivery_qa(final_path: str) -> dict | None:
         issues.append(f"subtitle speaker label leak: {subtitle_qa.get('leaked_speaker_labels')}")
 
     timeline = _read_output_json("turn_timeline.json")
+    dialogue_shape = None
+    speaker_count = 0
     if isinstance(timeline, list):
         speakers = [str(t.get("speaker", "")).strip() for t in timeline if isinstance(t, dict)]
         speaker_count = len([s for s in dict.fromkeys(speakers) if s])
+        shapes = [str(t.get("dialogue_shape", "")).strip() for t in timeline if isinstance(t, dict) and t.get("dialogue_shape")]
+        dialogue_shape = shapes[0] if shapes else None
         banned = {"记者", "主持人", "主播", "采访者"}
         if not ADS_REPORTER_MODE:
             leaked_roles = sorted({s for s in speakers if s in banned})
@@ -3974,6 +3979,14 @@ def _write_adsd_delivery_qa(final_path: str) -> dict | None:
             issues.append("turn_timeline has no speakers")
         elif speaker_count > 4:
             issues.append(f"too many ADSD speakers: {speaker_count}")
+        if dialogue_shape not in {"monologue", "dialogue", "ensemble"}:
+            issues.append(f"invalid or missing dialogue_shape: {dialogue_shape}")
+        elif dialogue_shape == "monologue" and speaker_count != 1:
+            issues.append(f"monologue speaker_count mismatch: {speaker_count}")
+        elif dialogue_shape == "dialogue" and speaker_count != 2:
+            issues.append(f"dialogue speaker_count mismatch: {speaker_count}")
+        elif dialogue_shape == "ensemble" and not (3 <= speaker_count <= 4):
+            issues.append(f"ensemble speaker_count mismatch: {speaker_count}")
     else:
         issues.append("turn_timeline.json missing")
 
@@ -4001,6 +4014,8 @@ def _write_adsd_delivery_qa(final_path: str) -> dict | None:
             "lip_sync_qa": _qa_file_pass("lip_sync_qa.json"),
             "asr_qa": _qa_file_pass("asr_qa.json"),
             "audio_video_delta": audio_video_delta,
+            "dialogue_shape": dialogue_shape,
+            "speaker_count": speaker_count,
         },
         "created_at": datetime.now().isoformat(timespec="seconds"),
     }
