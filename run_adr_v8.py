@@ -2327,19 +2327,29 @@ def _upload_to_weryai(file_path: str) -> str:
     """Upload a local media file to WeryAI official storage and return its URL."""
     import mimetypes
     mime = mimetypes.guess_type(file_path)[0] or "application/octet-stream"
-    with open(file_path, "rb") as f:
-        r = requests.post(
-            f"{BASE_URL}/generation/upload-file",
-            headers={"Authorization": f"Bearer {WERYAI_API_KEY}"},
-            files={"file": (os.path.basename(file_path), f, mime)},
-            timeout=(30, 180),
-        )
-    r.raise_for_status()
-    data = r.json()
-    urls = (data.get("data") or {}).get("object_url_list") or []
-    if not urls:
-        raise RuntimeError(f"upload-file 无 object_url_list: {json.dumps(data, ensure_ascii=False)[:300]}")
-    return urls[0]
+    last_err = None
+    for attempt in range(3):
+        try:
+            with open(file_path, "rb") as f:
+                r = requests.post(
+                    f"{BASE_URL}/generation/upload-file",
+                    headers={"Authorization": f"Bearer {WERYAI_API_KEY}"},
+                    files={"file": (os.path.basename(file_path), f, mime)},
+                    timeout=(30, 180),
+                )
+            r.raise_for_status()
+            data = r.json()
+            urls = (data.get("data") or {}).get("object_url_list") or []
+            if not urls:
+                raise RuntimeError(f"upload-file 无 object_url_list: {json.dumps(data, ensure_ascii=False)[:300]}")
+            return urls[0]
+        except Exception as e:
+            last_err = e
+            if attempt < 2:
+                wait_s = 3 * (attempt + 1)
+                log(f"upload-file 失败（{Path(file_path).name} 第 {attempt+1}/3 次）：{e}，{wait_s}s 后重试")
+                time.sleep(wait_s)
+    raise RuntimeError(f"upload-file 重试失败: {last_err}")
 
 
 APPROVAL_DIR = Path("/tmp/adr_approval")
@@ -3287,7 +3297,7 @@ def _lip_sync_one_scene(idx: int, scene: dict, target_dur: float, aspect_ratio: 
         return idx, False, final
     except Exception as e:
         log(f"[lip-sync {idx}] 异常: {type(e).__name__}: {e}")
-        return idx, False, {"turn": idx + 1, "pass": False, "reason": str(e)}
+        return idx, False, {"turn": idx + 1, "speaker": scene.get("speaker"), "pass": False, "reason": str(e)}
 
 
 def step66_adsd_lip_sync(script: list[dict]):
