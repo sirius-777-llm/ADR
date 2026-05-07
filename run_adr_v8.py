@@ -722,6 +722,60 @@ def _adsd_dialogue_shape(speakers: list[str]) -> str:
     return "ensemble"
 
 
+def _finalize_adsd_turns(turns: list[dict]) -> list[dict]:
+    speakers = [t["speaker"] for t in turns if t.get("speaker")]
+    shape = _adsd_dialogue_shape(speakers)
+    speaker_count = len(dict.fromkeys(speakers))
+    for turn in turns:
+        turn["dialogue_shape"] = shape
+        turn["speaker_count"] = speaker_count
+    return turns
+
+
+def _parse_adsd_override_turns(raw_lines: list[str], topic: str) -> list[dict]:
+    """Parse /tmp/adr_script_override.txt into ADSD turns.
+
+    Supported formats:
+    - 纯台词: treated as monologue by the default onsite role.
+    - 角色：台词 / 角色: 台词: preserves up to four onsite speakers.
+    """
+    import re as _re
+    role_candidates = _adsd_role_candidates(topic)
+    fallback_role = role_candidates[0]
+    banned_speakers = {"记者", "主持人", "主播", "职员", "采访者"}
+    known: list[str] = []
+    turns: list[dict] = []
+    for i, raw in enumerate(raw_lines):
+        line = str(raw).strip()
+        m = _re.match(r"^([^：:]{2,12})[：:]\s*(.+)$", line)
+        if m:
+            speaker = m.group(1).strip()
+            text = m.group(2).strip()
+        else:
+            speaker = known[0] if known else fallback_role
+            text = line
+        if speaker in banned_speakers or not speaker:
+            speaker = known[i % len(known)] if known else fallback_role
+        if speaker not in known and len(known) < 4:
+            known.append(speaker)
+        elif speaker not in known:
+            speaker = known[i % len(known)] if known else fallback_role
+        if not text:
+            raise RuntimeError(f"ADSD 注入脚本第 {i+1} 行为空")
+        voice = _voice_for_speaker(speaker)
+        turns.append({
+            "dialogue_turn": i + 1,
+            "speaker": speaker,
+            "speaker_id": voice["voice_id"],
+            "speaker_name": voice["voice_name"],
+            "text": text,
+            "shot": f"{speaker}在现场说出这一句，旁人只作倾听或反应",
+            "emotion": "neutral",
+            "injected_script": True,
+        })
+    return _finalize_adsd_turns(turns)
+
+
 def _adsd_pov_contract() -> str:
     return (
         "Onsite observer POV: the viewer feels physically present in the historical scene, standing at eye level "
@@ -1055,6 +1109,13 @@ def step1_script(topic: str) -> list[dict]:
             lines = _override_lines
             num_lines = len(lines)
             _script_injected = True
+            if ADS_DIALOGUE_MODE:
+                dialogue_turns = _parse_adsd_override_turns(_override_lines, topic)
+                lines = [t["text"] for t in dialogue_turns]
+                roles = " / ".join(dict.fromkeys(t.get("speaker", "") for t in dialogue_turns if t.get("speaker")))
+                shape = dialogue_turns[0].get("dialogue_shape", "dialogue") if dialogue_turns else "dialogue"
+                log(f"ADSD 注入脚本解析：shape={shape} roles={roles}")
+                tg(f"📥 ADSD 注入脚本解析完成\n结构：{shape}\n角色：{roles}")
             log(f"📥 外部脚本注入：读取 {num_lines} 句台词，跳过 LLM 生成")
             tg(f"📥 检测到外部脚本注入\n读取 {num_lines} 句台词，跳过 LLM 自动生成")
             _used_path = _OVERRIDE_FILE.with_suffix(f".used_{int(time.time())}")
