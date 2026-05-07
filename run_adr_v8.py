@@ -744,7 +744,7 @@ def _generate_adsd_dialogue_turns(topic: str, num_turns: int, tone: str, style_g
 
 
 def step1_script(topic: str) -> list[dict]:
-    fmt_label = "VDAR 9:16" if IS_VERTICAL else "HDAR 16:9"
+    fmt_label = f"{ADSD_MODE_NAME} {'9:16' if IS_VERTICAL else '16:9'}" if ADS_DIALOGUE_MODE else ("VDAR 9:16" if IS_VERTICAL else "HDAR 16:9")
     tg(f"🎬 ADR V8 启动\n主题：{topic}\n格式：{fmt_label}\n\n斯皮尔伯格正在撰写台词...")
     log(f"开始处理：{topic} [{fmt_label}]")
 
@@ -4518,7 +4518,10 @@ def main():
             tg(f"🔇 无配音模式：已生成 {est_dur:.1f}s 静音轨（{total_chars} 字 ÷ 3/s + 间隔）")
             timings["静音轨生成"] = time.time() - t
         else:
-            t = time.time(); voice_path = step2_master_voice(script, spk_id, spk_name); timings["Podcast 音轨"] = time.time() - t
+            if ADS_DIALOGUE_MODE:
+                t = time.time(); voice_path = step2_dialogue_voice(script); timings["ADSD TTS 音轨+ASR"] = time.time() - t
+            else:
+                t = time.time(); voice_path = step2_master_voice(script, spk_id, spk_name); timings["Podcast 音轨"] = time.time() - t
         t = time.time(); script     = step345_timeline(script, voice_path);   timings["时间轴计算"] = time.time() - t
         t = time.time(); bgm_path   = step6_parallel(script, topic);          timings["图片+BGM 并发"] = time.time() - t
         if WITH_MOTION:
