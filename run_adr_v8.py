@@ -1790,8 +1790,31 @@ def _asr_verify_dialogue_audio(audio_path: str) -> dict | None:
         return None
 
 
+def _normalize_cn_number_token(token: str) -> str:
+    digits = {"零": 0, "〇": 0, "一": 1, "二": 2, "两": 2, "三": 3, "四": 4, "五": 5, "六": 6, "七": 7, "八": 8, "九": 9}
+    if not token:
+        return token
+    if "百" in token:
+        left, _, right = token.partition("百")
+        hundreds = digits.get(left, 1 if not left else None)
+        if hundreds is None:
+            return token
+        return str(hundreds * 100 + int(_normalize_cn_number_token(right) or "0"))
+    if "十" in token:
+        left, _, right = token.partition("十")
+        tens = digits.get(left, 1 if not left else None)
+        ones = digits.get(right, 0 if not right else None)
+        if tens is None or ones is None:
+            return token
+        return str(tens * 10 + ones)
+    if all(ch in digits for ch in token):
+        return "".join(str(digits[ch]) for ch in token)
+    return token
+
+
 def _compact_zh_text(text: str) -> str:
-    return re.sub(r"[\s，。！？、；：,.!?;:'\"“”‘’（）()《》【】\[\]\-—…·]", "", text or "")
+    compact = re.sub(r"[\s，。！？、；：,.!?;:'\"“”‘’（）()《》【】\[\]\-—…·]", "", text or "")
+    return re.sub(r"[零〇一二两三四五六七八九十百]+", lambda m: _normalize_cn_number_token(m.group(0)), compact)
 
 
 def _write_adsd_asr_text_qa(script: list[dict], asr_data: dict) -> dict | None:
