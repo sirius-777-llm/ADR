@@ -129,6 +129,11 @@ ADS_DIALOGUE_MODE = (
     or "--adsd" in sys.argv
     or os.environ.get("ADR_ADS_DIALOGUE", "").strip().lower() in ("1", "true", "yes", "on")
 )
+ADSD_LIP_SYNC_EXPERIMENT = (
+    "--adsd-lip-sync" in sys.argv
+    or "--lip-sync" in sys.argv
+    or os.environ.get("ADR_ADSD_LIP_SYNC", "").strip().lower() in ("1", "true", "yes", "on")
+)
 
 # --ads-reporter：把 ADS 的"拟现场第一人称记者感"并入 ADR 动态化。
 # 该模式自动开启 --with-motion，并约束剧本、分镜与 motion prompt；
@@ -697,7 +702,7 @@ def _generate_adsd_dialogue_turns(topic: str, num_turns: int, tone: str, style_g
 3. 每项字段必须包含：speaker、text、shot、emotion。
 4. speaker 只能是「记者」或「职员」，两人必须交替出现，第一句用「记者」。
 5. text 是中文对白，每句 18~36 字，白话、直接、普通人能听懂。
-6. shot 是中文画面说明，要具体到地点、道具、人物动作；避免正脸口型依赖，多用电报、地图、文件、侧脸、背影。
+6. shot 是中文画面说明，要具体到地点、道具、人物动作；必须让当前 speaker 成为画面里的说话主体，另一个角色作为倾听/反应对象。
 7. emotion 只能从 neutral / tense / solemn / explanatory 中选。
 8. 严禁诗化表达、隐喻、金句、含蓄暗示、空泛大词。
 9. 每 2~3 句必须解释一个专名或因果。
@@ -741,6 +746,33 @@ def _generate_adsd_dialogue_turns(topic: str, num_turns: int, tone: str, style_g
             "emotion": emotion,
         })
     return turns
+
+
+def _adsd_visual_contract(speaker: str, lip_sync: bool | None = None) -> str:
+    """Prompt contract for ADSD: keep the active speaker visually accountable."""
+    if lip_sync is None:
+        lip_sync = ADSD_LIP_SYNC_EXPERIMENT
+    if speaker == "记者":
+        anchor = (
+            "Active speaker is the young field reporter. Show the reporter as the clear speaking subject, "
+            "holding a telegram or notebook, face visible in three-quarter view, the ministry clerk listening nearby"
+        )
+    elif speaker == "职员":
+        anchor = (
+            "Active speaker is the older foreign-ministry clerk. Show the clerk as the clear speaking subject, "
+            "holding official papers, face visible in three-quarter view, the young reporter listening nearby"
+        )
+    else:
+        anchor = "Active speaker is the visible person delivering this line, face readable, listener secondary"
+    if lip_sync:
+        return (
+            f"{anchor}. Talking-head friendly framing: medium close-up or over-shoulder two-shot, mouth area visible, "
+            "subtle natural lip movement implied, no extreme mouth close-up, no distorted teeth, no modern microphone"
+        )
+    return (
+        f"{anchor}. Speaker-focus framing: medium close-up or over-shoulder two-shot, mouth can be visible but do not force exact lip sync, "
+        "use eyes, hands, documents and reaction timing to sell the dialogue, no extreme mouth close-up"
+    )
 
 
 def step1_script(topic: str) -> list[dict]:
@@ -1323,10 +1355,11 @@ THUMBNAIL_ANCHOR: 封面视觉锚，用 4~6 个短语描述：主体、主色（
         shot_tmpl = shot_blueprint[i] if i < len(shot_blueprint) else ""
         subject = visuals[i].get("prompt", "")
         if dialogue_meta:
+            visual_contract = _adsd_visual_contract(dialogue_meta.get("speaker", ""))
             subject = (
                 f"{dialogue_meta.get('shot', '')}. "
                 f"Dialogue speaker: {dialogue_meta.get('speaker', '')}; "
-                "avoid mouth-closeup lip sync, prefer side profile, back view, hands, documents, maps, telegrams. "
+                f"{visual_contract}. "
                 f"{subject}"
             )
         # 硬拼接：导演 + 镜头模板 + 主体 + 情绪风格 + negative
@@ -1351,6 +1384,8 @@ THUMBNAIL_ANCHOR: 封面视觉锚，用 4~6 个短语描述：主体、主色（
                 "speaker_id": dialogue_meta.get("speaker_id"),
                 "speaker_name": dialogue_meta.get("speaker_name", ""),
                 "shot": dialogue_meta.get("shot", ""),
+                "speaker_visual_contract": visual_contract,
+                "lip_sync_experiment": ADSD_LIP_SYNC_EXPERIMENT,
             })
         script.append(item)
         emotion_count[emotion] = emotion_count.get(emotion, 0) + 1
@@ -1851,6 +1886,54 @@ def _write_adsd_asr_text_qa(script: list[dict], asr_data: dict) -> dict | None:
         return None
 
 
+def _write_adsd_speaker_focus_qa(script: list[dict], motion_results: dict[int, bool] | None = None) -> dict | None:
+    """Record ADSD speaker-to-shot contract; this is the gate before real lip-sync."""
+    if not ADS_DIALOGUE_MODE:
+        return None
+    try:
+        scenes = []
+        for i, scene in enumerate(script):
+            prompt = scene.get("prompt", "")
+            speaker = scene.get("speaker", "")
+            contract = scene.get("speaker_visual_contract", "")
+            scenes.append({
+                "turn": i + 1,
+                "speaker": speaker,
+                "audio_start": scene.get("audio_start"),
+                "audio_end": scene.get("audio_end"),
+                "duration": scene.get("dur"),
+                "speaker_contract_exists": bool(contract),
+                "prompt_has_active_speaker": "Active speaker is" in prompt,
+                "prompt_names_speaker_role": ("young field reporter" in prompt if speaker == "记者" else "older foreign-ministry clerk" in prompt if speaker == "职员" else bool(speaker)),
+                "motion_succeeded": motion_results.get(i) if motion_results is not None else None,
+            })
+        failed = [
+            s for s in scenes
+            if not s["speaker"]
+            or not s["speaker_contract_exists"]
+            or not s["prompt_has_active_speaker"]
+            or s["audio_start"] is None
+            or s["audio_end"] is None
+        ]
+        payload = {
+            "mode": ADSD_MODE_NAME,
+            "policy": "lip_sync_prompt_experiment" if ADSD_LIP_SYNC_EXPERIMENT else "speaker_focus_required",
+            "real_lip_sync": False,
+            "note": "Current WERYDANCE path is text-to-video; it can enforce active speaker framing, but cannot guarantee audio-driven viseme alignment.",
+            "total": len(script),
+            "failed_count": len(failed),
+            "pass": len(failed) == 0,
+            "motion_success_count": sum(1 for v in motion_results.values() if v) if motion_results is not None else None,
+            "scenes": scenes,
+            "created_at": datetime.now().isoformat(timespec="seconds"),
+        }
+        (OUTPUT_DIR / "speaker_focus_qa.json").write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        return payload
+    except Exception as e:
+        log(f"ADSD speaker_focus_qa 写入失败: {e}")
+        return None
+
+
 def step2_dialogue_voice(script: list[dict]) -> str:
     """ADSD voice core: one TTS per dialogue turn, deterministic timeline."""
     pause = float(os.environ.get("ADR_ADSD_TURN_PAUSE", "0.22"))
@@ -2141,6 +2224,11 @@ def step345_timeline(script: list[dict], voice_path: str) -> list[dict]:
                 f"Turn {i+1} {s.get('speaker','')}（{s.get('dur', 0):.2f}s）→ "
                 f"画面 {s['audio_start']:.2f}s / 字幕 {s['sub_start']:.2f}s"
             )
+        speaker_qa = _write_adsd_speaker_focus_qa(script)
+        if speaker_qa and speaker_qa.get("pass"):
+            tg(f"✅ {ADSD_MODE_NAME} 说话人镜头同步 QA 通过：{speaker_qa.get('total')} turn")
+        elif speaker_qa:
+            tg(f"⚠️ {ADSD_MODE_NAME} 说话人镜头同步 QA 未通过：failed={speaker_qa.get('failed_count')}")
         tg(f"✅ {ADSD_MODE_NAME} 时间轴采用逐句 TTS 真实时长\n" + "\n".join(lines))
         return script
 
@@ -2727,9 +2815,14 @@ def _generate_motion_prompts(script: list[dict]) -> list[str]:
 - Use period-appropriate motion only; no smartphone livestream, no TV studio camera, no modern microphone, no LED screen.
 - Keep it immersive but historically plausible: a staged dispatch/newsreel, not a real modern live broadcast.
 """ if ADS_REPORTER_MODE else ""
+    adsd_motion_guide = f"""
+- ADSD dialogue mode is ON: each scene has one active speaker. Motion must keep the active speaker visually dominant for that turn.
+- Use medium close-up or over-the-shoulder two-shot, gentle reaction timing, natural eye movement, paper handling, and listener reaction.
+- {"Lip-sync experiment is ON: keep the mouth area visible and imply subtle natural lip movement, but avoid exaggerated dubbing or distorted teeth." if ADSD_LIP_SYNC_EXPERIMENT else "Production default: do not promise exact lip-sync; keep speaker focus stable with readable face, hands, documents, and listener reaction."}
+""" if ADS_DIALOGUE_MODE else ""
     try:
         summary_lines = "\n".join(
-            f"{i+1}. ({sc.get('dur', 5):.0f}s, emotion: {sc.get('emotion', 'neutral')}) {sc['text'][:80]}"
+            f"{i+1}. ({sc.get('dur', 5):.0f}s, speaker: {sc.get('speaker', '旁白')}, emotion: {sc.get('emotion', 'neutral')}) {sc['text'][:80]}"
             for i, sc in enumerate(script)
         )
         raw = chat(
@@ -2746,6 +2839,7 @@ Rules:
 - End with ", cinematic atmosphere, smooth motion" for consistency.
 - Do NOT describe what's in the frame (that's already fixed).
 {reporter_motion_guide}
+{adsd_motion_guide}
 
 Output strict JSON array of {n} strings:
 ["motion1", "motion2", ...]"""
@@ -2965,6 +3059,10 @@ def step65_motion(script: list[dict]):
         _run_batch(failed_r1, "round 2")
 
     success_cnt = sum(1 for v in results.values() if v)
+    if ADS_DIALOGUE_MODE:
+        speaker_qa = _write_adsd_speaker_focus_qa(script, results)
+        if speaker_qa and not speaker_qa.get("pass"):
+            tg(f"⚠️ {ADSD_MODE_NAME} 说话人镜头同步 QA 未通过：failed={speaker_qa.get('failed_count')}")
     tg(f"✅ 动态化完成：{success_cnt}/{n} 成功 · {n - success_cnt} 保留静态兜底（含重试后仍失败）")
 
 
@@ -3393,6 +3491,7 @@ def step9_render(raw_path: str, voice_path: str, bgm_path: str | None, ass_path:
                 "asr_result_exists": (OUTPUT_DIR / "speech_recognize_result.json").exists(),
                 "asr_qa_exists": (OUTPUT_DIR / "asr_qa.json").exists(),
                 "scene_qa_exists": (OUTPUT_DIR / "scene_qa.json").exists(),
+                "speaker_focus_qa_exists": (OUTPUT_DIR / "speaker_focus_qa.json").exists(),
                 "subtitle_exists": Path(ass_path).exists(),
                 "created_at": datetime.now().isoformat(timespec="seconds"),
             }
