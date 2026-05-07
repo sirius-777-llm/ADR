@@ -124,6 +124,11 @@ if "--skip-approval" in sys.argv:
     SKIP_APPROVAL = True  # 显式 skip 也支持
 WITH_MOTION = "--with-motion" in sys.argv  # 每分镜走 WERYDANCE_2_0 生成带运动视频，~2x 时长 + $0.3/scene
 NO_VOICE    = "--no-voice" in sys.argv    # 跳过 Podcast / TTS，用静音轨占位；成片只有画面 + 字幕 + BGM
+ADS_DIALOGUE_MODE = (
+    "--ads-dialogue" in sys.argv
+    or "--adsd" in sys.argv
+    or os.environ.get("ADR_ADS_DIALOGUE", "").strip().lower() in ("1", "true", "yes", "on")
+)
 
 # --ads-reporter：把 ADS 的"拟现场第一人称记者感"并入 ADR 动态化。
 # 该模式自动开启 --with-motion，并约束剧本、分镜与 motion prompt；
@@ -135,6 +140,14 @@ ADS_REPORTER_MODE = (
 )
 if ADS_REPORTER_MODE:
     WITH_MOTION = True
+
+ADSD_MODE_NAME = ("VADSD" if IS_VERTICAL else "HADSD") if ADS_DIALOGUE_MODE else ""
+
+ADSD_VOICES = {
+    "记者": {"voice_id": 67, "voice_name": "Refreshing Young Man"},
+    "职员": {"voice_id": 69, "voice_name": "Reliable Executive"},
+    "旁白": {"voice_id": 76, "voice_name": "News Anchor"},
+}
 
 ADS_REPORTER_SCRIPT_GUIDE = """
 
@@ -394,6 +407,28 @@ def poll_podcast(task_id: str, wait_for: str = "text-success", max_polls: int | 
     raise RuntimeError(f"Podcast 轮询超时（等待 {wait_for}, {max_polls * POLL_INTERVAL}s）")
 
 
+def poll_task_status(task_id: str, label: str = "task", max_wait: float = 180.0) -> dict:
+    """Poll generic WeryAI generation task by task_status."""
+    polls = max(1, int(max_wait / POLL_INTERVAL))
+    for i in range(polls):
+        time.sleep(POLL_INTERVAL)
+        try:
+            resp = req_get(f"/generation/{task_id}/status")
+            data = resp.get("data", {})
+            st = data.get("task_status", "")
+            if i == 0 or (i + 1) % 5 == 0 or st in ("succeed", "failed"):
+                log(f"[{label}] poll #{i+1}: task_status={st}")
+            if st == "succeed":
+                return data
+            if st == "failed":
+                raise RuntimeError(f"{label} failed: {json.dumps(data, ensure_ascii=False)[:300]}")
+        except RuntimeError:
+            raise
+        except Exception as e:
+            log(f"{label} 轮询异常: {e}")
+    raise RuntimeError(f"{label} 轮询超时（{max_wait:.0f}s）")
+
+
 def chat(model: str, system: str, user: str, max_tokens: int = 4096, timeout: int = 180) -> str:
     """调用 WeryAI Chat Completion，返回回复文本。3 次重试防瞬断/限流/无 choices。
     timeout 默认 180s，对慢推理模型（GPT-5.4 / Claude Opus / DeepSeek-R1）需传更大值如 600s。"""
@@ -624,6 +659,90 @@ def ffmpeg(*args, timeout: int = 120):
 
 
 # ── 第一步：双导演生成剧本 ────────────────────────────────────────────────────
+def _extract_json_array(raw: str) -> list:
+    fence = re.search(r'```(?:json)?\s*([\s\S]*?)```', raw)
+    text = fence.group(1).strip() if fence else raw.strip()
+    start = text.find("[")
+    end = text.rfind("]")
+    if start < 0 or end <= start:
+        raise ValueError(f"no JSON array: {raw[:200]}")
+    return json.loads(text[start:end + 1])
+
+
+def _voice_for_speaker(speaker: str) -> dict:
+    if speaker in ADSD_VOICES:
+        return ADSD_VOICES[speaker]
+    if "记者" in speaker:
+        return ADSD_VOICES["记者"]
+    if "职员" in speaker or "官员" in speaker or "解释" in speaker:
+        return ADSD_VOICES["职员"]
+    return ADSD_VOICES["旁白"]
+
+
+def _generate_adsd_dialogue_turns(topic: str, num_turns: int, tone: str, style_guide: str) -> list[dict]:
+    """Generate ADSD dialogue turns. Each turn becomes one TTS unit and one video segment."""
+    num_turns = max(4, min(12, num_turns))
+    prompt = f"""你是 ADSD（ADS Dialogue）短剧化历史讲解编剧。
+
+主题：「{topic}」
+目标：生成 {num_turns} 句角色对白，用两个角色把复杂历史讲给普通人听懂。
+
+固定角色：
+1. 记者：负责现场追问、拿材料、把观众带进现场。
+2. 职员：负责解释概念、背景、因果，像懂历史的办事人员。
+
+硬性要求：
+1. 只输出 JSON 数组，不要 Markdown，不要解释。
+2. 数组长度必须正好 {num_turns}。
+3. 每项字段必须包含：speaker、text、shot、emotion。
+4. speaker 只能是「记者」或「职员」，两人必须交替出现，第一句用「记者」。
+5. text 是中文对白，每句 18~36 字，白话、直接、普通人能听懂。
+6. shot 是中文画面说明，要具体到地点、道具、人物动作；避免正脸口型依赖，多用电报、地图、文件、侧脸、背影。
+7. emotion 只能从 neutral / tense / solemn / explanatory 中选。
+8. 严禁诗化表达、隐喻、金句、含蓄暗示、空泛大词。
+9. 每 2~3 句必须解释一个专名或因果。
+10. 结尾要把主题讲清楚，不要只煽情。
+
+语言风格：
+{style_guide}
+
+输出示例格式：
+[
+  {{"speaker":"记者","text":"我手里这份电报，是日本今天送来的最后通牒。","shot":"北京外交部外，记者手持电报，镜头推近纸面","emotion":"tense"}}
+]"""
+    raw = chat("GEMINI_3_1_FLASH_LITE", "你只输出严格 JSON 数组。", prompt, max_tokens=2600, timeout=180)
+    arr = _extract_json_array(raw)
+    if len(arr) != num_turns:
+        raise RuntimeError(f"ADSD 对话句数不匹配：got {len(arr)}, need {num_turns}")
+    turns = []
+    for i, item in enumerate(arr):
+        speaker = str(item.get("speaker", "")).strip()
+        if speaker not in ("记者", "职员"):
+            speaker = "记者" if i % 2 == 0 else "职员"
+        if i % 2 == 0 and speaker != "记者":
+            speaker = "记者"
+        if i % 2 == 1 and speaker != "职员":
+            speaker = "职员"
+        text = str(item.get("text", "")).strip()
+        shot = str(item.get("shot", "")).strip()
+        emotion = str(item.get("emotion", "neutral")).strip().lower()
+        if emotion not in ("neutral", "tense", "solemn", "explanatory"):
+            emotion = "neutral"
+        if not text or len(text) > 80:
+            raise RuntimeError(f"ADSD 第 {i+1} 句台词异常：{text}")
+        voice = _voice_for_speaker(speaker)
+        turns.append({
+            "dialogue_turn": i + 1,
+            "speaker": speaker,
+            "speaker_id": voice["voice_id"],
+            "speaker_name": voice["voice_name"],
+            "text": text,
+            "shot": shot or f"{speaker}在现场说明材料",
+            "emotion": emotion,
+        })
+    return turns
+
+
 def step1_script(topic: str) -> list[dict]:
     fmt_label = "VDAR 9:16" if IS_VERTICAL else "HDAR 16:9"
     tg(f"🎬 ADR V8 启动\n主题：{topic}\n格式：{fmt_label}\n\n斯皮尔伯格正在撰写台词...")
@@ -836,6 +955,7 @@ def step1_script(topic: str) -> list[dict]:
     # ── 外部脚本注入（可选开关）──────────────────────────────────
     _OVERRIDE_FILE = Path("/tmp/adr_script_override.txt")
     _script_injected = False
+    dialogue_turns: list[dict] = []
     if _OVERRIDE_FILE.exists() and _OVERRIDE_FILE.stat().st_size > 0:
         _override_lines = [l.strip() for l in _OVERRIDE_FILE.read_text(encoding="utf-8").splitlines() if l.strip()]
         if 6 <= len(_override_lines) <= 22:
@@ -851,27 +971,43 @@ def step1_script(topic: str) -> list[dict]:
             log(f"⚠️ 外部脚本句数 {len(_override_lines)} 不在 6~22 范围内，忽略，走 LLM 生成")
             tg(f"⚠️ 外部脚本句数 {len(_override_lines)} 不在 6~22 范围内，已忽略")
 
-    # 最多重试 3 次拿到足够句数 + 通过数据校验（外部注入时跳过）
-    if not _script_injected:
-        lines = []
+    # ADSD：生成角色对白 turn；后续每个 turn 独立 TTS 并驱动画面/字幕。
+    if ADS_DIALOGUE_MODE and not almanac_data and not _script_injected:
         for _try in range(3):
-            raw_lines = chat("GEMINI_3_1_FLASH_LITE", "你是纪录片旁白创作大师。", spielberg_prompt)
-            lines = [l.strip() for l in raw_lines.strip().splitlines() if l.strip()][:num_lines]
-            if len(lines) < num_lines:
-                log(f"斯皮尔伯格只生成了 {len(lines)} 句（需要 {num_lines} 句），重试...")
-                continue
+            try:
+                dialogue_turns = _generate_adsd_dialogue_turns(topic, num_lines, tone, style_guide)
+                lines = [t["text"] for t in dialogue_turns]
+                num_lines = len(lines)
+                tg(f"🎭 {ADSD_MODE_NAME} 对话剧本就绪：{num_lines} 个 turn，角色：记者 / 职员")
+                log(f"ADSD 对话剧本生成成功：{num_lines} turns")
+                break
+            except Exception as e:
+                log(f"ADSD 对话剧本生成失败（第 {_try+1}/3 次）：{e}")
+                if _try == 2:
+                    raise
 
-            # 老黄历数据校验：台词整体必须包含关键数据值
-            if almanac_checkpoints:
-                full_text = ''.join(lines)
-                missing = [cp for cp in almanac_checkpoints if cp not in full_text]
-                if missing:
-                    log(f"台词缺少黄历数据：{missing}，重试...")
-                    tg(f"⚠️ 台词未引用黄历数据（缺 {', '.join(missing)}），重新生成...")
+    # 最多重试 3 次拿到足够句数 + 通过数据校验（外部注入/ADSD 时跳过）
+    if not _script_injected:
+        if not ADS_DIALOGUE_MODE:
+            lines = []
+            for _try in range(3):
+                raw_lines = chat("GEMINI_3_1_FLASH_LITE", "你是纪录片旁白创作大师。", spielberg_prompt)
+                lines = [l.strip() for l in raw_lines.strip().splitlines() if l.strip()][:num_lines]
+                if len(lines) < num_lines:
+                    log(f"斯皮尔伯格只生成了 {len(lines)} 句（需要 {num_lines} 句），重试...")
                     continue
-                log(f"黄历数据校验通过，全部关键词命中")
 
-            break  # 句数够 + 校验通过
+                # 老黄历数据校验：台词整体必须包含关键数据值
+                if almanac_checkpoints:
+                    full_text = ''.join(lines)
+                    missing = [cp for cp in almanac_checkpoints if cp not in full_text]
+                    if missing:
+                        log(f"台词缺少黄历数据：{missing}，重试...")
+                        tg(f"⚠️ 台词未引用黄历数据（缺 {', '.join(missing)}），重新生成...")
+                        continue
+                    log(f"黄历数据校验通过，全部关键词命中")
+
+                break  # 句数够 + 校验通过
 
         if len(lines) < num_lines:
             raise RuntimeError(f"斯皮尔伯格 3 次重试后仍只有 {len(lines)} 句台词（需要 {num_lines} 句）")
@@ -1180,9 +1316,19 @@ THUMBNAIL_ANCHOR: 封面视觉锚，用 4~6 个短语描述：主体、主色（
     emotion_count: dict[str, int] = {}
     for i, line in enumerate(lines):
         emotion = visuals[i].get("emotion", fb_emotion)
+        dialogue_meta = dialogue_turns[i] if ADS_DIALOGUE_MODE and i < len(dialogue_turns) else {}
+        if dialogue_meta.get("emotion"):
+            emotion = dialogue_meta["emotion"]
         style   = style_pool.get(emotion, "")
         shot_tmpl = shot_blueprint[i] if i < len(shot_blueprint) else ""
         subject = visuals[i].get("prompt", "")
+        if dialogue_meta:
+            subject = (
+                f"{dialogue_meta.get('shot', '')}. "
+                f"Dialogue speaker: {dialogue_meta.get('speaker', '')}; "
+                "avoid mouth-closeup lip sync, prefer side profile, back view, hands, documents, maps, telegrams. "
+                f"{subject}"
+            )
         # 硬拼接：导演 + 镜头模板 + 主体 + 情绪风格 + negative
         parts = [director_tag, shot_tmpl, subject]
         if style:
@@ -1196,7 +1342,17 @@ THUMBNAIL_ANCHOR: 封面视觉锚，用 4~6 个短语描述：主体、主色（
             )
         if neg_tag:
             prompt += f". Negative: {neg_tag}"
-        script.append({"text": line, "emotion": emotion, "prompt": prompt, "historical_context": historical_context, "tone": tone})
+        item = {"text": line, "emotion": emotion, "prompt": prompt, "historical_context": historical_context, "tone": tone}
+        if dialogue_meta:
+            item.update({
+                "dialogue_mode": True,
+                "dialogue_turn": dialogue_meta.get("dialogue_turn", i + 1),
+                "speaker": dialogue_meta.get("speaker", ""),
+                "speaker_id": dialogue_meta.get("speaker_id"),
+                "speaker_name": dialogue_meta.get("speaker_name", ""),
+                "shot": dialogue_meta.get("shot", ""),
+            })
+        script.append(item)
         emotion_count[emotion] = emotion_count.get(emotion, 0) + 1
 
     emotion_summary = " / ".join(f"{k}×{v}" for k, v in emotion_count.items())
@@ -1455,6 +1611,163 @@ def step2_master_voice(script: list[dict], speaker_id: str = "liyan2-ef9401ec", 
     return voice_path
 
 
+def _tts_turn_to_audio(turn: dict, idx: int, max_retries: int = 3) -> tuple[str, float, dict]:
+    """Generate one ADSD dialogue turn via WeryAI text-to-audio."""
+    voice_id = int(turn.get("speaker_id") or ADSD_VOICES["旁白"]["voice_id"])
+    text = _sanitize_for_external_api(turn["text"])[:500]
+    last_err = None
+    for attempt in range(max_retries):
+        try:
+            payload = {
+                "text": text,
+                "voice_id": voice_id,
+                "speed": os.environ.get("ADR_ADSD_TTS_SPEED", "1.0"),
+                "vol": os.environ.get("ADR_ADSD_TTS_VOL", "4.0"),
+                "trace_id": f"adsd-{OUTPUT_DIR.name}-turn-{idx+1}",
+            }
+            r = req_post("/generation/text-to-audio", payload, timeout=30)
+            task_id = r.get("data", {}).get("task_id") or (r.get("data", {}).get("task_ids") or [None])[0]
+            if not task_id:
+                raise RuntimeError(f"text-to-audio 无 task_id: {json.dumps(r, ensure_ascii=False)[:200]}")
+            data = poll_task_status(task_id, f"ADSD TTS {idx+1}", max_wait=180)
+            audios = data.get("audios") or []
+            if not audios:
+                raise RuntimeError(f"text-to-audio 成功但无 audios: {json.dumps(data, ensure_ascii=False)[:200]}")
+            mp3_path = str(OUTPUT_DIR / f"turn_{idx+1:02d}_{turn.get('speaker','speaker')}.mp3")
+            urllib.request.urlretrieve(audios[0], mp3_path)
+            wav_path = str(OUTPUT_DIR / f"turn_{idx+1:02d}_{turn.get('speaker','speaker')}.wav")
+            ffmpeg("-i", mp3_path, "-ar", "44100", "-ac", "1", "-c:a", "pcm_s16le", wav_path, timeout=60)
+            dur = ffprobe_duration(wav_path)
+            return wav_path, dur, {"task_id": task_id, "cost_credits": data.get("cost_credits"), "mp3_path": mp3_path}
+        except Exception as e:
+            last_err = e
+            if attempt < max_retries - 1:
+                wait_s = 2 * (attempt + 1)
+                log(f"ADSD TTS {idx+1} 失败（第 {attempt+1}/{max_retries} 次）：{e}，{wait_s}s 后重试")
+                time.sleep(wait_s)
+                continue
+            raise RuntimeError(f"ADSD TTS {idx+1} 重试失败：{last_err}")
+
+
+def _asr_verify_dialogue_audio(audio_path: str) -> dict | None:
+    """Upload ADSD master audio through Telegram and verify transcript with WeryAI ASR."""
+    if os.environ.get("ADR_ADSD_SKIP_ASR", "").strip().lower() in ("1", "true", "yes", "on"):
+        return None
+    try:
+        with open(audio_path, "rb") as f:
+            r = requests.post(
+                f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendAudio",
+                data={"chat_id": TG_CHAT_ID, "caption": "ADSD QA audio for ASR"},
+                files={"audio": (os.path.basename(audio_path), f, "audio/mpeg")},
+                timeout=(30, 180),
+            )
+        r.raise_for_status()
+        file_id = (r.json().get("result") or {}).get("audio", {}).get("file_id")
+        if not file_id:
+            raise RuntimeError("Telegram sendAudio 无 file_id")
+        fr = requests.get(
+            f"https://api.telegram.org/bot{TG_BOT_TOKEN}/getFile",
+            params={"file_id": file_id},
+            timeout=30,
+        )
+        fr.raise_for_status()
+        file_path = (fr.json().get("result") or {}).get("file_path")
+        if not file_path:
+            raise RuntimeError("Telegram getFile 无 file_path")
+        audio_url = f"https://api.telegram.org/file/bot{TG_BOT_TOKEN}/{file_path}"
+        r2 = req_post("/generation/speech-recognize", {"audio_url": audio_url, "language": "zh"}, timeout=30)
+        task_id = r2.get("data", {}).get("task_id") or (r2.get("data", {}).get("task_ids") or [None])[0]
+        if not task_id:
+            raise RuntimeError(f"speech-recognize 无 task_id: {json.dumps(r2, ensure_ascii=False)[:200]}")
+        data = poll_task_status(task_id, "ADSD ASR", max_wait=240)
+        (OUTPUT_DIR / "speech_recognize_result.json").write_text(
+            json.dumps(data, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        return data
+    except Exception as e:
+        log(f"ADSD ASR 校验失败（不阻断）：{e}")
+        tg(f"⚠️ ADSD ASR 校验失败，不阻断成片：{e}")
+        return None
+
+
+def step2_dialogue_voice(script: list[dict]) -> str:
+    """ADSD voice core: one TTS per dialogue turn, deterministic timeline."""
+    pause = float(os.environ.get("ADR_ADSD_TURN_PAUSE", "0.22"))
+    tg(f"🎭 {ADSD_MODE_NAME} TTS 启动：text-to-audio × {len(script)} turn，逐句生成确定性时间轴...")
+    timeline = []
+    wav_files: list[str] = []
+    cursor = 0.0
+    for i, turn in enumerate(script):
+        wav_path, dur, meta = _tts_turn_to_audio(turn, i)
+        turn.update({
+            "dialogue_mode": True,
+            "dialogue_audio": wav_path,
+            "dialogue_audio_mp3": meta.get("mp3_path"),
+            "dialogue_tts_task_id": meta.get("task_id"),
+            "dialogue_tts_cost_credits": meta.get("cost_credits"),
+            "audio_start": cursor,
+            "audio_end": cursor + dur,
+            "sub_start": cursor + SUB_DELAY,
+            "sub_end": cursor + dur + SUB_DELAY,
+            "dur": dur,
+            "vid_duration": max(1.0, dur + (AUDIO_DELAY if i == len(script) - 1 else pause)),
+            "img_path": str(OUTPUT_DIR / f"img_{i}.jpg"),
+            "vid_path": str(OUTPUT_DIR / f"seg_{i}.mp4"),
+        })
+        timeline.append({
+            "turn": i + 1,
+            "speaker": turn.get("speaker"),
+            "voice_id": turn.get("speaker_id"),
+            "voice_name": turn.get("speaker_name"),
+            "text": turn.get("text"),
+            "shot": turn.get("shot"),
+            "audio": wav_path,
+            "start": round(cursor, 3),
+            "end": round(cursor + dur, 3),
+            "duration": round(dur, 3),
+            "tts_task_id": meta.get("task_id"),
+            "tts_cost_credits": meta.get("cost_credits"),
+        })
+        wav_files.append(wav_path)
+        if i < len(script) - 1:
+            silence = str(OUTPUT_DIR / f"silence_{i+1:02d}.wav")
+            ffmpeg(
+                "-f", "lavfi", "-i", "anullsrc=r=44100:cl=mono",
+                "-t", str(pause),
+                "-c:a", "pcm_s16le",
+                silence,
+                timeout=30,
+            )
+            wav_files.append(silence)
+            cursor += dur + pause
+        else:
+            cursor += dur
+        log(f"ADSD turn {i+1}: {turn.get('speaker')} {dur:.3f}s [{turn['audio_start']:.3f}-{turn['audio_end']:.3f}]")
+    timeline_path = OUTPUT_DIR / "turn_timeline.json"
+    timeline_path.write_text(json.dumps(timeline, ensure_ascii=False, indent=2), encoding="utf-8")
+    concat_txt = OUTPUT_DIR / "dialogue_wav_concat.txt"
+    with open(concat_txt, "w", encoding="utf-8") as f:
+        for p in wav_files:
+            f.write(f"file '{p}'\n")
+    wav_master = str(OUTPUT_DIR / "dialogue_master.wav")
+    ffmpeg("-f", "concat", "-safe", "0", "-i", str(concat_txt), "-c", "copy", wav_master, timeout=120)
+    voice_path = str(OUTPUT_DIR / "dialogue_master.mp3")
+    ffmpeg("-i", wav_master, "-c:a", "libmp3lame", "-b:a", "128k", voice_path, timeout=120)
+    total_dur = ffprobe_duration(voice_path)
+    asr_data = _asr_verify_dialogue_audio(voice_path)
+    if asr_data and asr_data.get("speech_text"):
+        expected = "".join(s.get("text", "") for s in script)
+        recognized = re.sub(r"\s+", "", asr_data.get("speech_text", ""))
+        missing = [s.get("text", "")[:8] for s in script if s.get("text", "")[:8] not in recognized]
+        if missing:
+            tg(f"⚠️ ADSD ASR 校验有疑似缺句：{', '.join(missing)}")
+        else:
+            tg("✅ ADSD ASR 全文校验通过")
+    tg(f"✅ {ADSD_MODE_NAME} 主音轨完成：{total_dur:.2f}s，时间轴 {timeline_path}")
+    return voice_path
+
+
 # ── 第三步 + 第四步 + 第五步：时间轴计算（Whisper + 同步优先剪辑节奏）────────
 # 默认严格音画同步；如需电影感 J-Cut，可通过环境变量手动开启：
 #   ADR_AUDIO_DELAY=0.5 ADR_SUB_DELAY=0.2 python3 run_adr_v8.py "主题"
@@ -1653,6 +1966,21 @@ def _calc_sentence_boundaries(voice_path: str, script: list[dict]) -> list[dict]
 def step345_timeline(script: list[dict], voice_path: str) -> list[dict]:
     total_dur = ffprobe_duration(voice_path)
     tg(f"✅ 主音轨时长探测完成：{total_dur:.3f} 秒")
+
+    if ADS_DIALOGUE_MODE and script and script[0].get("dialogue_mode") and "audio_start" in script[0]:
+        lines = []
+        for i, s in enumerate(script):
+            s.setdefault("img_path", str(OUTPUT_DIR / f"img_{i}.jpg"))
+            s.setdefault("vid_path", str(OUTPUT_DIR / f"seg_{i}.mp4"))
+            s.setdefault("sub_start", s["audio_start"] + SUB_DELAY)
+            s.setdefault("sub_end", s.get("audio_end", s["audio_start"] + s.get("dur", 1.0)) + SUB_DELAY)
+            s.setdefault("vid_duration", max(1.0, s.get("dur", 1.0)))
+            lines.append(
+                f"Turn {i+1} {s.get('speaker','')}（{s.get('dur', 0):.2f}s）→ "
+                f"画面 {s['audio_start']:.2f}s / 字幕 {s['sub_start']:.2f}s"
+            )
+        tg(f"✅ {ADSD_MODE_NAME} 时间轴采用逐句 TTS 真实时长\n" + "\n".join(lines))
+        return script
 
     segs = _calc_sentence_boundaries(voice_path, script)
     tg(f"✅ 时间轴分配完成（Whisper 语速曲线 + 字符分界），{len(segs)} 段")
@@ -2752,6 +3080,9 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
                 for seg in segments
                 for chunk in _wrap_card(seg)
             ]
+            if s.get("dialogue_mode") and s.get("speaker") and segments:
+                # 对话版只在第一张字幕卡加角色名，避免每行重复占用老人可读空间。
+                segments[0] = f"{s['speaker']}：{segments[0]}"
 
             total_chars = sum(len(c.replace(r"\N", "")) for c in segments) or 1
             duration = t_end - t_start
