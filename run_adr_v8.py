@@ -134,6 +134,10 @@ ADSD_LIP_SYNC_EXPERIMENT = (
     or "--lip-sync" in sys.argv
     or os.environ.get("ADR_ADSD_LIP_SYNC", "").strip().lower() in ("1", "true", "yes", "on")
 )
+ADSD_RICH_MOTION_PROMPT = (
+    "--adsd-rich-motion" in sys.argv
+    or os.environ.get("ADR_ADSD_RICH_MOTION", "").strip().lower() in ("1", "true", "yes", "on")
+)
 
 # --ads-reporter：把 ADS 的"拟现场第一人称记者感"并入 ADR 动态化。
 # 该模式自动开启 --with-motion，并约束剧本、分镜与 motion prompt；
@@ -2949,7 +2953,7 @@ def _build_motion_video_prompt(scene: dict, motion_prompt: str, safe_retry: bool
         speaker = scene.get("speaker", "")
         contract = _adsd_visual_contract(speaker)
         shot = scene.get("shot", "")
-        if safe_retry:
+        if safe_retry or not ADSD_RICH_MOTION_PROMPT:
             role = "reporter" if speaker == "记者" else "office clerk" if speaker == "职员" else "speaker"
             return (
                 "Neutral period dialogue scene in an old office courtyard, two adult characters, "
@@ -3003,6 +3007,8 @@ def _motion_one_scene(idx: int, scene: dict, motion_prompt: str, aspect_ratio: s
         # Phase 1 改造：直接 text-to-video（Seedance 2.0），绕过"照片晃动"，走真正摄影机运动
         # ADSD 使用降噪 prompt，避免把上游静帧 prompt 的风格词带入 WERYDANCE 触发版权拦截。
         full_prompt = _build_motion_video_prompt(scene, motion_prompt, safe_retry=safe_retry)
+        if ADS_DIALOGUE_MODE and not ADSD_RICH_MOTION_PROMPT and not safe_retry:
+            log(f"[motion {idx}] ADSD 使用默认安全 prompt")
         if safe_retry:
             log(f"[motion {idx}] 使用极简安全 prompt 重试")
         # text-to-video 限 2000 字符
