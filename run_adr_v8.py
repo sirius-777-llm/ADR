@@ -1487,6 +1487,15 @@ _SENSITIVE_TERMS = {
     "侵略": "入境", "暴行": "行为", "血洗": "进入",
 }
 
+_ADSD_POLICY_REWRITE_TERMS = {
+    "最后通牒": "限期照会",
+    "威胁": "施压",
+    "胁迫": "施压",
+    "开战": "扩大冲突",
+    "战争": "战事",
+    "军事": "军务",
+}
+
 def _sanitize_for_external_api(text: str) -> str:
     if not text:
         return text
@@ -1498,7 +1507,73 @@ def _sanitize_for_external_api(text: str) -> str:
 
 def _is_content_policy_error(err: Exception) -> bool:
     s = str(err).lower()
-    return "text-fail" in s or "audio-fail" in s or "content policy" in s or "policy violation" in s
+    return (
+        "text-fail" in s
+        or "audio-fail" in s
+        or "content policy" in s
+        or "policy violation" in s
+        or "sensitive" in s
+        or "1002" in s
+        or "敏感内容" in s
+        or "内容审查" in s
+    )
+
+
+def _rewrite_adsd_tts_text_for_policy(text: str, speaker: str, err: Exception) -> str:
+    """Rewrite only the blocked ADSD TTS line into neutral historical wording."""
+    original = text or ""
+    sanitized = _sanitize_for_external_api(original)
+    prompt = f"""把下面这句短视频对白改写成更中性、可播报的历史说明，用于 TTS。
+
+要求：
+1. 保留事实含义，不新增事件。
+2. 避免强烈控诉、暴力、威胁、仇恨、煽动词。
+3. 仍然像人物对白，不要写成论文。
+4. 不超过 {max(28, min(70, len(original) + 8))} 个汉字。
+5. 只输出改写后的这一句，不加引号、不加解释。
+
+角色：{speaker}
+原句：{sanitized}
+接口错误：{str(err)[:120]}
+"""
+    rewritten = ""
+    try:
+        rewritten = chat(
+            "GEMINI_25_FLASH",
+            "你是历史短视频对白编辑，只输出一行可播报中文。",
+            prompt,
+            max_tokens=180,
+            timeout=90,
+        ).strip()
+    except Exception as e:
+        log(f"ADSD TTS policy 改写 LLM 失败，走规则兜底：{e}")
+    rewritten = re.sub(r'^[「"“”]+|[」"“”]+$', "", rewritten).strip()
+    rewritten = rewritten.splitlines()[0].strip() if rewritten else ""
+    if not rewritten or rewritten == original:
+        rewritten = sanitized
+        for k, v in _ADSD_POLICY_REWRITE_TERMS.items():
+            rewritten = rewritten.replace(k, v)
+    rewritten = _sanitize_for_external_api(rewritten)[:500]
+    if not rewritten:
+        rewritten = "这件事需要放回当年的国际形势里看。"
+    return rewritten
+
+
+def _record_adsd_tts_rewrite(idx: int, speaker: str, before: str, after: str, err: Exception):
+    try:
+        path = OUTPUT_DIR / "tts_policy_rewrites.jsonl"
+        payload = {
+            "turn": idx + 1,
+            "speaker": speaker,
+            "before": before,
+            "after": after,
+            "error": str(err)[:300],
+            "created_at": datetime.now().isoformat(timespec="seconds"),
+        }
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(payload, ensure_ascii=False) + "\n")
+    except Exception as e:
+        log(f"ADSD TTS policy 改写记录失败: {e}")
 
 
 def step2_master_voice(script: list[dict], speaker_id: str = "liyan2-ef9401ec", speaker_name: str = "国栋") -> str:
@@ -1614,8 +1689,15 @@ def step2_master_voice(script: list[dict], speaker_id: str = "liyan2-ef9401ec", 
 def _tts_turn_to_audio(turn: dict, idx: int, max_retries: int = 3) -> tuple[str, float, dict]:
     """Generate one ADSD dialogue turn via WeryAI text-to-audio."""
     voice_id = int(turn.get("speaker_id") or ADSD_VOICES["旁白"]["voice_id"])
-    text = _sanitize_for_external_api(turn["text"])[:500]
+    speaker = turn.get("speaker", "speaker")
+    original_text = turn["text"]
+    text = _sanitize_for_external_api(original_text)[:500]
+    if text != original_text:
+        turn["text"] = text
+        turn["tts_policy_rewritten"] = True
+        _record_adsd_tts_rewrite(idx, speaker, original_text, text, RuntimeError("initial external-api sanitization"))
     last_err = None
+    rewrite_count = 0
     for attempt in range(max_retries):
         try:
             payload = {
@@ -1633,20 +1715,37 @@ def _tts_turn_to_audio(turn: dict, idx: int, max_retries: int = 3) -> tuple[str,
             audios = data.get("audios") or []
             if not audios:
                 raise RuntimeError(f"text-to-audio 成功但无 audios: {json.dumps(data, ensure_ascii=False)[:200]}")
-            mp3_path = str(OUTPUT_DIR / f"turn_{idx+1:02d}_{turn.get('speaker','speaker')}.mp3")
+            mp3_path = str(OUTPUT_DIR / f"turn_{idx+1:02d}_{speaker}.mp3")
             urllib.request.urlretrieve(audios[0], mp3_path)
-            wav_path = str(OUTPUT_DIR / f"turn_{idx+1:02d}_{turn.get('speaker','speaker')}.wav")
+            wav_path = str(OUTPUT_DIR / f"turn_{idx+1:02d}_{speaker}.wav")
             ffmpeg("-i", mp3_path, "-ar", "44100", "-ac", "1", "-c:a", "pcm_s16le", wav_path, timeout=60)
             dur = ffprobe_duration(wav_path)
-            return wav_path, dur, {"task_id": task_id, "cost_credits": data.get("cost_credits"), "mp3_path": mp3_path}
+            return wav_path, dur, {
+                "task_id": task_id,
+                "cost_credits": data.get("cost_credits"),
+                "mp3_path": mp3_path,
+                "tts_policy_rewritten": bool(turn.get("tts_policy_rewritten")),
+            }
         except Exception as e:
             last_err = e
+            if _is_content_policy_error(e) and rewrite_count < 2:
+                before = turn.get("text", text)
+                after = _rewrite_adsd_tts_text_for_policy(before, speaker, e)
+                rewrite_count += 1
+                turn["text"] = after
+                turn["tts_policy_rewritten"] = True
+                text = _sanitize_for_external_api(after)[:500]
+                _record_adsd_tts_rewrite(idx, speaker, before, after, e)
+                tg(f"⚠️ ADSD TTS {idx+1} 触发内容审查，已自动改写为中性历史表述后重试")
+                log(f"ADSD TTS {idx+1} policy rewrite: {before} -> {after}")
+                continue
             if attempt < max_retries - 1:
                 wait_s = 2 * (attempt + 1)
                 log(f"ADSD TTS {idx+1} 失败（第 {attempt+1}/{max_retries} 次）：{e}，{wait_s}s 后重试")
                 time.sleep(wait_s)
                 continue
             raise RuntimeError(f"ADSD TTS {idx+1} 重试失败：{last_err}")
+    raise RuntimeError(f"ADSD TTS {idx+1} 重试失败：{last_err}")
 
 
 def _asr_verify_dialogue_audio(audio_path: str) -> dict | None:
@@ -1688,6 +1787,44 @@ def _asr_verify_dialogue_audio(audio_path: str) -> dict | None:
     except Exception as e:
         log(f"ADSD ASR 校验失败（不阻断）：{e}")
         tg(f"⚠️ ADSD ASR 校验失败，不阻断成片：{e}")
+        return None
+
+
+def _compact_zh_text(text: str) -> str:
+    return re.sub(r"[\s，。！？、；：,.!?;:'\"“”‘’（）()《》【】\[\]\-—…·]", "", text or "")
+
+
+def _write_adsd_asr_text_qa(script: list[dict], asr_data: dict) -> dict | None:
+    """Compare subtitle/script text against ASR text to catch silent TTS rewrites."""
+    try:
+        import difflib
+        expected = _compact_zh_text("".join(s.get("text", "") for s in script))
+        recognized = _compact_zh_text(asr_data.get("speech_text", ""))
+        ratio = difflib.SequenceMatcher(None, expected, recognized).ratio() if expected and recognized else 0.0
+        missing_chunks = []
+        for i, turn in enumerate(script):
+            line = _compact_zh_text(turn.get("text", ""))
+            if len(line) < 6:
+                continue
+            starts = list(range(0, max(len(line) - 5, 1), 6))
+            for start in starts:
+                chunk = line[start:start + 6]
+                if len(chunk) >= 6 and chunk not in recognized:
+                    missing_chunks.append({"turn": i + 1, "speaker": turn.get("speaker"), "chunk": chunk})
+                    break
+        qa = {
+            "expected_chars": len(expected),
+            "recognized_chars": len(recognized),
+            "similarity": round(ratio, 4),
+            "missing_chunks": missing_chunks[:20],
+            "missing_count": len(missing_chunks),
+            "pass": ratio >= 0.92 and not missing_chunks,
+            "created_at": datetime.now().isoformat(timespec="seconds"),
+        }
+        (OUTPUT_DIR / "asr_qa.json").write_text(json.dumps(qa, ensure_ascii=False, indent=2), encoding="utf-8")
+        return qa
+    except Exception as e:
+        log(f"ADSD ASR 文本 QA 写入失败: {e}")
         return None
 
 
@@ -1757,13 +1894,15 @@ def step2_dialogue_voice(script: list[dict]) -> str:
     total_dur = ffprobe_duration(voice_path)
     asr_data = _asr_verify_dialogue_audio(voice_path)
     if asr_data and asr_data.get("speech_text"):
-        expected = "".join(s.get("text", "") for s in script)
-        recognized = re.sub(r"\s+", "", asr_data.get("speech_text", ""))
-        missing = [s.get("text", "")[:8] for s in script if s.get("text", "")[:8] not in recognized]
-        if missing:
-            tg(f"⚠️ ADSD ASR 校验有疑似缺句：{', '.join(missing)}")
+        asr_qa = _write_adsd_asr_text_qa(script, asr_data)
+        if asr_qa and not asr_qa.get("pass"):
+            samples = [m.get("chunk") for m in asr_qa.get("missing_chunks", [])[:5]]
+            tg(
+                f"⚠️ ADSD ASR 文本一致性需复查：similarity={asr_qa.get('similarity')}, "
+                f"missing={asr_qa.get('missing_count')}，样例：{', '.join(samples)}"
+            )
         else:
-            tg("✅ ADSD ASR 全文校验通过")
+            tg(f"✅ ADSD ASR 文本一致性通过 similarity={asr_qa.get('similarity') if asr_qa else 'n/a'}")
     tg(f"✅ {ADSD_MODE_NAME} 主音轨完成：{total_dur:.2f}s，时间轴 {timeline_path}")
     return voice_path
 
@@ -2362,6 +2501,28 @@ def step6_parallel(script: list[dict], topic: str) -> str | None:
             # 异常张（文字错/风格离群/内容偏离）单独推审批；其他自动通过
             tg(f"🔍 智能异常检测：Vision 扫描 {n} 张图...")
             anomaly_idxs = _llm_check_scenes_anomalies(script)
+            qa_path = OUTPUT_DIR / "scene_qa.json"
+            qa_payload = {
+                "mode": ADSD_MODE_NAME if ADS_DIALOGUE_MODE else ("VDAR" if IS_VERTICAL else "HDAR"),
+                "total": n,
+                "anomaly_indices": sorted(int(i) for i in anomaly_idxs),
+                "anomaly_scene_numbers": sorted(int(i) + 1 for i in anomaly_idxs),
+                "policy": "auto_approve_adsd" if ADS_DIALOGUE_MODE else "manual_review_anomalies",
+                "created_at": datetime.now().isoformat(timespec="seconds"),
+            }
+            try:
+                qa_path.write_text(json.dumps(qa_payload, ensure_ascii=False, indent=2), encoding="utf-8")
+            except Exception as e:
+                log(f"scene_qa.json 写入失败: {e}")
+            if ADS_DIALOGUE_MODE:
+                if anomaly_idxs:
+                    tg(
+                        f"⚠️ {ADSD_MODE_NAME} 场景 QA：Vision 标记 {len(anomaly_idxs)} 张疑似异常 "
+                        f"{sorted(i+1 for i in anomaly_idxs)}，已记录 {qa_path.name} 并自动放行"
+                    )
+                else:
+                    tg(f"✅ {ADSD_MODE_NAME} 场景 QA：全部 {n} 张通过，自动进入合成阶段")
+                anomaly_idxs = set()
             if anomaly_idxs:
                 tg(f"⚠️ 异常检测：{len(anomaly_idxs)} 张需要你审核：{sorted(i+1 for i in anomaly_idxs)}\n（其他 {n - len(anomaly_idxs)} 张自动通过）")
                 # 推送异常张到 Telegram
@@ -3143,7 +3304,7 @@ def step9_render(raw_path: str, voice_path: str, bgm_path: str | None, ass_path:
     except Exception as e:
         log(f"音画同步修正失败（使用原视频）：{e}")
 
-    fmt_tag = "VDAR" if IS_VERTICAL else "HDAR"
+    fmt_tag = ADSD_MODE_NAME if ADS_DIALOGUE_MODE else ("VDAR" if IS_VERTICAL else "HDAR")
     final_path = str(OUTPUT_DIR / f"ADR_V8_{fmt_tag}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.mp4")
     ass_escaped = ass_path.replace("\\", "/").replace(":", "\\:")
 
@@ -3186,6 +3347,42 @@ def step9_render(raw_path: str, voice_path: str, bgm_path: str | None, ass_path:
 
     size_mb = os.path.getsize(final_path) / (1024 * 1024)
     dur     = ffprobe_duration(final_path)
+    if ADS_DIALOGUE_MODE:
+        try:
+            import subprocess as _sp
+            probe = _sp.check_output([
+                "ffprobe", "-v", "error",
+                "-show_entries", "stream=codec_type,duration",
+                "-of", "json",
+                final_path,
+            ], stderr=subprocess.DEVNULL)
+            streams = json.loads(probe.decode()).get("streams", [])
+            video_dur = next((float(s["duration"]) for s in streams if s.get("codec_type") == "video" and s.get("duration")), None)
+            audio_dur = next((float(s["duration"]) for s in streams if s.get("codec_type") == "audio" and s.get("duration")), None)
+            qa_summary = {
+                "mode": ADSD_MODE_NAME,
+                "final_path": final_path,
+                "format_duration": dur,
+                "video_duration": video_dur,
+                "audio_duration": audio_dur,
+                "audio_video_delta": abs(video_dur - audio_dur) if video_dur is not None and audio_dur is not None else None,
+                "turn_timeline_exists": (OUTPUT_DIR / "turn_timeline.json").exists(),
+                "asr_result_exists": (OUTPUT_DIR / "speech_recognize_result.json").exists(),
+                "asr_qa_exists": (OUTPUT_DIR / "asr_qa.json").exists(),
+                "scene_qa_exists": (OUTPUT_DIR / "scene_qa.json").exists(),
+                "subtitle_exists": Path(ass_path).exists(),
+                "created_at": datetime.now().isoformat(timespec="seconds"),
+            }
+            (OUTPUT_DIR / "qa_summary.json").write_text(
+                json.dumps(qa_summary, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            if qa_summary["audio_video_delta"] is not None and qa_summary["audio_video_delta"] > 0.25:
+                tg(f"⚠️ {ADSD_MODE_NAME} QA：音视频时长差 {qa_summary['audio_video_delta']:.3f}s，需复查")
+            else:
+                tg(f"✅ {ADSD_MODE_NAME} QA：音视频时长差 {qa_summary.get('audio_video_delta', 0):.3f}s")
+        except Exception as e:
+            log(f"ADSD qa_summary 写入失败: {e}")
     tg(f"✅ 成片输出完毕，文件大小 {size_mb:.1f} MB，时长 {dur:.2f}s")
     return final_path
 
@@ -4109,7 +4306,40 @@ def _generate_cover_image(topic: str, short_title: str, script: list[dict]) -> s
         "中性": "contemplative kinfolk editorial, balanced soft tones",
     }.get(tone, "contemplative kinfolk editorial, balanced soft tones")
 
-    if is_1919_global_topic(topic):
+    if ADS_DIALOGUE_MODE:
+        dialogue_hint = " / ".join(
+            f"{s.get('speaker','角色')}:{s.get('text','')[:18]}"
+            for s in (script or [])[:4]
+        )
+        date_exact = f"{_py}年{_pmo}月{_pd}日" if _pm else (_date_tag or "")
+        subtitle_rule = (
+            f'Directly below main title: a small cream rounded pill with exact subtitle "{date_exact}" — '
+            f'use Arabic digits exactly, never convert to Chinese numerals.'
+        ) if date_exact else "Directly below main title: a small cream rounded pill with a short factual subtitle, exactly once."
+        cover_prompt = (
+            f'3:4 vertical Chinese historical dialogue-drama cover for a video account, fully model-rendered typography. '
+            f'{_tone_aesthetic}. Republican-era China, two-person dialogue composition: a young field reporter holding a telegram faces an older foreign-ministry clerk holding documents; side profiles or three-quarter views, no mouth-closeup lip-sync pressure. '
+            f'Background: Beijing foreign ministry gate, old telegram paper, world map, rotary telephone, distant war smoke, sepia ink-wash watercolor mixed with historical realism. '
+            f'Top edge centered: dark-charcoal rounded pill with white Chinese "中华万年历". '
+            f'Top-right: compact PANTONE swatch, English/Pantone only. '
+            f'Center upper-middle: main title "{short_title}" in heavy-bold Chinese Song-ti serif, deep ink with cream outline, exactly once. '
+            f'{subtitle_rule} '
+            f'Bottom center: small warm sepia brush note "{_bottom_note}" flanked by two red seal dots, exactly once. '
+            f'Dialogue clue in illustration: reporter and clerk clearly appear to be talking over telegram documents; visual anchor from script: {dialogue_hint}. '
+            f'Strict text rule: render only these Chinese text blocks, no random signs, no duplicated title, no mirrored text, no extra subtitles in the illustration. '
+            f'Every Chinese character sharp and complete, 8% safe margin, no watermark, no modern devices, no microphones, no livestream.'
+        )
+        log(f"ADSD 对话版封面 prompt 由 Python 硬拼完成（长度 {len(cover_prompt)} 字符）")
+        if len(cover_prompt) > 1900:
+            cut = cover_prompt[:1900]
+            for sep in (". ", ", ", " and "):
+                idx = cut.rfind(sep)
+                if idx > 1900 * 0.7:
+                    cut = cut[:idx + 1]
+                    break
+            cover_prompt = cut.rstrip() + ' No watermarks. Every Chinese character sharp and complete.'
+            log(f"ADSD 封面 prompt 超长已截断：{len(cover_prompt)} 字符")
+    elif is_1919_global_topic(topic):
         cover_prompt = build_1919_global_cover_prompt(short_title)
         log(f"1919 万年历结构专用封面 prompt 由 Python 硬拼完成，长度 {len(cover_prompt)} 字符")
     else:
@@ -4433,7 +4663,8 @@ def step10_deliver(final_path: str, topic: str, script: list[dict]):
         log(f"自动压缩兜底失败，用原片尝试上传: {e}")
 
     url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendVideo"
-    short_caption = f"{short_title} — ADR V8"
+    delivery_tag = ADSD_MODE_NAME if ADS_DIALOGUE_MODE else "ADR V8"
+    short_caption = f"{short_title} — {delivery_tag}"
     video_ok = False
 
     # ── 尝试 1：requests（timeout 放大到 600s）──
