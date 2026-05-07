@@ -3267,21 +3267,35 @@ def _lip_sync_one_scene(idx: int, scene: dict, target_dur: float, aspect_ratio: 
         ]
         attempts: list[dict] = []
         for variant_name, model, prompt in variants:
-            _wait_motion_submit_slot(f"lip-sync {idx+1}")
-            r = req_post("/generation/almighty-reference-to-video", {
-                "model": model,
-                "images": [image_url],
-                "audios": [audio_url],
-                "prompt": prompt,
-                "duration": api_dur,
-                "aspect_ratio": aspect_ratio,
-                "resolution": "720p",
-                "generate_audio": "false",
-                "video_number": 1,
-            }, timeout=30)
-            task_id = r.get("data", {}).get("task_id") or (r.get("data", {}).get("task_ids") or [None])[0]
-            if not task_id:
-                attempts.append({"variant": variant_name, "model": model, "pass": False, "reason": "submit_without_task_id", "response": r})
+            r = None
+            task_id = None
+            for submit_attempt in range(3):
+                try:
+                    _wait_motion_submit_slot(f"lip-sync {idx+1}")
+                    r = req_post("/generation/almighty-reference-to-video", {
+                        "model": model,
+                        "images": [image_url],
+                        "audios": [audio_url],
+                        "prompt": prompt,
+                        "duration": api_dur,
+                        "aspect_ratio": aspect_ratio,
+                        "resolution": "720p",
+                        "generate_audio": "false",
+                        "video_number": 1,
+                    }, timeout=30)
+                    task_id = r.get("data", {}).get("task_id") or (r.get("data", {}).get("task_ids") or [None])[0]
+                    if task_id:
+                        break
+                except Exception as e:
+                    if submit_attempt < 2:
+                        wait_s = 5 * (submit_attempt + 1)
+                        log(f"[lip-sync {idx}] submit {variant_name}/{model} 失败（第 {submit_attempt+1}/3 次）：{e}，{wait_s}s 后重试")
+                        time.sleep(wait_s)
+                        continue
+                    attempts.append({"variant": variant_name, "model": model, "pass": False, "reason": f"submit_exception: {e}"})
+            if task_id is None:
+                if r is not None:
+                    attempts.append({"variant": variant_name, "model": model, "pass": False, "reason": "submit_without_task_id", "response": r})
                 continue
             _save_lip_sync_task(idx, task_id)
             ok, info = _lip_sync_poll_download_and_process(idx, task_id, scene, target_dur)
