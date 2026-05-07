@@ -3328,7 +3328,7 @@ def step66_adsd_lip_sync(script: list[dict]):
     target_durs = [_lip_sync_slot_duration(script, i) for i in range(n)]
     results: dict[int, bool] = {}
     records: list[dict] = []
-    max_workers = min(4, n)
+    max_workers = min(10, n)
     with ThreadPoolExecutor(max_workers=max_workers) as ex:
         futs = {ex.submit(_lip_sync_one_scene, i, script[i], target_durs[i], aspect): i for i in range(n)}
         for fut in as_completed(futs):
