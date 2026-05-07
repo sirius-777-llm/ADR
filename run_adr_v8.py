@@ -139,6 +139,11 @@ ADSD_RICH_MOTION_PROMPT = (
     "--adsd-rich-motion" in sys.argv
     or os.environ.get("ADR_ADSD_RICH_MOTION", "").strip().lower() in ("1", "true", "yes", "on")
 )
+ADSD_ONSITE_POV_MODE = (
+    "--pov" in sys.argv
+    or "--onsite-pov" in sys.argv
+    or os.environ.get("ADR_ADSD_ONSITE_POV", "").strip().lower() in ("1", "true", "yes", "on")
+)
 
 # --ads-reporter：把 ADS 的"拟现场第一人称记者感"并入 ADR 动态化。
 # 该模式自动开启 --with-motion，并约束剧本、分镜与 motion prompt；
@@ -703,6 +708,16 @@ def _adsd_default_roles(topic: str) -> tuple[str, str]:
     return "现场见证人", "知情讲述人"
 
 
+def _adsd_pov_contract() -> str:
+    return (
+        "Onsite observer POV: the viewer feels physically present in the historical scene, standing at eye level "
+        "beside the speaker, near a doorway, table edge, pier, street crowd, temple hall, office corridor, or army tent. "
+        "Use first-person documentary camera language such as over-the-shoulder from the crowd edge, shoulder-level handheld sway, "
+        "foreground documents or doorframes, and nearby listener reactions. Keep the active speaker's face and mouth readable. "
+        "No modern reporter, no host, no interview setup, no microphone, no livestream, no smartphone, no TV studio."
+    )
+
+
 def _generate_adsd_dialogue_turns(topic: str, num_turns: int, tone: str, style_guide: str) -> list[dict]:
     """Generate ADSD dialogue turns. Each turn becomes one TTS unit and one video segment."""
     num_turns = max(4, min(12, num_turns))
@@ -729,6 +744,7 @@ def _generate_adsd_dialogue_turns(topic: str, num_turns: int, tone: str, style_g
 10. 结尾要把主题讲清楚，不要只煽情。
 11. 不要出现「记者」「主持人」「主播」「采访」这些现代媒体身份，除非主题本身真实发生在现代新闻现场。
 12. 这是“现场视角”，不是记者报道；镜头可以像观众站在现场旁听。
+{"13. 已启用 POV 现场旁听模式：shot 必须写出观众仿佛站在人群边、门口、案前、船边、廊下或帐内近距离看见当前 speaker 说话；不要写成记者出镜、直播、采访。" if ADSD_ONSITE_POV_MODE else ""}
 
 语言风格：
 {style_guide}
@@ -784,14 +800,15 @@ def _adsd_visual_contract(speaker: str, lip_sync: bool | None = None) -> str:
         "Show this person as the clear speaking subject inside the period scene, face readable in three-quarter view, "
         "the other onsite character listening nearby. No modern reporter, no TV host, no microphone"
     )
+    pov = f". {_adsd_pov_contract()}" if ADSD_ONSITE_POV_MODE else ""
     if lip_sync:
         return (
             f"{anchor}. Talking-head friendly framing: medium close-up or over-shoulder two-shot, mouth area visible, "
-            "subtle natural lip movement implied, no extreme mouth close-up, no distorted teeth, no modern microphone"
+            f"subtle natural lip movement implied, no extreme mouth close-up, no distorted teeth, no modern microphone{pov}"
         )
     return (
         f"{anchor}. Speaker-focus framing: medium close-up or over-shoulder two-shot, mouth can be visible but do not force exact lip sync, "
-        "use eyes, hands, documents and reaction timing to sell the dialogue, no extreme mouth close-up"
+        f"use eyes, hands, documents and reaction timing to sell the dialogue, no extreme mouth close-up{pov}"
     )
 
 
@@ -1407,6 +1424,7 @@ THUMBNAIL_ANCHOR: 封面视觉锚，用 4~6 个短语描述：主体、主色（
                 "shot": dialogue_meta.get("shot", ""),
                 "speaker_visual_contract": visual_contract,
                 "lip_sync_experiment": ADSD_LIP_SYNC_EXPERIMENT,
+                "onsite_pov_mode": ADSD_ONSITE_POV_MODE,
             })
         script.append(item)
         emotion_count[emotion] = emotion_count.get(emotion, 0) + 1
@@ -1932,6 +1950,7 @@ def _write_adsd_speaker_focus_qa(script: list[dict], motion_results: dict[int, b
                 "speaker_contract_exists": bool(contract),
                 "prompt_has_active_speaker": "Active speaker is" in prompt,
                 "prompt_names_speaker_role": bool(speaker) and (speaker in prompt or "historical onsite character" in prompt),
+                "onsite_pov_prompt": (not ADSD_ONSITE_POV_MODE) or ("Onsite observer POV" in prompt),
                 "motion_succeeded": motion_results.get(i) if motion_results is not None else None,
             })
         failed = [
@@ -1939,6 +1958,7 @@ def _write_adsd_speaker_focus_qa(script: list[dict], motion_results: dict[int, b
             if not s["speaker"]
             or not s["speaker_contract_exists"]
             or not s["prompt_has_active_speaker"]
+            or not s["onsite_pov_prompt"]
             or s["audio_start"] is None
             or s["audio_end"] is None
         ]
@@ -1946,6 +1966,7 @@ def _write_adsd_speaker_focus_qa(script: list[dict], motion_results: dict[int, b
             "mode": ADSD_MODE_NAME,
             "policy": "lip_sync_prompt_experiment" if ADSD_LIP_SYNC_EXPERIMENT else "speaker_focus_required",
             "real_lip_sync": False,
+            "onsite_pov_mode": ADSD_ONSITE_POV_MODE,
             "note": "Current WERYDANCE path is text-to-video; it can enforce active speaker framing, but cannot guarantee audio-driven viseme alignment.",
             "total": len(script),
             "failed_count": len(failed),
@@ -2904,6 +2925,7 @@ def _generate_motion_prompts(script: list[dict]) -> list[str]:
 - ADSD dialogue mode is ON: each scene has one active speaker. Motion must keep the active speaker visually dominant for that turn.
 - Use medium close-up or over-the-shoulder two-shot, gentle reaction timing, natural eye movement, paper handling, and listener reaction.
 - {"Lip-sync experiment is ON: keep the mouth area visible and imply subtle natural lip movement, but avoid exaggerated dubbing or distorted teeth." if ADSD_LIP_SYNC_EXPERIMENT else "Production default: do not promise exact lip-sync; keep speaker focus stable with readable face, hands, documents, and listener reaction."}
+{"- Onsite POV mode is ON: make the viewer feel physically present beside the speaker or at the crowd/door/table edge. This is not a reporter, host, interview, livestream, or broadcast setup." if ADSD_ONSITE_POV_MODE else ""}
 """ if ADS_DIALOGUE_MODE else ""
     try:
         summary_lines = "\n".join(
@@ -3061,15 +3083,16 @@ def _build_motion_video_prompt(scene: dict, motion_prompt: str, safe_retry: bool
         shot = scene.get("shot", "")
         if safe_retry or not ADSD_RICH_MOTION_PROMPT:
             role = f"onsite historical character labelled {speaker}" if speaker else "onsite speaker"
+            pov = " First-person onsite observer POV, viewer stands beside the speaker or at the crowd edge." if ADSD_ONSITE_POV_MODE else ""
             return (
                 "Neutral period dialogue scene, two adult historical onsite characters, "
                 f"active {role} is clearly speaking while the other listens. "
-                "Simple slow camera push, slight head movement, subtle paper movement, natural light, realistic motion. "
+                f"Simple slow camera push, slight head movement, subtle paper movement, natural light, realistic motion.{pov} "
                 "No modern reporter, no TV host, no microphone, no famous style, no branded references, no movie references, no text, no logos, no watermark."
             )
         return (
-            "Historically grounded early-Republican China dialogue scene, neutral archival newsreel realism, "
-            "warm sepia paper tones, period clothing and diplomatic office props. "
+            "Historically grounded period dialogue scene, neutral archival realism, "
+            "warm sepia paper tones, period clothing and topic-accurate props. "
             f"{contract}. "
             f"Scene action: {shot}. "
             f"Camera motion: {motion_prompt}. "
@@ -3166,21 +3189,26 @@ def _lip_sync_slot_duration(script: list[dict], idx: int) -> float:
 def _adsd_lip_sync_prompt(scene: dict, safe_retry: bool = False) -> str:
     speaker = scene.get("speaker") or "speaker"
     role = f"historical onsite character labelled {speaker}"
+    pov = (
+        " First-person onsite observer POV: viewer stands beside the active speaker or at the crowd/door/table edge, "
+        "close enough to see the face and mouth, without reporter or interview framing."
+        if ADSD_ONSITE_POV_MODE else ""
+    )
     if safe_retry:
         return (
             "Neutral period dialogue scene. "
             f"Active speaker is the {role}; the other adult character listens silently. "
             "The active speaker follows the provided Chinese audio reference with natural mouth movement. "
-            "Visible mouth, stable face, subtle head motion, realistic lighting. "
+            f"Visible mouth, stable face, subtle head motion, realistic lighting.{pov} "
             "No modern reporter, no TV host, no microphone, no subtitles, no text overlay, no logos, no watermark, no branded style references."
         )
     text = scene.get("text", "")
     shot = scene.get("shot", "")
     return (
-        "Historically grounded early-Republican China dialogue scene. "
+        "Historically grounded period dialogue scene. "
         f"Active speaker is the {role}; the other person only listens. "
         f'台词:"{text}" The active speaker says exactly this line. '
-        "Mouth movement must synchronize with the provided audio reference; keep the mouth visible with natural jaw movement. "
+        f"Mouth movement must synchronize with the provided audio reference; keep the mouth visible with natural jaw movement.{pov} "
         f"Scene action: {shot}. "
         "Keep the same face and period clothing, no modern reporter, no TV host, no microphone, no subtitles, no text overlay, no logo, no watermark."
     )[:2000]
@@ -3365,6 +3393,7 @@ def step66_adsd_lip_sync(script: list[dict]):
         "mode": ADSD_MODE_NAME,
         "interface": "almighty-reference-to-video",
         "model": "WERYDANCE_2_0",
+        "onsite_pov_mode": ADSD_ONSITE_POV_MODE,
         "total": n,
         "success_count": success_cnt,
         "success_rate": round(success_cnt / max(n, 1), 4),
@@ -3855,6 +3884,7 @@ def step9_render(raw_path: str, voice_path: str, bgm_path: str | None, ass_path:
             audio_dur = next((float(s["duration"]) for s in streams if s.get("codec_type") == "audio" and s.get("duration")), None)
             qa_summary = {
                 "mode": ADSD_MODE_NAME,
+                "onsite_pov_mode": ADSD_ONSITE_POV_MODE,
                 "final_path": final_path,
                 "format_duration": dur,
                 "video_duration": video_dur,
@@ -4812,10 +4842,14 @@ def _generate_cover_image(topic: str, short_title: str, script: list[dict]) -> s
             f'Directly below main title: a small cream rounded pill with exact subtitle "{date_exact}" — '
             f'use Arabic digits exactly, never convert to Chinese numerals.'
         ) if date_exact else "Directly below main title: a small cream rounded pill with a short factual subtitle, exactly once."
+        pov_cover = (
+            "Composition feels like an onsite observer standing just inside the scene, with foreground document edge or doorway framing, not a reporter cover. "
+            if ADSD_ONSITE_POV_MODE else ""
+        )
         cover_prompt = (
             f'3:4 vertical Chinese historical dialogue-drama cover for a video account, fully model-rendered typography. '
             f'{_tone_aesthetic}. Two historical onsite characters from the actual topic era speak face to face; side profiles or three-quarter views, no modern reporter, no TV host, no microphone, no mouth-closeup lip-sync pressure. '
-            f'Background: historically accurate location, period documents and objects directly tied to the topic, sepia ink-wash watercolor mixed with historical realism. '
+            f'{pov_cover}Background: historically accurate location, period documents and objects directly tied to the topic, sepia ink-wash watercolor mixed with historical realism. '
             f'Top edge centered: dark-charcoal rounded pill with white Chinese "中华万年历". '
             f'Top-right: compact PANTONE swatch, English/Pantone only. '
             f'Center upper-middle: main title "{short_title}" in heavy-bold Chinese Song-ti serif, deep ink with cream outline, exactly once. '
