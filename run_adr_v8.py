@@ -3806,6 +3806,113 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
     return str(ass_path)
 
 
+def _read_output_json(name: str) -> dict | list | None:
+    try:
+        p = OUTPUT_DIR / name
+        if not p.exists():
+            return None
+        return json.loads(p.read_text(encoding="utf-8"))
+    except Exception as e:
+        log(f"读取 QA 文件失败 {name}: {e}")
+        return None
+
+
+def _qa_file_pass(name: str) -> bool | None:
+    data = _read_output_json(name)
+    if isinstance(data, dict) and "pass" in data:
+        return bool(data.get("pass"))
+    return None
+
+
+def _write_adsd_delivery_qa(final_path: str) -> dict | None:
+    """Final ADSD gate before Telegram delivery. Failed QA blocks publishing the finished video."""
+    if not ADS_DIALOGUE_MODE:
+        return None
+
+    issues: list[str] = []
+    warnings: list[str] = []
+
+    final = Path(final_path)
+    if not final.exists() or final.stat().st_size < 10000:
+        issues.append(f"final video missing or too small: {final_path}")
+
+    qa_summary = _read_output_json("qa_summary.json")
+    audio_video_delta = None
+    if isinstance(qa_summary, dict):
+        audio_video_delta = qa_summary.get("audio_video_delta")
+        if audio_video_delta is None:
+            issues.append("qa_summary.audio_video_delta missing")
+        elif float(audio_video_delta) > 0.25:
+            issues.append(f"audio_video_delta too large: {audio_video_delta:.3f}s")
+    else:
+        issues.append("qa_summary.json missing")
+
+    required_files = [
+        ("subtitle_qa.json", "subtitle labels"),
+        ("speaker_focus_qa.json", "speaker focus"),
+        ("asr_qa.json", "ASR text match"),
+    ]
+    if ADSD_LIP_SYNC_EXPERIMENT:
+        required_files.append(("lip_sync_qa.json", "lip sync"))
+
+    for name, label in required_files:
+        passed = _qa_file_pass(name)
+        if passed is None:
+            issues.append(f"{label} QA missing: {name}")
+        elif not passed:
+            issues.append(f"{label} QA failed: {name}")
+
+    subtitle_qa = _read_output_json("subtitle_qa.json")
+    if isinstance(subtitle_qa, dict) and subtitle_qa.get("leaked_speaker_labels"):
+        issues.append(f"subtitle speaker label leak: {subtitle_qa.get('leaked_speaker_labels')}")
+
+    timeline = _read_output_json("turn_timeline.json")
+    if isinstance(timeline, list):
+        speakers = [str(t.get("speaker", "")).strip() for t in timeline if isinstance(t, dict)]
+        banned = {"记者", "主持人", "主播", "采访者"}
+        if not ADS_REPORTER_MODE:
+            leaked_roles = sorted({s for s in speakers if s in banned})
+            if leaked_roles:
+                issues.append(f"modern media speaker roles leaked: {leaked_roles}")
+        if not speakers:
+            issues.append("turn_timeline has no speakers")
+    else:
+        issues.append("turn_timeline.json missing")
+
+    lip_sync_qa = _read_output_json("lip_sync_qa.json")
+    if ADSD_LIP_SYNC_EXPERIMENT and isinstance(lip_sync_qa, dict):
+        rate = float(lip_sync_qa.get("success_rate") or 0)
+        if rate < 0.8:
+            issues.append(f"lip_sync success_rate below 0.8: {rate:.4f}")
+        if lip_sync_qa.get("success_count") != lip_sync_qa.get("total"):
+            warnings.append(
+                f"lip_sync partial success: {lip_sync_qa.get('success_count')}/{lip_sync_qa.get('total')}"
+            )
+
+    payload = {
+        "mode": ADSD_MODE_NAME,
+        "onsite_pov_mode": ADSD_ONSITE_POV_MODE,
+        "lip_sync_experiment": ADSD_LIP_SYNC_EXPERIMENT,
+        "final_path": final_path,
+        "pass": len(issues) == 0,
+        "issues": issues,
+        "warnings": warnings,
+        "checks": {
+            "subtitle_qa": _qa_file_pass("subtitle_qa.json"),
+            "speaker_focus_qa": _qa_file_pass("speaker_focus_qa.json"),
+            "lip_sync_qa": _qa_file_pass("lip_sync_qa.json"),
+            "asr_qa": _qa_file_pass("asr_qa.json"),
+            "audio_video_delta": audio_video_delta,
+        },
+        "created_at": datetime.now().isoformat(timespec="seconds"),
+    }
+    (OUTPUT_DIR / "delivery_qa.json").write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    return payload
+
+
 # ── 第九步：最终合成 ─────────────────────────────────────────────────────────
 def step9_render(raw_path: str, voice_path: str, bgm_path: str | None, ass_path: str, topic: str) -> str:
     # 兜底：如果 bgm_path 为 None 但 bgm.mp3 文件实际存在且有效，强制补读
@@ -3918,6 +4025,10 @@ def step9_render(raw_path: str, voice_path: str, bgm_path: str | None, ass_path:
                 "speaker_focus_qa_exists": (OUTPUT_DIR / "speaker_focus_qa.json").exists(),
                 "lip_sync_qa_exists": (OUTPUT_DIR / "lip_sync_qa.json").exists(),
                 "subtitle_qa_exists": (OUTPUT_DIR / "subtitle_qa.json").exists(),
+                "asr_qa_pass": _qa_file_pass("asr_qa.json"),
+                "speaker_focus_qa_pass": _qa_file_pass("speaker_focus_qa.json"),
+                "lip_sync_qa_pass": _qa_file_pass("lip_sync_qa.json"),
+                "subtitle_qa_pass": _qa_file_pass("subtitle_qa.json"),
                 "subtitle_exists": Path(ass_path).exists(),
                 "created_at": datetime.now().isoformat(timespec="seconds"),
             }
@@ -5037,6 +5148,21 @@ def _generate_cover_image(topic: str, short_title: str, script: list[dict]) -> s
 
 
 def step10_deliver(final_path: str, topic: str, script: list[dict]):
+    if ADS_DIALOGUE_MODE:
+        delivery_qa = _write_adsd_delivery_qa(final_path)
+        if delivery_qa and not delivery_qa.get("pass"):
+            issues = "\n".join(f"• {x}" for x in delivery_qa.get("issues", [])[:8])
+            tg(
+                f"🛑 {ADSD_MODE_NAME} 发布已阻断：QA 未通过\n\n"
+                f"{issues}\n\n"
+                f"成片已保留在本地：{final_path}\n"
+                f"QA：{OUTPUT_DIR / 'delivery_qa.json'}"
+            )
+            log(f"{ADSD_MODE_NAME} delivery QA blocked: {delivery_qa.get('issues')}")
+            return
+        if delivery_qa:
+            tg(f"✅ {ADSD_MODE_NAME} 发布门禁通过：字幕/口型/ASR/音画同步 QA OK")
+
     caption, short_title, hashtags = _generate_caption(topic, script)
     tg(f"📝 社媒文案 + 短标题 + 热门标签已生成\n\n📤 正在发送...")
 
