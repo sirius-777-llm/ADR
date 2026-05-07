@@ -3133,9 +3133,17 @@ def _lip_sync_slot_duration(script: list[dict], idx: int) -> float:
     return max(1.0, float(scene.get("audio_end", scene.get("audio_start", 0) + scene.get("dur", 1))) - float(scene.get("audio_start", 0)))
 
 
-def _adsd_lip_sync_prompt(scene: dict) -> str:
+def _adsd_lip_sync_prompt(scene: dict, safe_retry: bool = False) -> str:
     speaker = scene.get("speaker") or "speaker"
     role = "young field reporter" if speaker == "记者" else "older foreign-ministry clerk" if speaker == "职员" else "active speaker"
+    if safe_retry:
+        return (
+            "Neutral period dialogue scene in an old office courtyard. "
+            f"Active speaker is the {role}; the other adult character listens silently. "
+            "The active speaker follows the provided Chinese audio reference with natural mouth movement. "
+            "Visible mouth, stable face, subtle head motion, realistic lighting. "
+            "No subtitles, no text overlay, no logos, no watermark, no branded style references."
+        )
     text = scene.get("text", "")
     shot = scene.get("shot", "")
     return (
@@ -3237,27 +3245,46 @@ def _lip_sync_one_scene(idx: int, scene: dict, target_dur: float, aspect_ratio: 
     try:
         image_url = _upload_to_weryai(scene["img_path"])
         audio_url = _upload_to_weryai(source_audio)
-        prompt = _adsd_lip_sync_prompt(scene)
         api_dur = int(round(max(5, min(15, float(scene.get("dur") or target_dur)))))
-        _wait_motion_submit_slot(f"lip-sync {idx+1}")
-        r = req_post("/generation/almighty-reference-to-video", {
-            "model": "WERYDANCE_2_0",
-            "images": [image_url],
-            "audios": [audio_url],
-            "prompt": prompt,
-            "duration": api_dur,
-            "aspect_ratio": aspect_ratio,
-            "resolution": "720p",
-            "generate_audio": "false",
-            "video_number": 1,
-        }, timeout=30)
-        task_id = r.get("data", {}).get("task_id") or (r.get("data", {}).get("task_ids") or [None])[0]
-        if not task_id:
-            return idx, False, {"turn": idx + 1, "pass": False, "reason": "submit_without_task_id", "response": r}
-        _save_lip_sync_task(idx, task_id)
-        ok, info = _lip_sync_poll_download_and_process(idx, task_id, scene, target_dur)
-        info.update({"submit_duration": api_dur, "image_url": image_url, "audio_url": audio_url})
-        return idx, ok, info
+        variants = [
+            ("primary", "WERYDANCE_2_0", _adsd_lip_sync_prompt(scene, safe_retry=False)),
+            ("safe_prompt", "WERYDANCE_2_0", _adsd_lip_sync_prompt(scene, safe_retry=True)),
+            ("fast_safe_prompt", "WERYDANCE_2_0_FAST", _adsd_lip_sync_prompt(scene, safe_retry=True)),
+        ]
+        attempts: list[dict] = []
+        for variant_name, model, prompt in variants:
+            _wait_motion_submit_slot(f"lip-sync {idx+1}")
+            r = req_post("/generation/almighty-reference-to-video", {
+                "model": model,
+                "images": [image_url],
+                "audios": [audio_url],
+                "prompt": prompt,
+                "duration": api_dur,
+                "aspect_ratio": aspect_ratio,
+                "resolution": "720p",
+                "generate_audio": "false",
+                "video_number": 1,
+            }, timeout=30)
+            task_id = r.get("data", {}).get("task_id") or (r.get("data", {}).get("task_ids") or [None])[0]
+            if not task_id:
+                attempts.append({"variant": variant_name, "model": model, "pass": False, "reason": "submit_without_task_id", "response": r})
+                continue
+            _save_lip_sync_task(idx, task_id)
+            ok, info = _lip_sync_poll_download_and_process(idx, task_id, scene, target_dur)
+            info.update({
+                "variant": variant_name,
+                "submit_model": model,
+                "submit_duration": api_dur,
+                "image_url": image_url,
+                "audio_url": audio_url,
+            })
+            attempts.append({k: v for k, v in info.items() if k not in ("image_url", "audio_url", "response")})
+            if ok:
+                info["attempts"] = attempts
+                return idx, ok, info
+        final = attempts[-1] if attempts else {"turn": idx + 1, "pass": False, "reason": "no_attempts"}
+        final.update({"turn": idx + 1, "pass": False, "attempts": attempts, "image_url": image_url, "audio_url": audio_url})
+        return idx, False, final
     except Exception as e:
         log(f"[lip-sync {idx}] 异常: {type(e).__name__}: {e}")
         return idx, False, {"turn": idx + 1, "pass": False, "reason": str(e)}
