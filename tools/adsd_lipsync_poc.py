@@ -243,23 +243,34 @@ def make_candidates(image_url: str, audio_url: str, prompt: str, duration: int, 
         "prompt": prompt,
         "duration": duration,
         "aspect_ratio": aspect_ratio,
-        "resolution": "1080p",
     }
     return [
         {
+            "name": "almighty_reference_image_audio",
+            "path": "/generation/almighty-reference-to-video",
+            "payload": {
+                **common,
+                "images": [image_url],
+                "audios": [audio_url],
+                "resolution": "720p",
+                "generate_audio": "false",
+                "video_number": 1,
+            },
+        },
+        {
             "name": "image_to_video_audio",
             "path": "/generation/image-to-video",
-            "payload": {**common, "image": image_url, "audio": audio_url, "audio_visual_sync": True},
+            "payload": {**common, "image": image_url, "audio": audio_url, "resolution": "1080p", "audio_visual_sync": True},
         },
         {
             "name": "image_to_video_audio_url",
             "path": "/generation/image-to-video",
-            "payload": {**common, "image": image_url, "audio_url": audio_url, "audio_visual_sync": True},
+            "payload": {**common, "image": image_url, "audio_url": audio_url, "resolution": "1080p", "audio_visual_sync": True},
         },
         {
             "name": "image_to_video_reference_audio",
             "path": "/generation/image-to-video",
-            "payload": {**common, "image": image_url, "reference_audio": audio_url, "audio_visual_sync": True},
+            "payload": {**common, "image": image_url, "reference_audio": audio_url, "resolution": "1080p", "audio_visual_sync": True},
         },
         {
             "name": "video_lip_sync_image_audio",
