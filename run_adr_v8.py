@@ -695,17 +695,31 @@ def _voice_for_speaker(speaker: str) -> dict:
 
 
 def _adsd_default_roles(topic: str) -> tuple[str, str]:
+    roles = _adsd_role_candidates(topic)
+    return roles[0], roles[1] if len(roles) > 1 else roles[0]
+
+
+def _adsd_role_candidates(topic: str) -> list[str]:
     if any(k in topic for k in ("同泰寺", "佛", "僧", "梁武帝", "萧衍", "寺")):
-        return "寺中僧人", "朝廷官员"
+        return ["寺中僧人", "朝廷官员", "梁朝文士", "寺外百姓"]
     if any(k in topic for k in ("公车上书", "康有为", "梁启超", "科举", "上书")):
-        return "上书士人", "旁观官员"
+        return ["上书士人", "旁观官员", "在京举人", "书吏"]
     if any(k in topic for k in ("郑成功", "鹿耳门", "台湾", "海", "潮")):
-        return "水师兵士", "海边百姓"
+        return ["水师兵士", "海边百姓", "船上将领", "地方父老"]
     if any(k in topic for k in ("二十一条", "最后通牒", "外交", "条约")):
-        return "街头见证人", "衙署官员"
+        return ["街头见证人", "衙署官员", "报馆学生", "电报员"]
     if any(k in topic for k in ("三国", "归晋", "晋", "魏", "蜀", "吴")):
-        return "军中亲历者", "地方官吏"
-    return "现场见证人", "知情讲述人"
+        return ["军中亲历者", "地方官吏", "归降士兵", "城中百姓"]
+    return ["现场见证人", "知情讲述人", "当事人", "旁观百姓"]
+
+
+def _adsd_dialogue_shape(speakers: list[str]) -> str:
+    count = len([s for s in dict.fromkeys(speakers) if s])
+    if count <= 1:
+        return "monologue"
+    if count == 2:
+        return "dialogue"
+    return "ensemble"
 
 
 def _adsd_pov_contract() -> str:
@@ -721,23 +735,29 @@ def _adsd_pov_contract() -> str:
 def _generate_adsd_dialogue_turns(topic: str, num_turns: int, tone: str, style_guide: str) -> list[dict]:
     """Generate ADSD dialogue turns. Each turn becomes one TTS unit and one video segment."""
     num_turns = max(4, min(12, num_turns))
-    role_a, role_b = _adsd_default_roles(topic)
+    role_candidates = _adsd_role_candidates(topic)
+    role_hint = " / ".join(role_candidates)
+    fallback_role = role_candidates[0]
     prompt = f"""你是 ADSD（ADS Dialogue）短剧化历史讲解编剧。
 
 主题：「{topic}」
-目标：生成 {num_turns} 句现场视角对白，用两个历史现场内的人物把复杂历史讲给普通人听懂。
+目标：生成 {num_turns} 句现场视角台词，用最适合剧情的说话结构把复杂历史讲给普通人听懂。
 
-默认现场角色（可按题材微调，但必须是历史现场内的人）：
-1. {role_a}：负责提出现场疑问、指出眼前人事物、把观众带进现场。
-2. {role_b}：负责解释概念、背景、因果。
+可用现场角色方向（可按题材微调，但必须是历史现场内的人）：
+{role_hint}
+
+你必须先在心里判断本题最适合哪种结构，但输出里不要解释：
+- 独白：一个当事人/见证人连续讲述，适合内心独白、临终陈述、密信、回忆录、案前陈词。
+- 双人对白：两个人一问一答，适合解释复杂背景、因果和专名。
+- 多人群像：3~4 个角色轮流发言，适合朝堂、街头、船上、战场、书院、报馆等多方在场的剧情。
 
 硬性要求：
 1. 只输出 JSON 数组，不要 Markdown，不要解释。
 2. 数组长度必须正好 {num_turns}。
 3. 每项字段必须包含：speaker、text、shot、emotion。
-4. speaker 只能使用两个现场角色名；两人必须交替出现，第一句用第一个角色。
+4. speaker 必须是现场角色名；全片使用 1~4 个 speaker。根据剧情需要可独白、双人或多人，不强制交替。
 5. text 是中文对白，每句 18~36 字，白话、直接、普通人能听懂。
-6. shot 是中文画面说明，要具体到地点、道具、人物动作；必须让当前 speaker 成为画面里的说话主体，另一个角色作为倾听/反应对象。
+6. shot 是中文画面说明，要具体到地点、道具、人物动作；必须让当前 speaker 成为画面里的说话主体；如有其他角色，只作为倾听/反应对象。
 7. emotion 只能从 neutral / tense / solemn / explanatory 中选。
 8. 严禁诗化表达、隐喻、金句、含蓄暗示、空泛大词。
 9. 每 2~3 句必须解释一个专名或因果。
@@ -745,13 +765,14 @@ def _generate_adsd_dialogue_turns(topic: str, num_turns: int, tone: str, style_g
 11. 不要出现「记者」「主持人」「主播」「采访」这些现代媒体身份，除非主题本身真实发生在现代新闻现场。
 12. 这是“现场视角”，不是记者报道；镜头可以像观众站在现场旁听。
 {"13. 已启用 POV 现场旁听模式：shot 必须写出观众仿佛站在人群边、门口、案前、船边、廊下或帐内近距离看见当前 speaker 说话；不要写成记者出镜、直播、采访。" if ADSD_ONSITE_POV_MODE else ""}
+14. 不要为了凑人数而加角色；如果一个人讲最清楚，就用独白；如果多人在场更自然，才用多人。
 
 语言风格：
 {style_guide}
 
 输出示例格式：
 [
-  {{"speaker":"{role_a}","text":"这张告示刚贴出来，街口的人全围过来了。","shot":"街口墙边，{role_a}指着新贴告示，{role_b}在旁凝神看","emotion":"tense"}}
+  {{"speaker":"{fallback_role}","text":"这张告示刚贴出来，街口的人全围过来了。","shot":"街口墙边，{fallback_role}指着新贴告示，旁人凝神看","emotion":"tense"}}
 ]"""
     raw = chat("GEMINI_3_1_FLASH_LITE", "你只输出严格 JSON 数组。", prompt, max_tokens=2600, timeout=180)
     arr = _extract_json_array(raw)
@@ -759,18 +780,15 @@ def _generate_adsd_dialogue_turns(topic: str, num_turns: int, tone: str, style_g
         raise RuntimeError(f"ADSD 对话句数不匹配：got {len(arr)}, need {num_turns}")
     turns = []
     speakers_seen: list[str] = []
+    banned_speakers = {"记者", "主持人", "主播", "职员", "采访者"}
     for i, item in enumerate(arr):
         speaker = str(item.get("speaker", "")).strip()
-        if speaker in ("记者", "主持人", "主播", "职员") or not speaker:
-            speaker = role_a if i % 2 == 0 else role_b
-        if speaker not in speakers_seen and len(speakers_seen) < 2:
+        if speaker in banned_speakers or not speaker:
+            speaker = speakers_seen[i % len(speakers_seen)] if speakers_seen else fallback_role
+        if speaker not in speakers_seen and len(speakers_seen) < 4:
             speakers_seen.append(speaker)
-        if len(speakers_seen) >= 2:
-            expected = speakers_seen[i % 2]
-            if speaker != expected:
-                speaker = expected
-        else:
-            speaker = role_a if i % 2 == 0 else role_b
+        elif speaker not in speakers_seen:
+            speaker = speakers_seen[i % len(speakers_seen)] if speakers_seen else fallback_role
         text = str(item.get("text", "")).strip()
         shot = str(item.get("shot", "")).strip()
         emotion = str(item.get("emotion", "neutral")).strip().lower()
@@ -788,6 +806,12 @@ def _generate_adsd_dialogue_turns(topic: str, num_turns: int, tone: str, style_g
             "shot": shot or f"{speaker}在现场说明材料",
             "emotion": emotion,
         })
+    speakers = [t["speaker"] for t in turns if t.get("speaker")]
+    shape = _adsd_dialogue_shape(speakers)
+    speaker_count = len(dict.fromkeys(speakers))
+    for turn in turns:
+        turn["dialogue_shape"] = shape
+        turn["speaker_count"] = speaker_count
     return turns
 
 
@@ -798,7 +822,7 @@ def _adsd_visual_contract(speaker: str, lip_sync: bool | None = None) -> str:
     anchor = (
         f"Active speaker is the historical onsite character labelled '{speaker}'. "
         "Show this person as the clear speaking subject inside the period scene, face readable in three-quarter view, "
-        "the other onsite character listening nearby. No modern reporter, no TV host, no microphone"
+        "with any other onsite characters only listening or reacting nearby. No modern reporter, no TV host, no microphone"
     )
     pov = f". {_adsd_pov_contract()}" if ADSD_ONSITE_POV_MODE else ""
     if lip_sync:
@@ -1048,8 +1072,9 @@ def step1_script(topic: str) -> list[dict]:
                 lines = [t["text"] for t in dialogue_turns]
                 num_lines = len(lines)
                 roles = " / ".join(dict.fromkeys(t.get("speaker", "") for t in dialogue_turns if t.get("speaker")))
-                tg(f"🎭 {ADSD_MODE_NAME} 现场对白就绪：{num_lines} 个 turn，角色：{roles}")
-                log(f"ADSD 对话剧本生成成功：{num_lines} turns")
+                shape = dialogue_turns[0].get("dialogue_shape", "dialogue") if dialogue_turns else "dialogue"
+                tg(f"🎭 {ADSD_MODE_NAME} 现场台词就绪：{num_lines} 个 turn，结构：{shape}，角色：{roles}")
+                log(f"ADSD 台词剧本生成成功：{num_lines} turns shape={shape} roles={roles}")
                 break
             except Exception as e:
                 log(f"ADSD 对话剧本生成失败（第 {_try+1}/3 次）：{e}")
@@ -1422,6 +1447,8 @@ THUMBNAIL_ANCHOR: 封面视觉锚，用 4~6 个短语描述：主体、主色（
                 "speaker_id": dialogue_meta.get("speaker_id"),
                 "speaker_name": dialogue_meta.get("speaker_name", ""),
                 "shot": dialogue_meta.get("shot", ""),
+                "dialogue_shape": dialogue_meta.get("dialogue_shape", ""),
+                "speaker_count": dialogue_meta.get("speaker_count"),
                 "speaker_visual_contract": visual_contract,
                 "lip_sync_experiment": ADSD_LIP_SYNC_EXPERIMENT,
                 "onsite_pov_mode": ADSD_ONSITE_POV_MODE,
@@ -1944,6 +1971,8 @@ def _write_adsd_speaker_focus_qa(script: list[dict], motion_results: dict[int, b
             scenes.append({
                 "turn": i + 1,
                 "speaker": speaker,
+                "dialogue_shape": scene.get("dialogue_shape"),
+                "speaker_count": scene.get("speaker_count"),
                 "audio_start": scene.get("audio_start"),
                 "audio_end": scene.get("audio_end"),
                 "duration": scene.get("dur"),
@@ -1964,6 +1993,8 @@ def _write_adsd_speaker_focus_qa(script: list[dict], motion_results: dict[int, b
         ]
         payload = {
             "mode": ADSD_MODE_NAME,
+            "dialogue_shape": script[0].get("dialogue_shape") if script else None,
+            "speakers": list(dict.fromkeys(scene.get("speaker", "") for scene in script if scene.get("speaker"))),
             "policy": "lip_sync_prompt_experiment" if ADSD_LIP_SYNC_EXPERIMENT else "speaker_focus_required",
             "real_lip_sync": False,
             "onsite_pov_mode": ADSD_ONSITE_POV_MODE,
@@ -2277,7 +2308,10 @@ def step345_timeline(script: list[dict], voice_path: str) -> list[dict]:
             tg(f"✅ {ADSD_MODE_NAME} 说话人镜头同步 QA 通过：{speaker_qa.get('total')} turn")
         elif speaker_qa:
             tg(f"⚠️ {ADSD_MODE_NAME} 说话人镜头同步 QA 未通过：failed={speaker_qa.get('failed_count')}")
-        tg(f"✅ {ADSD_MODE_NAME} 时间轴采用逐句 TTS 真实时长\n" + "\n".join(lines))
+        shape = script[0].get("dialogue_shape") if script else ""
+        speakers = " / ".join(dict.fromkeys(s.get("speaker", "") for s in script if s.get("speaker")))
+        shape_note = f"结构：{shape}；角色：{speakers}\n" if shape or speakers else ""
+        tg(f"✅ {ADSD_MODE_NAME} 时间轴采用逐句 TTS 真实时长\n{shape_note}" + "\n".join(lines))
         return script
 
     segs = _calc_sentence_boundaries(voice_path, script)
@@ -2923,7 +2957,7 @@ def _generate_motion_prompts(script: list[dict]) -> list[str]:
 """ if ADS_REPORTER_MODE else ""
     adsd_motion_guide = f"""
 - ADSD dialogue mode is ON: each scene has one active speaker. Motion must keep the active speaker visually dominant for that turn.
-- Use medium close-up or over-the-shoulder two-shot, gentle reaction timing, natural eye movement, paper handling, and listener reaction.
+- Support monologue, two-person dialogue, or ensemble scenes. Use medium close-up, over-the-shoulder, or group reaction timing according to the scene, while keeping the current active speaker unambiguous.
 - {"Lip-sync experiment is ON: keep the mouth area visible and imply subtle natural lip movement, but avoid exaggerated dubbing or distorted teeth." if ADSD_LIP_SYNC_EXPERIMENT else "Production default: do not promise exact lip-sync; keep speaker focus stable with readable face, hands, documents, and listener reaction."}
 {"- Onsite POV mode is ON: make the viewer feel physically present beside the speaker or at the crowd/door/table edge. This is not a reporter, host, interview, livestream, or broadcast setup." if ADSD_ONSITE_POV_MODE else ""}
 """ if ADS_DIALOGUE_MODE else ""
@@ -3085,8 +3119,8 @@ def _build_motion_video_prompt(scene: dict, motion_prompt: str, safe_retry: bool
             role = f"onsite historical character labelled {speaker}" if speaker else "onsite speaker"
             pov = " First-person onsite observer POV, viewer stands beside the speaker or at the crowd edge." if ADSD_ONSITE_POV_MODE else ""
             return (
-                "Neutral period dialogue scene, two adult historical onsite characters, "
-                f"active {role} is clearly speaking while the other listens. "
+                "Neutral period spoken scene with one or more adult historical onsite characters, "
+                f"active {role} is clearly speaking while any other characters only listen or react. "
                 f"Simple slow camera push, slight head movement, subtle paper movement, natural light, realistic motion.{pov} "
                 "No modern reporter, no TV host, no microphone, no famous style, no branded references, no movie references, no text, no logos, no watermark."
             )
@@ -3197,7 +3231,7 @@ def _adsd_lip_sync_prompt(scene: dict, safe_retry: bool = False) -> str:
     if safe_retry:
         return (
             "Neutral period dialogue scene. "
-            f"Active speaker is the {role}; the other adult character listens silently. "
+            f"Active speaker is the {role}; any other onsite characters listen silently. "
             "The active speaker follows the provided Chinese audio reference with natural mouth movement. "
             f"Visible mouth, stable face, subtle head motion, realistic lighting.{pov} "
             "No modern reporter, no TV host, no microphone, no subtitles, no text overlay, no logos, no watermark, no branded style references."
@@ -3206,7 +3240,7 @@ def _adsd_lip_sync_prompt(scene: dict, safe_retry: bool = False) -> str:
     shot = scene.get("shot", "")
     return (
         "Historically grounded period dialogue scene. "
-        f"Active speaker is the {role}; the other person only listens. "
+        f"Active speaker is the {role}; any other people only listen or react. "
         f'台词:"{text}" The active speaker says exactly this line. '
         f"Mouth movement must synchronize with the provided audio reference; keep the mouth visible with natural jaw movement.{pov} "
         f"Scene action: {shot}. "
@@ -3869,6 +3903,7 @@ def _write_adsd_delivery_qa(final_path: str) -> dict | None:
     timeline = _read_output_json("turn_timeline.json")
     if isinstance(timeline, list):
         speakers = [str(t.get("speaker", "")).strip() for t in timeline if isinstance(t, dict)]
+        speaker_count = len([s for s in dict.fromkeys(speakers) if s])
         banned = {"记者", "主持人", "主播", "采访者"}
         if not ADS_REPORTER_MODE:
             leaked_roles = sorted({s for s in speakers if s in banned})
@@ -3876,6 +3911,8 @@ def _write_adsd_delivery_qa(final_path: str) -> dict | None:
                 issues.append(f"modern media speaker roles leaked: {leaked_roles}")
         if not speakers:
             issues.append("turn_timeline has no speakers")
+        elif speaker_count > 4:
+            issues.append(f"too many ADSD speakers: {speaker_count}")
     else:
         issues.append("turn_timeline.json missing")
 
@@ -4981,14 +5018,14 @@ def _generate_cover_image(topic: str, short_title: str, script: list[dict]) -> s
         )
         cover_prompt = (
             f'3:4 vertical Chinese historical dialogue-drama cover for a video account, fully model-rendered typography. '
-            f'{_tone_aesthetic}. Two historical onsite characters from the actual topic era speak face to face; side profiles or three-quarter views, no modern reporter, no TV host, no microphone, no mouth-closeup lip-sync pressure. '
+            f'{_tone_aesthetic}. One to four historical onsite characters from the actual topic era appear according to the script structure; active discussion or solemn testimony, side profiles or three-quarter views, no modern reporter, no TV host, no microphone, no mouth-closeup lip-sync pressure. '
             f'{pov_cover}Background: historically accurate location, period documents and objects directly tied to the topic, sepia ink-wash watercolor mixed with historical realism. '
             f'Top edge centered: dark-charcoal rounded pill with white Chinese "中华万年历". '
             f'Top-right: compact PANTONE swatch, English/Pantone only. '
             f'Center upper-middle: main title "{short_title}" in heavy-bold Chinese Song-ti serif, deep ink with cream outline, exactly once. '
             f'{subtitle_rule} '
             f'Bottom center: small warm sepia brush note "{_bottom_note}" flanked by two red seal dots, exactly once. '
-            f'Dialogue clue in illustration: the two onsite characters clearly appear to be discussing period documents or objects; visual anchor from script: {dialogue_hint}. '
+            f'Dialogue clue in illustration: onsite character or characters clearly appear to be discussing or testifying about period documents or objects; visual anchor from script: {dialogue_hint}. '
             f'Strict text rule: render only these Chinese text blocks, no random signs, no duplicated title, no mirrored text, no extra subtitles in the illustration. '
             f'Every Chinese character sharp and complete, 8% safe margin, no watermark, no modern devices, no microphones, no livestream.'
         )
