@@ -3762,9 +3762,6 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
                 for seg in segments
                 for chunk in _wrap_card(seg)
             ]
-            if s.get("dialogue_mode") and s.get("speaker") and segments:
-                # 对话版只在第一张字幕卡加角色名，避免每行重复占用老人可读空间。
-                segments[0] = f"{s['speaker']}：{segments[0]}"
 
             total_chars = sum(len(c.replace(r"\N", "")) for c in segments) or 1
             duration = t_end - t_start
@@ -3780,6 +3777,30 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
                         f"Default,,0,0,0,,{FADE_TAG}{seg}\n"
                     )
                 cursor = seg_end + SUB_GAP
+
+    if ADS_DIALOGUE_MODE:
+        try:
+            ass_text = ass_path.read_text(encoding="utf-8", errors="replace")
+            speakers = sorted({str(s.get("speaker", "")).strip() for s in script if s.get("speaker")})
+            leaked = [sp for sp in speakers if f"{sp}：" in ass_text or f"{sp}:" in ass_text]
+            subtitle_qa = {
+                "mode": ADSD_MODE_NAME,
+                "policy": "speaker_labels_internal_only",
+                "speaker_label_leak_count": len(leaked),
+                "leaked_speaker_labels": leaked,
+                "pass": len(leaked) == 0,
+                "created_at": datetime.now().isoformat(timespec="seconds"),
+            }
+            (OUTPUT_DIR / "subtitle_qa.json").write_text(
+                json.dumps(subtitle_qa, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            if leaked:
+                tg(f"⚠️ {ADSD_MODE_NAME} 字幕 QA：发现角色身份泄露 {leaked}")
+            else:
+                log(f"{ADSD_MODE_NAME} 字幕 QA 通过：未泄露对白者身份标签")
+        except Exception as e:
+            log(f"ADSD subtitle_qa 写入失败: {e}")
 
     tg(f"✅ ASS 字幕文件已生成，共 {len(script)} 行对白")
     return str(ass_path)
@@ -3896,6 +3917,7 @@ def step9_render(raw_path: str, voice_path: str, bgm_path: str | None, ass_path:
                 "scene_qa_exists": (OUTPUT_DIR / "scene_qa.json").exists(),
                 "speaker_focus_qa_exists": (OUTPUT_DIR / "speaker_focus_qa.json").exists(),
                 "lip_sync_qa_exists": (OUTPUT_DIR / "lip_sync_qa.json").exists(),
+                "subtitle_qa_exists": (OUTPUT_DIR / "subtitle_qa.json").exists(),
                 "subtitle_exists": Path(ass_path).exists(),
                 "created_at": datetime.now().isoformat(timespec="seconds"),
             }
