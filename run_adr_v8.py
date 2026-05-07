@@ -2944,11 +2944,19 @@ def _motion_poll_and_download(idx: int, task_id: str, vid_path: str) -> bool:
     return False
 
 
-def _build_motion_video_prompt(scene: dict, motion_prompt: str) -> str:
+def _build_motion_video_prompt(scene: dict, motion_prompt: str, safe_retry: bool = False) -> str:
     if ADS_DIALOGUE_MODE:
         speaker = scene.get("speaker", "")
         contract = _adsd_visual_contract(speaker)
         shot = scene.get("shot", "")
+        if safe_retry:
+            role = "reporter" if speaker == "记者" else "office clerk" if speaker == "职员" else "speaker"
+            return (
+                "Neutral period dialogue scene in an old office courtyard, two adult characters, "
+                f"active {role} is clearly speaking while the other listens. "
+                "Simple slow camera push, slight head movement, subtle paper movement, natural light, realistic motion. "
+                "No famous style, no branded references, no movie references, no text, no logos, no watermark."
+            )
         return (
             "Historically grounded early-Republican China dialogue scene, neutral archival newsreel realism, "
             "warm sepia paper tones, period clothing and diplomatic office props. "
@@ -2961,7 +2969,7 @@ def _build_motion_video_prompt(scene: dict, motion_prompt: str) -> str:
     return f"{scene_prompt}. Camera motion: {motion_prompt}" if scene_prompt else motion_prompt
 
 
-def _motion_one_scene(idx: int, scene: dict, motion_prompt: str, aspect_ratio: str) -> bool:
+def _motion_one_scene(idx: int, scene: dict, motion_prompt: str, aspect_ratio: str, safe_retry: bool = False) -> bool:
     """对单个 scene 调 WERYDANCE_2_0 生成 motion 版 seg_N.mp4；成功返回 True"""
     img_path = scene["img_path"]
     vid_path = scene["vid_path"]  # 静态 seg_N.mp4 的路径，成功就覆盖它
@@ -2994,7 +3002,9 @@ def _motion_one_scene(idx: int, scene: dict, motion_prompt: str, aspect_ratio: s
     try:
         # Phase 1 改造：直接 text-to-video（Seedance 2.0），绕过"照片晃动"，走真正摄影机运动
         # ADSD 使用降噪 prompt，避免把上游静帧 prompt 的风格词带入 WERYDANCE 触发版权拦截。
-        full_prompt = _build_motion_video_prompt(scene, motion_prompt)
+        full_prompt = _build_motion_video_prompt(scene, motion_prompt, safe_retry=safe_retry)
+        if safe_retry:
+            log(f"[motion {idx}] 使用极简安全 prompt 重试")
         # text-to-video 限 2000 字符
         if len(full_prompt) > 2000:
             full_prompt = full_prompt[:2000]
@@ -3047,13 +3057,13 @@ def step65_motion(script: list[dict]):
     aspect = "9:16" if IS_VERTICAL else "16:9"
     results: dict[int, bool] = {}
 
-    def _run_batch(indices: list[int], round_label: str):
+    def _run_batch(indices: list[int], round_label: str, safe_retry: bool = False):
         """跑一批 indices，更新 results。task_id 持久化保证重试时已成功的分镜不会重复烧钱。"""
         if not indices:
             return
         with ThreadPoolExecutor(max_workers=min(20, len(indices))) as ex:
             futs = {
-                ex.submit(_motion_one_scene, i, script[i], motion_prompts[i], aspect): i
+                ex.submit(_motion_one_scene, i, script[i], motion_prompts[i], aspect, safe_retry): i
                 for i in indices
             }
             for fut in as_completed(futs):
@@ -3077,8 +3087,8 @@ def step65_motion(script: list[dict]):
     # Round 2：失败的自动重试 1 次（task_id 持久化下已成功的不会重复烧钱）
     failed_r1 = [i for i, ok in results.items() if not ok]
     if failed_r1:
-        tg(f"🔄 第一轮失败 {len(failed_r1)}/{n}，自动重试 1 次...")
-        _run_batch(failed_r1, "round 2")
+        tg(f"🔄 第一轮失败 {len(failed_r1)}/{n}，自动用极简安全 prompt 重试 1 次...")
+        _run_batch(failed_r1, "round 2", safe_retry=True)
 
     success_cnt = sum(1 for v in results.values() if v)
     if ADS_DIALOGUE_MODE:
