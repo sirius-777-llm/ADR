@@ -3282,7 +3282,7 @@ def _lip_sync_one_scene(idx: int, scene: dict, target_dur: float, aspect_ratio: 
             if ok:
                 info["attempts"] = attempts
                 return idx, ok, info
-        final = attempts[-1] if attempts else {"turn": idx + 1, "pass": False, "reason": "no_attempts"}
+        final = dict(attempts[-1]) if attempts else {"turn": idx + 1, "pass": False, "reason": "no_attempts"}
         final.update({"turn": idx + 1, "pass": False, "attempts": attempts, "image_url": image_url, "audio_url": audio_url})
         return idx, False, final
     except Exception as e:
