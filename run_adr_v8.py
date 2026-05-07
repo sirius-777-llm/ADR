@@ -12,6 +12,7 @@ ADR V8 — 字幕驱动纪录片自动生成管线
     OUTPUT_DIR       可选，默认 /tmp/adr_v8_output
 """
 import json
+import math
 import os
 import re
 import subprocess
@@ -2297,6 +2298,50 @@ def _extract_img_url(data: dict):
     return None
 
 
+def _extract_video_url(data: dict) -> str | None:
+    """Extract a generated video URL from WeryAI task data."""
+    candidates = [
+        data.get("video_url"),
+        data.get("video"),
+        data.get("videos"),
+        (data.get("task_result") or {}).get("video_url"),
+        (data.get("task_result") or {}).get("video"),
+        (data.get("task_result") or {}).get("videos"),
+    ]
+    for item in candidates:
+        if isinstance(item, str) and item.startswith("http"):
+            return item
+        if isinstance(item, list) and item:
+            first = item[0]
+            if isinstance(first, str) and first.startswith("http"):
+                return first
+            if isinstance(first, dict):
+                for key in ("url", "video_url", "src"):
+                    val = first.get(key)
+                    if isinstance(val, str) and val.startswith("http"):
+                        return val
+    return None
+
+
+def _upload_to_weryai(file_path: str) -> str:
+    """Upload a local media file to WeryAI official storage and return its URL."""
+    import mimetypes
+    mime = mimetypes.guess_type(file_path)[0] or "application/octet-stream"
+    with open(file_path, "rb") as f:
+        r = requests.post(
+            f"{BASE_URL}/generation/upload-file",
+            headers={"Authorization": f"Bearer {WERYAI_API_KEY}"},
+            files={"file": (os.path.basename(file_path), f, mime)},
+            timeout=(30, 180),
+        )
+    r.raise_for_status()
+    data = r.json()
+    urls = (data.get("data") or {}).get("object_url_list") or []
+    if not urls:
+        raise RuntimeError(f"upload-file 无 object_url_list: {json.dumps(data, ensure_ascii=False)[:300]}")
+    return urls[0]
+
+
 APPROVAL_DIR = Path("/tmp/adr_approval")
 
 
@@ -2874,6 +2919,13 @@ def _motion_tasks_file() -> Path:
     return OUTPUT_DIR / "motion_tasks.json"
 
 
+_lip_sync_tasks_lock = threading.Lock()
+
+
+def _lip_sync_tasks_file() -> Path:
+    return OUTPUT_DIR / "lip_sync_tasks.json"
+
+
 def _load_motion_tasks() -> dict:
     p = _motion_tasks_file()
     if not p.exists():
@@ -2897,6 +2949,30 @@ def _remove_motion_task(idx: int):
         tasks = _load_motion_tasks()
         tasks.pop(str(idx), None)
         _motion_tasks_file().write_text(json.dumps(tasks, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _load_lip_sync_tasks() -> dict:
+    p = _lip_sync_tasks_file()
+    if not p.exists():
+        return {}
+    try:
+        return json.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def _save_lip_sync_task(idx: int, task_id: str):
+    with _lip_sync_tasks_lock:
+        tasks = _load_lip_sync_tasks()
+        tasks[str(idx)] = task_id
+        _lip_sync_tasks_file().write_text(json.dumps(tasks, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _remove_lip_sync_task(idx: int):
+    with _lip_sync_tasks_lock:
+        tasks = _load_lip_sync_tasks()
+        tasks.pop(str(idx), None)
+        _lip_sync_tasks_file().write_text(json.dumps(tasks, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
 def _motion_poll_and_download(idx: int, task_id: str, vid_path: str) -> bool:
@@ -3048,6 +3124,192 @@ def _motion_one_scene(idx: int, scene: dict, motion_prompt: str, aspect_ratio: s
     except Exception as e:
         log(f"[motion {idx}] 异常: {type(e).__name__}: {e}")
         return False
+
+
+def _lip_sync_slot_duration(script: list[dict], idx: int) -> float:
+    scene = script[idx]
+    if idx < len(script) - 1:
+        return max(1.0, float(script[idx + 1].get("audio_start", scene.get("audio_end", 0))) - float(scene.get("audio_start", 0)))
+    return max(1.0, float(scene.get("audio_end", scene.get("audio_start", 0) + scene.get("dur", 1))) - float(scene.get("audio_start", 0)))
+
+
+def _adsd_lip_sync_prompt(scene: dict) -> str:
+    speaker = scene.get("speaker") or "speaker"
+    role = "young field reporter" if speaker == "记者" else "older foreign-ministry clerk" if speaker == "职员" else "active speaker"
+    text = scene.get("text", "")
+    shot = scene.get("shot", "")
+    return (
+        "Historically grounded early-Republican China dialogue scene. "
+        f"Active speaker is the {role}; the other person only listens. "
+        f'台词:"{text}" The active speaker says exactly this line. '
+        "Mouth movement must synchronize with the provided audio reference; keep the mouth visible with natural jaw movement. "
+        f"Scene action: {shot}. "
+        "Keep the same face and period clothing, no subtitles, no text overlay, no logo, no watermark."
+    )[:2000]
+
+
+def _postprocess_lip_sync_segment(src_video: str, scene: dict, target_dur: float) -> bool:
+    """Normalize Werydance silent lip video to ADR segment size and exact timeline duration."""
+    vid_path = scene["vid_path"]
+    src_dur = ffprobe_duration(src_video)
+    pad = max(0.0, target_dur - src_dur)
+    vf = (
+        f"scale={VIDEO_W}:{VIDEO_H}:force_original_aspect_ratio=increase,"
+        f"crop={VIDEO_W}:{VIDEO_H},setsar=1"
+    )
+    if pad > 0.04:
+        vf += f",tpad=stop_mode=clone:stop_duration={pad:.3f}"
+    vf += f",trim=duration={target_dur:.3f},setpts=PTS-STARTPTS"
+    ffmpeg(
+        "-i", src_video,
+        "-vf", vf,
+        "-an",
+        "-c:v", "libx264", "-crf", "20", "-preset", "medium",
+        "-pix_fmt", "yuv420p",
+        vid_path,
+        timeout=180,
+    )
+    return os.path.exists(vid_path) and os.path.getsize(vid_path) > 10000
+
+
+def _lip_sync_poll_download_and_process(idx: int, task_id: str, scene: dict, target_dur: float) -> tuple[bool, dict]:
+    info = {
+        "turn": idx + 1,
+        "speaker": scene.get("speaker"),
+        "task_id": task_id,
+        "source_audio": scene.get("dialogue_audio_mp3") or scene.get("dialogue_audio"),
+        "target_duration": round(target_dur, 3),
+    }
+    for iteration in range(181):
+        try:
+            s = req_get(f"/generation/{task_id}/status")
+            data = s.get("data", {})
+            st = data.get("task_status", "")
+            if iteration == 0 or iteration % 12 == 0 or st in ("succeed", "failed"):
+                log(f"[lip-sync {idx}] poll #{iteration+1}: {st}")
+            if st == "succeed":
+                vid_url = _extract_video_url(data)
+                if not vid_url:
+                    info.update({"pass": False, "reason": "succeed_without_video_url"})
+                    return False, info
+                raw_path = str(OUTPUT_DIR / f"lip_sync_raw_{idx}.mp4")
+                urllib.request.urlretrieve(vid_url, raw_path)
+                raw_dur = ffprobe_duration(raw_path)
+                ok = _postprocess_lip_sync_segment(raw_path, scene, target_dur)
+                final_dur = ffprobe_duration(scene["vid_path"]) if ok else None
+                source_audio = scene.get("dialogue_audio_mp3") or scene.get("dialogue_audio")
+                audio_dur = ffprobe_duration(source_audio) if source_audio and os.path.exists(source_audio) else None
+                info.update({
+                    "pass": ok,
+                    "candidate": "almighty_reference_image_audio",
+                    "raw_video_path": raw_path,
+                    "raw_video_duration": raw_dur,
+                    "final_segment_path": scene["vid_path"],
+                    "final_segment_duration": final_dur,
+                    "source_audio_duration": audio_dur,
+                    "video_has_audio": False,
+                    "duration_delta": abs((final_dur or 0) - target_dur) if final_dur is not None else None,
+                    "clip_duration_match_pass": final_dur is not None and abs(final_dur - target_dur) <= 0.25,
+                    "needs_master_audio_mux": True,
+                })
+                _remove_lip_sync_task(idx)
+                return ok, info
+            if st == "failed":
+                info.update({"pass": False, "reason": "task_failed", "response": data})
+                _remove_lip_sync_task(idx)
+                return False, info
+        except Exception as e:
+            if iteration in (0, 12, 60, 120):
+                log(f"[lip-sync {idx}] poll 异常: {e}")
+        time.sleep(5)
+    info.update({"pass": False, "reason": "poll_timeout"})
+    return False, info
+
+
+def _lip_sync_one_scene(idx: int, scene: dict, target_dur: float, aspect_ratio: str) -> tuple[int, bool, dict]:
+    source_audio = scene.get("dialogue_audio_mp3") or scene.get("dialogue_audio")
+    if not source_audio or not os.path.exists(source_audio):
+        return idx, False, {"turn": idx + 1, "pass": False, "reason": "missing_turn_audio"}
+    existing_tid = _load_lip_sync_tasks().get(str(idx))
+    if existing_tid:
+        ok, info = _lip_sync_poll_download_and_process(idx, existing_tid, scene, target_dur)
+        return idx, ok, info
+    try:
+        image_url = _upload_to_weryai(scene["img_path"])
+        audio_url = _upload_to_weryai(source_audio)
+        prompt = _adsd_lip_sync_prompt(scene)
+        api_dur = int(round(max(5, min(15, float(scene.get("dur") or target_dur)))))
+        _wait_motion_submit_slot(f"lip-sync {idx+1}")
+        r = req_post("/generation/almighty-reference-to-video", {
+            "model": "WERYDANCE_2_0",
+            "images": [image_url],
+            "audios": [audio_url],
+            "prompt": prompt,
+            "duration": api_dur,
+            "aspect_ratio": aspect_ratio,
+            "resolution": "720p",
+            "generate_audio": "false",
+            "video_number": 1,
+        }, timeout=30)
+        task_id = r.get("data", {}).get("task_id") or (r.get("data", {}).get("task_ids") or [None])[0]
+        if not task_id:
+            return idx, False, {"turn": idx + 1, "pass": False, "reason": "submit_without_task_id", "response": r}
+        _save_lip_sync_task(idx, task_id)
+        ok, info = _lip_sync_poll_download_and_process(idx, task_id, scene, target_dur)
+        info.update({"submit_duration": api_dur, "image_url": image_url, "audio_url": audio_url})
+        return idx, ok, info
+    except Exception as e:
+        log(f"[lip-sync {idx}] 异常: {type(e).__name__}: {e}")
+        return idx, False, {"turn": idx + 1, "pass": False, "reason": str(e)}
+
+
+def step66_adsd_lip_sync(script: list[dict]):
+    """Experimental ADSD real lip-sync path using Werydance Almighty Reference."""
+    if not (ADS_DIALOGUE_MODE and ADSD_LIP_SYNC_EXPERIMENT):
+        return
+    n = len(script)
+    aspect = "9:16" if IS_VERTICAL else "16:9"
+    tg(f"👄 {ADSD_MODE_NAME} 口型同步启动：WERYDANCE_2_0 Almighty Reference × {n} turn")
+    target_durs = [_lip_sync_slot_duration(script, i) for i in range(n)]
+    results: dict[int, bool] = {}
+    records: list[dict] = []
+    max_workers = min(4, n)
+    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+        futs = {ex.submit(_lip_sync_one_scene, i, script[i], target_durs[i], aspect): i for i in range(n)}
+        for fut in as_completed(futs):
+            i = futs[fut]
+            try:
+                idx, ok, info = fut.result()
+            except Exception as e:
+                idx, ok, info = i, False, {"turn": i + 1, "pass": False, "reason": str(e)}
+            results[idx] = ok
+            records.append(info)
+            if ok:
+                tg(f"👄 Turn {idx+1}/{n} 口型同步 ✓")
+            else:
+                tg(f"⚠️ Turn {idx+1}/{n} 口型同步失败，保留原静态/motion片段")
+    records.sort(key=lambda x: int(x.get("turn", 0)))
+    success_cnt = sum(1 for v in results.values() if v)
+    qa = {
+        "mode": ADSD_MODE_NAME,
+        "interface": "almighty-reference-to-video",
+        "model": "WERYDANCE_2_0",
+        "total": n,
+        "success_count": success_cnt,
+        "success_rate": round(success_cnt / max(n, 1), 4),
+        "pass": success_cnt >= max(1, math.ceil(n * 0.8)),
+        "policy": "failed_turns_keep_existing_segments",
+        "master_audio_mux_required": True,
+        "final_audio_offset_required": 0.0,
+        "manual_visual_checks_required": ["mouth_visible", "active_speaker_correct", "no_face_drift", "mouth_motion_matches_syllable_timing"],
+        "records": records,
+        "created_at": datetime.now().isoformat(timespec="seconds"),
+    }
+    (OUTPUT_DIR / "lip_sync_qa.json").write_text(json.dumps(qa, ensure_ascii=False, indent=2), encoding="utf-8")
+    if qa["pass"]:
+        tg(f"✅ {ADSD_MODE_NAME} 口型同步 QA 通过：{success_cnt}/{n}")
+    else:
+        tg(f"⚠️ {ADSD_MODE_NAME} 口型同步 QA 未达标：{success_cnt}/{n}，本次仍可用静态/motion兜底成片")
 
 
 def step65_motion(script: list[dict]):
@@ -3436,7 +3698,9 @@ def step9_render(raw_path: str, voice_path: str, bgm_path: str | None, ass_path:
             tg("❌ step9 BGM 最终兜底也失败：bgm.mp3 不存在或太小，视频将无BGM")
     else:
         tg(f"🎵 step9 BGM 正常传入: {bgm_path}")
-    tg("🎬 最终合成中... 视频轨 ✓ 主音轨 ✓" + (" BGM ✓" if bgm_path else "") + " 字幕烧录 ✓\n画面 → +{:.1f}s 字幕 → +{:.1f}s 配音".format(SUB_DELAY, AUDIO_DELAY))
+    render_audio_offset = 0.0 if (ADS_DIALOGUE_MODE and ADSD_LIP_SYNC_EXPERIMENT) else AUDIO_DELAY
+    sync_note = "口型同步模式：音频不延迟" if render_audio_offset == 0 else "画面 → +{:.1f}s 字幕 → +{:.1f}s 配音".format(SUB_DELAY, render_audio_offset)
+    tg("🎬 最终合成中... 视频轨 ✓ 主音轨 ✓" + (" BGM ✓" if bgm_path else "") + f" 字幕烧录 ✓\n{sync_note}")
 
     # ★ 音画同步修正：WERYDANCE 每段固定 5s × N，但配音总时长 ≠ 5N（往往更长）
     # 若配音比视频长 > 1s，整体用 setpts 拉伸视频到配音时长，避免 -shortest 截断尾部内容
@@ -3444,13 +3708,13 @@ def step9_render(raw_path: str, voice_path: str, bgm_path: str | None, ass_path:
         voice_dur_chk = ffprobe_duration(voice_path)
         video_dur_chk = ffprobe_duration(raw_path)
         # 目标视频时长 = 配音时长 + AUDIO_DELAY 偏移 + 0.3s 收尾缓冲（保证配音完整不被 -shortest 截）
-        target_video_dur = voice_dur_chk + AUDIO_DELAY + 0.3
+        target_video_dur = voice_dur_chk + render_audio_offset + 0.3
         if abs(target_video_dur - video_dur_chk) > 1.0:
             # 双向同步：视频长→压缩，视频短→拉伸
             ratio = target_video_dur / video_dur_chk
             direction = "拉伸" if ratio > 1 else "压缩"
-            log(f"音画同步修正：video {video_dur_chk:.2f}s → 目标 {target_video_dur:.2f}s（配音 {voice_dur_chk:.2f}s + J-Cut 缓冲 0.8s）setpts ×{ratio:.3f} · {direction}")
-            tg(f"🔧 音画同步修正：视频 {video_dur_chk:.1f}s → {direction}到 {target_video_dur:.1f}s（含 J-Cut 缓冲）")
+            log(f"音画同步修正：video {video_dur_chk:.2f}s → 目标 {target_video_dur:.2f}s（配音 {voice_dur_chk:.2f}s + offset {render_audio_offset:.1f}s + 缓冲 0.3s）setpts ×{ratio:.3f} · {direction}")
+            tg(f"🔧 音画同步修正：视频 {video_dur_chk:.1f}s → {direction}到 {target_video_dur:.1f}s")
             synced_raw = str(OUTPUT_DIR / "raw_concat_synced.mp4")
             ffmpeg(
                 "-i", raw_path,
@@ -3469,7 +3733,7 @@ def step9_render(raw_path: str, voice_path: str, bgm_path: str | None, ass_path:
 
     # -itsoffset AUDIO_DELAY 延迟音频，画面先出
     # 字幕已在 step8 中加了 SUB_DELAY 偏移，在画面和配音之间
-    offset = str(AUDIO_DELAY)
+    offset = str(render_audio_offset)
 
     if bgm_path:
         ffmpeg(
@@ -3530,6 +3794,7 @@ def step9_render(raw_path: str, voice_path: str, bgm_path: str | None, ass_path:
                 "asr_qa_exists": (OUTPUT_DIR / "asr_qa.json").exists(),
                 "scene_qa_exists": (OUTPUT_DIR / "scene_qa.json").exists(),
                 "speaker_focus_qa_exists": (OUTPUT_DIR / "speaker_focus_qa.json").exists(),
+                "lip_sync_qa_exists": (OUTPUT_DIR / "lip_sync_qa.json").exists(),
                 "subtitle_exists": Path(ass_path).exists(),
                 "created_at": datetime.now().isoformat(timespec="seconds"),
             }
@@ -4915,7 +5180,9 @@ def main():
                 t = time.time(); voice_path = step2_master_voice(script, spk_id, spk_name); timings["Podcast 音轨"] = time.time() - t
         t = time.time(); script     = step345_timeline(script, voice_path);   timings["时间轴计算"] = time.time() - t
         t = time.time(); bgm_path   = step6_parallel(script, topic);          timings["图片+BGM 并发"] = time.time() - t
-        if WITH_MOTION:
+        if ADS_DIALOGUE_MODE and ADSD_LIP_SYNC_EXPERIMENT:
+            t = time.time(); step66_adsd_lip_sync(script);                    timings["ADSD 口型同步"] = time.time() - t
+        elif WITH_MOTION:
             t = time.time(); step65_motion(script);                            timings["动态化 (WERYDANCE)"] = time.time() - t
         t = time.time(); raw_path   = step7_concat(script);                   timings["视频拼接"] = time.time() - t
         t = time.time(); ass_path   = step8_subtitles(script);                timings["字幕生成"] = time.time() - t
