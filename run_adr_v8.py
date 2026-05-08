@@ -887,26 +887,31 @@ def _generate_adsd_dialogue_turns(topic: str, num_turns: int, tone: str, style_g
 硬性要求：
 1. 只输出 JSON 数组，不要 Markdown，不要解释。
 2. 数组长度必须正好 {num_turns}。
-3. 每项字段必须包含：speaker、gender、text、shot、emotion。
+3. 每项字段必须包含：speaker、voice_gender、visual_subject、text、shot、emotion。
 4. speaker 必须是现场角色名；全片使用 1~4 个 speaker。根据剧情需要可独白、双人或多人，不强制交替。
-5. **gender 只能是 "male" 或 "female"**——同一 speaker 在所有 turn 里 gender 必须保持一致；按角色名/年龄/职业最自然的性别选。
-6. text 是中文对白，每句 18~36 字，白话、直接、普通人能听懂。
-7. shot 是中文画面说明，要具体到地点、道具、人物动作；必须让当前 speaker 成为画面里的说话主体；如有其他角色，只作为倾听/反应对象。**shot 里要带上 speaker 的性别+大致年龄外貌**（如"中年男性"、"年轻女性"），让画面渲染时性别准确。
-8. emotion 只能从 neutral / tense / solemn / explanatory 中选。
-9. 严禁诗化表达、隐喻、金句、含蓄暗示、空泛大词。
-10. 每 2~3 句必须解释一个专名或因果。
-11. 结尾要把主题讲清楚，不要只煽情。
-12. 角色必须服务沉浸感：可以是时代内部的新闻人/报馆人/通讯员；是否跳戏由沉浸感审稿环节判断，不靠关键词硬禁。
-13. 这是“时代内部人物的现场视角”；镜头可以像观众站在现场旁听，而不是电视采访。
-{"14. 已启用 POV 现场旁听模式：shot 必须写出观众仿佛站在人群边、门口、案前、船边、廊下或帐内近距离看见当前 speaker 说话；不要写成记者出镜、直播、采访。" if ADSD_ONSITE_POV_MODE else ""}
-15. 不要为了凑人数而加角色；如果一个人讲最清楚，就用独白；如果多人在场更自然，才用多人。
+5. **voice_gender 只能是 "male" 或 "female"**——这是 TTS 音色性别（即使角色是动物/机器人/抽象灵也必须二选一），同一 speaker 跨所有 turn 必须一致。
+6. **visual_subject 是 12-30 词英文，描述角色的视觉外形**——同一 speaker 跨所有 turn 必须一致。
+   - 真人：写性别 + 种族 + 年龄段 + 服饰 + 时代背景。例：`"an adult Han Chinese woman, qipao, 1920s Shanghai, soft natural light"`
+   - 动物 / 拟人动物：写具体物种 + 颜色 + 材质 + 是否拟人化。例：`"a worker bee queen, golden fuzz, translucent blue wings, anthropomorphic torso"`
+   - 机器人 / AI：写形态 + 材质 + 颜色 + 标志特征。例：`"an industrial robot, worn copper plating, glowing optical sensors, no human face"`
+   - 抽象/灵：写水墨/烟雾/光影 + 半透明形态。例：`"an ink-wash spirit, semi-transparent silhouette, drifting form"`
+7. text 是中文对白，每句 18~36 字，白话、直接、普通人能听懂。
+8. shot 是中文画面说明，要具体到地点、道具、人物动作；必须让当前 speaker 成为画面里的说话主体；如有其他角色，只作为倾听/反应对象。**shot 不需要再写性别**——visual_subject 已经锁定外形。
+9. emotion 只能从 neutral / tense / solemn / explanatory 中选。
+10. 严禁诗化表达、隐喻、金句、含蓄暗示、空泛大词。
+11. 每 2~3 句必须解释一个专名或因果。
+12. 结尾要把主题讲清楚，不要只煽情。
+13. 角色必须服务沉浸感：可以是时代内部的新闻人/报馆人/通讯员；是否跳戏由沉浸感审稿环节判断，不靠关键词硬禁。
+14. 这是"时代内部人物的现场视角"；镜头可以像观众站在现场旁听，而不是电视采访。
+{"15. 已启用 POV 现场旁听模式：shot 必须写出观众仿佛站在人群边、门口、案前、船边、廊下或帐内近距离看见当前 speaker 说话；不要写成记者出镜、直播、采访。" if ADSD_ONSITE_POV_MODE else ""}
+16. 不要为了凑人数而加角色；如果一个人讲最清楚，就用独白；如果多人在场更自然，才用多人。
 
 语言风格：
 {style_guide}
 
 输出示例格式：
 [
-  {{"speaker":"{fallback_role}","gender":"male","text":"这张告示刚贴出来，街口的人全围过来了。","shot":"街口墙边，中年男性{fallback_role}指着新贴告示，旁人凝神看","emotion":"tense"}}
+  {{"speaker":"{fallback_role}","voice_gender":"male","visual_subject":"an adult Han Chinese man, dark long robe, 1920s Shanghai street","text":"这张告示刚贴出来，街口的人全围过来了。","shot":"街口墙边，{fallback_role}指着新贴告示，旁人凝神看","emotion":"tense"}}
 ]"""
     raw = chat("GEMINI_3_1_FLASH_LITE", "你只输出严格 JSON 数组。", prompt, max_tokens=2600, timeout=180)
     arr = _extract_json_array(raw)
@@ -914,7 +919,9 @@ def _generate_adsd_dialogue_turns(topic: str, num_turns: int, tone: str, style_g
         raise RuntimeError(f"ADSD 对话句数不匹配：got {len(arr)}, need {num_turns}")
     turns = []
     speakers_seen: list[str] = []
-    speaker_gender_map: dict[str, str] = {}  # 同一 speaker 跨 turn 锁定 gender
+    # 同一 speaker 跨 turn 锁定 voice_gender + visual_subject（首次出现以 LLM 给的为准）
+    speaker_gender_map: dict[str, str] = {}
+    speaker_visual_map: dict[str, str] = {}
     for i, item in enumerate(arr):
         speaker = str(item.get("speaker", "")).strip()
         if not speaker:
@@ -928,22 +935,36 @@ def _generate_adsd_dialogue_turns(topic: str, num_turns: int, tone: str, style_g
         emotion = str(item.get("emotion", "neutral")).strip().lower()
         if emotion not in ("neutral", "tense", "solemn", "explanatory"):
             emotion = "neutral"
-        # gender：首次出现以 LLM 给的值为准，后续锁定
-        gender_raw = str(item.get("gender", "")).strip().lower()
+
+        # voice_gender：LLM 强约束（兼容旧字段名 gender）；缺失/非法则空，由 _voice_for_speaker 兜底推断
+        gender_raw = str(item.get("voice_gender") or item.get("gender") or "").strip().lower()
         if gender_raw not in ("male", "female"):
             gender_raw = ""
         if speaker in speaker_gender_map:
-            gender = speaker_gender_map[speaker]
+            voice_gender = speaker_gender_map[speaker]
         else:
-            gender = gender_raw or "male"  # 缺省 male，避免 fallback 全女声
-            speaker_gender_map[speaker] = gender
+            voice_gender = gender_raw or "male"  # 缺省 male，最终兜底
+            speaker_gender_map[speaker] = voice_gender
+
+        # visual_subject：LLM 软建议，自由英文描述外形；缺失/过短保持空，由 visual_contract 兜底用 GENDER LOCK
+        vs_raw = str(item.get("visual_subject") or "").strip()
+        if len(vs_raw.split()) < 4 or len(vs_raw) > 300:
+            vs_raw = ""
+        if speaker in speaker_visual_map and speaker_visual_map[speaker]:
+            visual_subject = speaker_visual_map[speaker]
+        else:
+            visual_subject = vs_raw
+            if visual_subject:
+                speaker_visual_map[speaker] = visual_subject
+
         if not text or len(text) > 80:
             raise RuntimeError(f"ADSD 第 {i+1} 句台词异常：{text}")
-        voice = _voice_for_speaker(speaker, gender)
+        voice = _voice_for_speaker(speaker, voice_gender)
         turns.append({
             "dialogue_turn": i + 1,
             "speaker": speaker,
-            "gender": gender,
+            "voice_gender": voice_gender,
+            "visual_subject": visual_subject,
             "speaker_id": voice["voice_id"],
             "speaker_name": voice["voice_name"],
             "text": text,
@@ -965,7 +986,8 @@ def _adsd_immersion_qa_rewrite_turns(topic: str, turns: list[dict], role_candida
         compact = [
             {
                 "speaker": t.get("speaker", ""),
-                "gender": t.get("gender", ""),
+                "voice_gender": t.get("voice_gender") or t.get("gender", ""),
+                "visual_subject": t.get("visual_subject", ""),
                 "text": t.get("text", ""),
                 "shot": t.get("shot", ""),
             }
@@ -999,7 +1021,7 @@ def _adsd_immersion_qa_rewrite_turns(topic: str, turns: list[dict], role_candida
                 continue
             turn["speaker"] = new[:12]
             turn["shot"] = str(turn.get("shot", "")).replace(old, turn["speaker"]) or f"{turn['speaker']}在现场说明材料"
-            gender = str(turn.get("gender", "")).strip().lower()
+            gender = str(turn.get("voice_gender") or turn.get("gender", "")).strip().lower()
             voice = _voice_for_speaker(turn["speaker"], gender if gender in ("male", "female") else None)
             turn["speaker_id"] = voice["voice_id"]
             turn["speaker_name"] = voice["voice_name"]
@@ -1012,23 +1034,43 @@ def _adsd_immersion_qa_rewrite_turns(topic: str, turns: list[dict], role_candida
         return _finalize_adsd_turns(turns)
 
 
-def _adsd_visual_contract(speaker: str, lip_sync: bool | None = None, gender: str | None = None) -> str:
-    """Prompt contract for ADSD: keep the active speaker visually accountable."""
+def _adsd_visual_contract(speaker: str, lip_sync: bool | None = None, gender: str | None = None, visual_subject: str | None = None) -> str:
+    """Prompt contract for ADSD: keep the active speaker visually accountable.
+
+    主路径：用 LLM 给的 visual_subject 作为锚（任何形态：人/动物/机器人/抽象）。
+    兜底：visual_subject 缺失/过短时，按 voice_gender 套 ADULT MAN/WOMAN GENDER LOCK。
+    """
     if lip_sync is None:
         lip_sync = ADSD_LIP_SYNC_EXPERIMENT
-    g = (gender or "").strip().lower()
-    if g == "female":
-        gender_phrase = "a female character"
-    elif g == "male":
-        gender_phrase = "a male character"
+    vs = (visual_subject or "").strip()
+    if vs and len(vs.split()) >= 4:
+        # LLM 主路径：直接用 visual_subject 锁定外形
+        anchor = (
+            f"Active speaker is {vs}, labelled '{speaker}'. "
+            f"APPEARANCE LOCK: render this exact subject consistently across every scene; "
+            f"the same speaker name must always have the same appearance/species/form. "
+            "Show as the clear speaking subject inside the period scene, face/head readable in three-quarter view, "
+            "with any other onsite characters only listening or reacting nearby. Keep the framing immersive for the topic era"
+        )
     else:
-        gender_phrase = "the historical onsite character"
-    anchor = (
-        f"Active speaker is {gender_phrase} labelled '{speaker}'. "
-        f"The speaker MUST be rendered as {g if g in ('male', 'female') else 'consistent in gender across all scenes'}; do not switch the speaker's gender between scenes. "
-        "Show this person as the clear speaking subject inside the period scene, face readable in three-quarter view, "
-        "with any other onsite characters only listening or reacting nearby. Keep the framing immersive for the topic era"
-    )
+        # 兜底：穷举 GENDER LOCK
+        g = (gender or "").strip().lower()
+        if g == "female":
+            gender_phrase = "an ADULT WOMAN (female)"
+            gender_negative = "no male features, no beard, no masculine jaw"
+        elif g == "male":
+            gender_phrase = "an ADULT MAN (male)"
+            gender_negative = "no female features, no makeup, no feminine hairstyle"
+        else:
+            gender_phrase = "the historical onsite character"
+            gender_negative = "consistent gender across all scenes"
+        anchor = (
+            f"Active speaker is {gender_phrase} labelled '{speaker}'. "
+            f"GENDER LOCK (fallback): render as {g.upper() if g in ('male', 'female') else 'CONSISTENT GENDER'} across every scene; "
+            f"the same speaker name must always have the same gender. {gender_negative}. "
+            "Show this person as the clear speaking subject inside the period scene, face readable in three-quarter view, "
+            "with any other onsite characters only listening or reacting nearby. Keep the framing immersive for the topic era"
+        )
     pov = f". {_adsd_pov_contract()}" if ADSD_ONSITE_POV_MODE else ""
     if lip_sync:
         return (
@@ -1631,13 +1673,22 @@ THUMBNAIL_ANCHOR: 封面视觉锚，用 4~6 个短语描述：主体、主色（
         shot_tmpl = shot_blueprint[i] if i < len(shot_blueprint) else ""
         subject = visuals[i].get("prompt", "")
         if dialogue_meta:
+            _dlg_gender = (dialogue_meta.get("voice_gender") or dialogue_meta.get("gender") or "").strip().lower()
+            _dlg_visual = (dialogue_meta.get("visual_subject") or "").strip()
             visual_contract = _adsd_visual_contract(
                 dialogue_meta.get("speaker", ""),
-                gender=dialogue_meta.get("gender"),
+                gender=_dlg_gender,
+                visual_subject=_dlg_visual,
             )
+            # 路径区分：LLM 主路径（visual_subject）/ 兜底（仅 gender）
+            speaker_meta = dialogue_meta.get('speaker', '')
+            if _dlg_visual and len(_dlg_visual.split()) >= 4:
+                speaker_tag = f"{speaker_meta} (voice={_dlg_gender or 'unknown'}, form={_dlg_visual})"
+            else:
+                speaker_tag = f"{speaker_meta} ({_dlg_gender or 'unknown'})"
             subject = (
                 f"{dialogue_meta.get('shot', '')}. "
-                f"Dialogue speaker: {dialogue_meta.get('speaker', '')} ({dialogue_meta.get('gender', 'unknown')}); "
+                f"Dialogue speaker: {speaker_tag}; "
                 f"{visual_contract}. "
                 f"{subject}"
             )
@@ -1660,6 +1711,8 @@ THUMBNAIL_ANCHOR: 封面视觉锚，用 4~6 个短语描述：主体、主色（
                 "dialogue_mode": True,
                 "dialogue_turn": dialogue_meta.get("dialogue_turn", i + 1),
                 "speaker": dialogue_meta.get("speaker", ""),
+                "voice_gender": dialogue_meta.get("voice_gender") or dialogue_meta.get("gender"),
+                "visual_subject": dialogue_meta.get("visual_subject", ""),
                 "speaker_id": dialogue_meta.get("speaker_id"),
                 "speaker_name": dialogue_meta.get("speaker_name", ""),
                 "shot": dialogue_meta.get("shot", ""),
@@ -2304,7 +2357,8 @@ def step2_dialogue_voice(script: list[dict]) -> str:
         timeline.append({
             "turn": i + 1,
             "speaker": turn.get("speaker"),
-            "gender": turn.get("gender"),
+            "voice_gender": turn.get("voice_gender") or turn.get("gender"),
+            "visual_subject": turn.get("visual_subject"),
             "dialogue_shape": turn.get("dialogue_shape"),
             "speaker_count": turn.get("speaker_count"),
             "voice_id": turn.get("speaker_id"),
