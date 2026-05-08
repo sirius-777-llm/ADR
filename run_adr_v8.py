@@ -149,6 +149,11 @@ ADSD_LIPS_CHANGE_REPAIR = (
     or "--lips-change" in sys.argv
     or os.environ.get("ADR_ADSD_LIPS_CHANGE", "").strip().lower() in ("1", "true", "yes", "on")
 )
+ADSD_LIPS_CHANGE_ALL = (
+    "--adsd-lips-change-all" in sys.argv
+    or "--lips-change-all" in sys.argv
+    or os.environ.get("ADR_ADSD_LIPS_CHANGE_ALL", "").strip().lower() in ("1", "true", "yes", "on")
+)
 
 # --ads-reporter：把 ADS 的"拟现场第一人称记者感"并入 ADR 动态化。
 # 该模式自动开启 --with-motion，并约束剧本、分镜与 motion prompt；
@@ -170,14 +175,23 @@ ADSD_VOICES = {
 }
 
 # 男声池：未知/英文/自创品牌角色名按名字 hash 在此池轮换，避免全部走女声 News Anchor
+# weryai 中文男声完整目录（66-70）
 ADSD_MALE_VOICE_POOL = [
+    {"voice_id": 66, "voice_name": "Pure-hearted Boy"},
     {"voice_id": 67, "voice_name": "Refreshing Young Man"},
+    {"voice_id": 68, "voice_name": "Lyrical Voice"},
     {"voice_id": 69, "voice_name": "Reliable Executive"},
+    {"voice_id": 70, "voice_name": "Stubborn Friend"},
 ]
 
 # 女声池：旁白 + 中文女性角色词命中时使用
+# weryai 中文女声完整目录（76-80）
 ADSD_FEMALE_VOICE_POOL = [
     {"voice_id": 76, "voice_name": "News Anchor"},
+    {"voice_id": 77, "voice_name": "Intellectual Girl"},
+    {"voice_id": 78, "voice_name": "Gentle Senior"},
+    {"voice_id": 79, "voice_name": "Kind-hearted Antie"},
+    {"voice_id": 80, "voice_name": "Arrogant Miss"},
 ]
 
 # 同一 ADR 进程内角色名 → voice 持久映射，确保同一角色跨 turn 用同一声音
@@ -3515,6 +3529,23 @@ def _lips_change_repair_segment(idx: int, scene: dict, target_dur: float) -> tup
         return False, info
 
 
+def _load_lips_change_requested_turns() -> set[int]:
+    """1-based turn indexes requested by manual QA for lips-change repair."""
+    p = Path("/tmp/adr_lips_repair_turns.json")
+    if not p.exists():
+        return set()
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+        if isinstance(data, list):
+            return {int(x) for x in data if int(x) > 0}
+        if isinstance(data, dict):
+            vals = data.get("turns") or data.get("repair_turns") or []
+            return {int(x) for x in vals if int(x) > 0}
+    except Exception as e:
+        log(f"读取 lips-change 指定 turn 失败: {e}")
+    return set()
+
+
 def _lip_sync_poll_download_and_process(idx: int, task_id: str, scene: dict, target_dur: float) -> tuple[bool, dict]:
     info = {
         "turn": idx + 1,
@@ -3573,6 +3604,9 @@ def _lip_sync_one_scene(idx: int, scene: dict, target_dur: float, aspect_ratio: 
     source_audio = scene.get("dialogue_audio_mp3") or scene.get("dialogue_audio")
     if not source_audio or not os.path.exists(source_audio):
         return idx, False, {"turn": idx + 1, "pass": False, "reason": "missing_turn_audio"}
+    manual_repair_turns = _load_lips_change_requested_turns()
+    repair_requested = ADSD_LIPS_CHANGE_REPAIR and ((idx + 1) in manual_repair_turns)
+    repair_all = ADSD_LIPS_CHANGE_REPAIR and ADSD_LIPS_CHANGE_ALL
     existing_tid = _load_lip_sync_tasks().get(str(idx))
     if existing_tid:
         ok, info = _lip_sync_poll_download_and_process(idx, existing_tid, scene, target_dur)
@@ -3627,8 +3661,9 @@ def _lip_sync_one_scene(idx: int, scene: dict, target_dur: float, aspect_ratio: 
                 "image_url": image_url,
                 "audio_url": audio_url,
             })
-            if ok and ADSD_LIPS_CHANGE_REPAIR:
+            if ok and (repair_all or repair_requested):
                 repair_ok, repair_info = _lips_change_repair_segment(idx, scene, target_dur)
+                repair_info["reason"] = "all_turns" if repair_all else "manual_requested_turn"
                 info["lips_change_repair"] = repair_info
                 ok = repair_ok
                 info["pass"] = ok
@@ -3640,6 +3675,17 @@ def _lip_sync_one_scene(idx: int, scene: dict, target_dur: float, aspect_ratio: 
                 return idx, ok, info
         final = dict(attempts[-1]) if attempts else {"turn": idx + 1, "pass": False, "reason": "no_attempts"}
         final.update({"turn": idx + 1, "pass": False, "attempts": attempts, "image_url": image_url, "audio_url": audio_url})
+        if ADSD_LIPS_CHANGE_REPAIR:
+            repair_ok, repair_info = _lips_change_repair_segment(idx, scene, target_dur)
+            repair_info["reason"] = "almighty_failed_fallback"
+            final["lips_change_repair"] = repair_info
+            if repair_ok:
+                final.update({
+                    "pass": True,
+                    "candidate": "video_lips_change_fallback",
+                    "reason": "almighty_failed_repaired_by_lips_change",
+                })
+                return idx, True, final
         return idx, False, final
     except Exception as e:
         log(f"[lip-sync {idx}] 异常: {type(e).__name__}: {e}")
@@ -3675,9 +3721,11 @@ def step66_adsd_lip_sync(script: list[dict]):
     success_cnt = sum(1 for v in results.values() if v)
     qa = {
         "mode": ADSD_MODE_NAME,
-        "interface": "almighty-reference-to-video+video-lips-change" if ADSD_LIPS_CHANGE_REPAIR else "almighty-reference-to-video",
+        "interface": "almighty-reference-to-video+video-lips-change-fallback" if ADSD_LIPS_CHANGE_REPAIR else "almighty-reference-to-video",
         "model": "WERYDANCE_2_0",
         "lips_change_repair_enabled": ADSD_LIPS_CHANGE_REPAIR,
+        "lips_change_all_enabled": ADSD_LIPS_CHANGE_ALL,
+        "lips_change_requested_turns": sorted(_load_lips_change_requested_turns()),
         "onsite_pov_mode": ADSD_ONSITE_POV_MODE,
         "total": n,
         "success_count": success_cnt,
@@ -4194,6 +4242,7 @@ def _write_adsd_delivery_qa(final_path: str) -> dict | None:
         "onsite_pov_mode": ADSD_ONSITE_POV_MODE,
         "lip_sync_experiment": ADSD_LIP_SYNC_EXPERIMENT,
         "lips_change_repair_enabled": ADSD_LIPS_CHANGE_REPAIR,
+        "lips_change_all_enabled": ADSD_LIPS_CHANGE_ALL,
         "final_path": final_path,
         "pass": len(issues) == 0,
         "issues": issues,
@@ -4207,6 +4256,7 @@ def _write_adsd_delivery_qa(final_path: str) -> dict | None:
             "dialogue_shape": dialogue_shape,
             "speaker_count": speaker_count,
             "lips_change_repair_enabled": ADSD_LIPS_CHANGE_REPAIR,
+            "lips_change_all_enabled": ADSD_LIPS_CHANGE_ALL,
         },
         "created_at": datetime.now().isoformat(timespec="seconds"),
     }
