@@ -169,6 +169,20 @@ ADSD_VOICES = {
     "旁白": {"voice_id": 76, "voice_name": "News Anchor"},
 }
 
+# 男声池：未知/英文/自创品牌角色名按名字 hash 在此池轮换，避免全部走女声 News Anchor
+ADSD_MALE_VOICE_POOL = [
+    {"voice_id": 67, "voice_name": "Refreshing Young Man"},
+    {"voice_id": 69, "voice_name": "Reliable Executive"},
+]
+
+# 女声池：旁白 + 中文女性角色词命中时使用
+ADSD_FEMALE_VOICE_POOL = [
+    {"voice_id": 76, "voice_name": "News Anchor"},
+]
+
+# 同一 ADR 进程内角色名 → voice 持久映射，确保同一角色跨 turn 用同一声音
+_ADSD_SPEAKER_VOICE_CACHE: dict[str, dict] = {}
+
 ADS_REPORTER_SCRIPT_GUIDE = """
 
 【ADS 第一人称历史讲解 POV 模式 · 最高优先级】
@@ -690,13 +704,27 @@ def _extract_json_array(raw: str) -> list:
 
 
 def _voice_for_speaker(speaker: str) -> dict:
+    # 同名角色复用首次分配，跨 turn 声音稳定
+    if speaker in _ADSD_SPEAKER_VOICE_CACHE:
+        return _ADSD_SPEAKER_VOICE_CACHE[speaker]
+
     if speaker in ADSD_VOICES:
-        return ADSD_VOICES[speaker]
-    if any(k in speaker for k in ("少年", "青年", "士人", "书生", "学生", "百姓", "船工", "兵士", "亲历者", "见证人")):
-        return ADSD_VOICES["记者"]
-    if any(k in speaker for k in ("职员", "官员", "朝臣", "僧", "长者", "将领", "书吏", "幕僚", "使者", "父老", "寺")):
-        return ADSD_VOICES["职员"]
-    return ADSD_VOICES["旁白"]
+        voice = ADSD_VOICES[speaker]
+    elif "旁白" in speaker or speaker.lower() in ("narrator", "voiceover", "vo"):
+        voice = ADSD_FEMALE_VOICE_POOL[0]
+    elif any(k in speaker for k in ("少年", "青年", "士人", "书生", "学生", "百姓", "船工", "兵士", "亲历者", "见证人")):
+        voice = ADSD_VOICES["记者"]
+    elif any(k in speaker for k in ("职员", "官员", "朝臣", "僧", "长者", "将领", "书吏", "幕僚", "使者", "父老", "寺")):
+        voice = ADSD_VOICES["职员"]
+    elif any(k in speaker for k in ("女", "娘", "姐", "嫂", "母", "婆", "妇")):
+        voice = ADSD_FEMALE_VOICE_POOL[abs(hash(speaker)) % len(ADSD_FEMALE_VOICE_POOL)]
+    else:
+        # 未知角色名（英文/自创品牌如 Wery/Nolan/Cella）→ 男声池按 hash 分配
+        # 避免全部 fall through 到 News Anchor 女声
+        voice = ADSD_MALE_VOICE_POOL[abs(hash(speaker)) % len(ADSD_MALE_VOICE_POOL)]
+
+    _ADSD_SPEAKER_VOICE_CACHE[speaker] = voice
+    return voice
 
 
 def _adsd_default_roles(topic: str) -> tuple[str, str]:
