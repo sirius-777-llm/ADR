@@ -719,6 +719,16 @@ def _extract_json_array(raw: str) -> list:
     return json.loads(text[start:end + 1])
 
 
+def _extract_json_object(raw: str) -> dict:
+    fence = re.search(r'```(?:json)?\s*([\s\S]*?)```', raw)
+    text = fence.group(1).strip() if fence else raw.strip()
+    start = text.find("{")
+    end = text.rfind("}")
+    if start < 0 or end <= start:
+        raise ValueError(f"no JSON object: {raw[:200]}")
+    return json.loads(text[start:end + 1])
+
+
 def _voice_for_speaker(speaker: str, gender: str | None = None) -> dict:
     """优先用 LLM 提供的 gender（'male'/'female'）选 voice 池；
     其次按中文角色词关键字命中；最后未知名按 hash 分到男声池（避免全掉女声 News Anchor）。
@@ -759,6 +769,26 @@ def _adsd_default_roles(topic: str) -> tuple[str, str]:
     return roles[0], roles[1] if len(roles) > 1 else roles[0]
 
 
+ADSD_MODERN_MEDIA_FRAMING_TERMS = (
+    "主持人", "主播", "采访者", "采访官", "主持台", "演播室", "电视台", "直播", "连线",
+    "麦克风", "话筒", "摄像机采访", "出镜报道", "我现在所在的位置",
+    "host", "interviewer", "anchor", "studio", "livestream", "microphone",
+)
+
+
+def _adsd_allows_media_role(topic: str) -> bool:
+    explicit = ("明确记者", "记者角色", "记者采访", "新闻采访", "战地记者", "拟现场记者", "记者出镜", "主持人")
+    negative = ("不要记者", "不设记者", "没有记者", "无记者", "避免记者", "不要主持人", "不设主持人")
+    if any(k in topic for k in negative):
+        return False
+    return ADS_REPORTER_MODE or any(k in topic for k in explicit)
+
+
+def _adsd_has_modern_media_framing(text: str) -> bool:
+    s = (text or "").strip().lower()
+    return any(term.lower() in s for term in ADSD_MODERN_MEDIA_FRAMING_TERMS)
+
+
 def _adsd_role_candidates(topic: str) -> list[str]:
     if any(k in topic for k in ("同泰寺", "佛", "僧", "梁武帝", "萧衍", "寺")):
         return ["寺中僧人", "朝廷官员", "梁朝文士", "寺外百姓"]
@@ -768,6 +798,8 @@ def _adsd_role_candidates(topic: str) -> list[str]:
         return ["水师兵士", "海边百姓", "船上将领", "地方父老"]
     if any(k in topic for k in ("二十一条", "最后通牒", "外交", "条约")):
         return ["街头见证人", "衙署官员", "报馆学生", "电报员"]
+    if any(k in topic for k in ("画报", "报馆", "石印", "申报", "新闻图像")):
+        return ["画师", "报馆编辑", "印工", "街边茶客"]
     if any(k in topic for k in ("三国", "归晋", "晋", "魏", "蜀", "吴")):
         return ["军中亲历者", "地方官吏", "归降士兵", "城中百姓"]
     return ["现场见证人", "知情讲述人", "当事人", "旁观百姓"]
@@ -802,7 +834,6 @@ def _parse_adsd_override_turns(raw_lines: list[str], topic: str) -> list[dict]:
     import re as _re
     role_candidates = _adsd_role_candidates(topic)
     fallback_role = role_candidates[0]
-    banned_speakers = {"记者", "主持人", "主播", "职员", "采访者"}
     known: list[str] = []
     turns: list[dict] = []
     for i, raw in enumerate(raw_lines):
@@ -814,7 +845,7 @@ def _parse_adsd_override_turns(raw_lines: list[str], topic: str) -> list[dict]:
         else:
             speaker = known[0] if known else fallback_role
             text = line
-        if speaker in banned_speakers or not speaker:
+        if _adsd_has_modern_media_framing(speaker) or not speaker:
             speaker = known[i % len(known)] if known else fallback_role
         if speaker not in known and len(known) < 4:
             known.append(speaker)
@@ -842,7 +873,7 @@ def _adsd_pov_contract() -> str:
         "beside the speaker, near a doorway, table edge, pier, street crowd, temple hall, office corridor, or army tent. "
         "Use first-person documentary camera language such as over-the-shoulder from the crowd edge, shoulder-level handheld sway, "
         "foreground documents or doorframes, and nearby listener reactions. Keep the active speaker's face and mouth readable. "
-        "No modern reporter, no host, no interview setup, no microphone, no livestream, no smartphone, no TV studio."
+        "No modern host, no interview setup, no microphone, no livestream, no smartphone, no TV studio."
     )
 
 
@@ -877,8 +908,8 @@ def _generate_adsd_dialogue_turns(topic: str, num_turns: int, tone: str, style_g
 9. 严禁诗化表达、隐喻、金句、含蓄暗示、空泛大词。
 10. 每 2~3 句必须解释一个专名或因果。
 11. 结尾要把主题讲清楚，不要只煽情。
-12. 不要出现「记者」「主持人」「主播」「采访」这些现代媒体身份，除非主题本身真实发生在现代新闻现场。
-13. 这是“现场视角”，不是记者报道；镜头可以像观众站在现场旁听。
+12. 角色必须服务沉浸感：可以是时代内部的新闻人/报馆人/通讯员，但不要写成现代主持、采访、直播、出镜报道结构。
+13. 这是“时代内部人物的现场视角”；镜头可以像观众站在现场旁听，而不是电视采访。
 {"14. 已启用 POV 现场旁听模式：shot 必须写出观众仿佛站在人群边、门口、案前、船边、廊下或帐内近距离看见当前 speaker 说话；不要写成记者出镜、直播、采访。" if ADSD_ONSITE_POV_MODE else ""}
 15. 不要为了凑人数而加角色；如果一个人讲最清楚，就用独白；如果多人在场更自然，才用多人。
 
@@ -896,10 +927,9 @@ def _generate_adsd_dialogue_turns(topic: str, num_turns: int, tone: str, style_g
     turns = []
     speakers_seen: list[str] = []
     speaker_gender_map: dict[str, str] = {}  # 同一 speaker 跨 turn 锁定 gender
-    banned_speakers = {"记者", "主持人", "主播", "职员", "采访者"}
     for i, item in enumerate(arr):
         speaker = str(item.get("speaker", "")).strip()
-        if speaker in banned_speakers or not speaker:
+        if _adsd_has_modern_media_framing(speaker) or not speaker:
             speaker = speakers_seen[i % len(speakers_seen)] if speakers_seen else fallback_role
         if speaker not in speakers_seen and len(speakers_seen) < 4:
             speakers_seen.append(speaker)
@@ -938,7 +968,63 @@ def _generate_adsd_dialogue_turns(topic: str, num_turns: int, tone: str, style_g
     for turn in turns:
         turn["dialogue_shape"] = shape
         turn["speaker_count"] = speaker_count
-    return turns
+    return _adsd_immersion_qa_rewrite_turns(topic, turns, role_candidates)
+
+
+def _adsd_immersion_qa_rewrite_turns(topic: str, turns: list[dict], role_candidates: list[str]) -> list[dict]:
+    """Use LLM judgment to keep ADSD roles immersive without hard-banning period news roles."""
+    try:
+        compact = [
+            {
+                "speaker": t.get("speaker", ""),
+                "gender": t.get("gender", ""),
+                "text": t.get("text", ""),
+                "shot": t.get("shot", ""),
+            }
+            for t in turns
+        ]
+        prompt = f"""你是历史短视频 ADSD 的沉浸感审稿人。判断角色是否让观众跳戏。
+
+主题：{topic}
+候选时代内部角色：{" / ".join(role_candidates)}
+当前 turns：
+{json.dumps(compact, ensure_ascii=False)}
+
+判断标准：
+1. 允许时代内部的报馆人、画师、通讯员、战地通信人员、当事人、见证人。
+2. 不要把内容写成现代主持、电视采访、直播连线、出镜报道、拿麦克风提问。
+3. “记者”不是天然禁止；如果它在题材时代内部合理且不形成现代采访感，可以保留。
+4. 如果某个 speaker/shot 会破坏沉浸感，请替换为更贴合时代现场的人物，但不要改台词含义。
+5. 输出严格 JSON：{{"pass": true/false, "replacements": {{"原speaker":"新speaker"}}, "reasons": ["..."]}}
+"""
+        raw = chat("GEMINI_3_1_FLASH_LITE", "你只输出严格 JSON 对象。", prompt, max_tokens=900, timeout=90)
+        obj = _extract_json_object(raw)
+        replacements = obj.get("replacements") if isinstance(obj, dict) else None
+        if not isinstance(replacements, dict) or not replacements:
+            return _finalize_adsd_turns(turns)
+        changed = False
+        speaker_gender_map: dict[str, str] = {}
+        for turn in turns:
+            old = str(turn.get("speaker", "")).strip()
+            new = str(replacements.get(old, "")).strip()
+            if not new or new == old:
+                continue
+            # Only hard-reject obvious modern framing, not period news roles.
+            if _adsd_has_modern_media_framing(new):
+                continue
+            turn["speaker"] = new[:12]
+            turn["shot"] = str(turn.get("shot", "")).replace(old, turn["speaker"]) or f"{turn['speaker']}在现场说明材料"
+            gender = str(turn.get("gender", "")).strip().lower()
+            voice = _voice_for_speaker(turn["speaker"], gender if gender in ("male", "female") else None)
+            turn["speaker_id"] = voice["voice_id"]
+            turn["speaker_name"] = voice["voice_name"]
+            changed = True
+        if changed:
+            log(f"ADSD 沉浸感 QA 替换角色：{replacements}")
+        return _finalize_adsd_turns(turns)
+    except Exception as e:
+        log(f"ADSD 沉浸感 QA 跳过：{e}")
+        return _finalize_adsd_turns(turns)
 
 
 def _adsd_visual_contract(speaker: str, lip_sync: bool | None = None, gender: str | None = None) -> str:
@@ -956,7 +1042,7 @@ def _adsd_visual_contract(speaker: str, lip_sync: bool | None = None, gender: st
         f"Active speaker is {gender_phrase} labelled '{speaker}'. "
         f"The speaker MUST be rendered as {g if g in ('male', 'female') else 'consistent in gender across all scenes'}; do not switch the speaker's gender between scenes. "
         "Show this person as the clear speaking subject inside the period scene, face readable in three-quarter view, "
-        "with any other onsite characters only listening or reacting nearby. No modern reporter, no TV host, no microphone"
+        "with any other onsite characters only listening or reacting nearby. No TV host, no microphone, no livestream or interview setup"
     )
     pov = f". {_adsd_pov_contract()}" if ADSD_ONSITE_POV_MODE else ""
     if lip_sync:
@@ -4244,11 +4330,20 @@ def _write_adsd_delivery_qa(final_path: str) -> dict | None:
         speaker_count = len([s for s in dict.fromkeys(speakers) if s])
         shapes = [str(t.get("dialogue_shape", "")).strip() for t in timeline if isinstance(t, dict) and t.get("dialogue_shape")]
         dialogue_shape = shapes[0] if shapes else None
-        banned = {"记者", "主持人", "主播", "采访者"}
-        if not ADS_REPORTER_MODE:
-            leaked_roles = sorted({s for s in speakers if s in banned})
-            if leaked_roles:
-                issues.append(f"modern media speaker roles leaked: {leaked_roles}")
+        leaked_roles = sorted({s for s in speakers if _adsd_has_modern_media_framing(s)})
+        if leaked_roles:
+            issues.append(f"modern media framing roles leaked: {leaked_roles}")
+        if not _adsd_allows_media_role(TOPIC):
+            modern_framing = []
+            for t in timeline:
+                if not isinstance(t, dict):
+                    continue
+                joined = f"{t.get('speaker', '')} {t.get('shot', '')} {t.get('text', '')}"
+                if _adsd_has_modern_media_framing(joined):
+                    modern_framing.append(str(t.get("speaker", "")).strip())
+            modern_framing = sorted({s for s in modern_framing if s})
+            if modern_framing:
+                issues.append(f"modern media framing leaked: {modern_framing}")
         if not speakers:
             issues.append("turn_timeline has no speakers")
         elif speaker_count > 4:
