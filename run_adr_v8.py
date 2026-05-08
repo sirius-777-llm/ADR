@@ -154,6 +154,8 @@ ADSD_LIPS_CHANGE_ALL = (
     or "--lips-change-all" in sys.argv
     or os.environ.get("ADR_ADSD_LIPS_CHANGE_ALL", "").strip().lower() in ("1", "true", "yes", "on")
 )
+if ADSD_LIPS_CHANGE_ALL:
+    ADSD_LIPS_CHANGE_REPAIR = True
 
 # --ads-reporter：把 ADS 的"拟现场第一人称记者感"并入 ADR 动态化。
 # 该模式自动开启 --with-motion，并约束剧本、分镜与 motion prompt；
@@ -717,12 +719,25 @@ def _extract_json_array(raw: str) -> list:
     return json.loads(text[start:end + 1])
 
 
-def _voice_for_speaker(speaker: str) -> dict:
-    # 同名角色复用首次分配，跨 turn 声音稳定
-    if speaker in _ADSD_SPEAKER_VOICE_CACHE:
-        return _ADSD_SPEAKER_VOICE_CACHE[speaker]
+def _voice_for_speaker(speaker: str, gender: str | None = None) -> dict:
+    """优先用 LLM 提供的 gender（'male'/'female'）选 voice 池；
+    其次按中文角色词关键字命中；最后未知名按 hash 分到男声池（避免全掉女声 News Anchor）。
+    同一 speaker 首次分配后写入 cache，后续 turn 复用。"""
+    cache_key = f"{speaker}|{gender or ''}"
+    if cache_key in _ADSD_SPEAKER_VOICE_CACHE:
+        return _ADSD_SPEAKER_VOICE_CACHE[cache_key]
+    # 同名 speaker 已有任意 gender 分配过，直接复用（防止同名跨 gender 反复改）
+    for k, v in _ADSD_SPEAKER_VOICE_CACHE.items():
+        if k.startswith(f"{speaker}|"):
+            _ADSD_SPEAKER_VOICE_CACHE[cache_key] = v
+            return v
 
-    if speaker in ADSD_VOICES:
+    g = (gender or "").strip().lower()
+    if g == "female":
+        voice = ADSD_FEMALE_VOICE_POOL[abs(hash(speaker)) % len(ADSD_FEMALE_VOICE_POOL)]
+    elif g == "male":
+        voice = ADSD_MALE_VOICE_POOL[abs(hash(speaker)) % len(ADSD_MALE_VOICE_POOL)]
+    elif speaker in ADSD_VOICES:
         voice = ADSD_VOICES[speaker]
     elif "旁白" in speaker or speaker.lower() in ("narrator", "voiceover", "vo"):
         voice = ADSD_FEMALE_VOICE_POOL[0]
@@ -733,11 +748,9 @@ def _voice_for_speaker(speaker: str) -> dict:
     elif any(k in speaker for k in ("女", "娘", "姐", "嫂", "母", "婆", "妇")):
         voice = ADSD_FEMALE_VOICE_POOL[abs(hash(speaker)) % len(ADSD_FEMALE_VOICE_POOL)]
     else:
-        # 未知角色名（英文/自创品牌如 Wery/Nolan/Cella）→ 男声池按 hash 分配
-        # 避免全部 fall through 到 News Anchor 女声
         voice = ADSD_MALE_VOICE_POOL[abs(hash(speaker)) % len(ADSD_MALE_VOICE_POOL)]
 
-    _ADSD_SPEAKER_VOICE_CACHE[speaker] = voice
+    _ADSD_SPEAKER_VOICE_CACHE[cache_key] = voice
     return voice
 
 
@@ -855,25 +868,26 @@ def _generate_adsd_dialogue_turns(topic: str, num_turns: int, tone: str, style_g
 硬性要求：
 1. 只输出 JSON 数组，不要 Markdown，不要解释。
 2. 数组长度必须正好 {num_turns}。
-3. 每项字段必须包含：speaker、text、shot、emotion。
+3. 每项字段必须包含：speaker、gender、text、shot、emotion。
 4. speaker 必须是现场角色名；全片使用 1~4 个 speaker。根据剧情需要可独白、双人或多人，不强制交替。
-5. text 是中文对白，每句 18~36 字，白话、直接、普通人能听懂。
-6. shot 是中文画面说明，要具体到地点、道具、人物动作；必须让当前 speaker 成为画面里的说话主体；如有其他角色，只作为倾听/反应对象。
-7. emotion 只能从 neutral / tense / solemn / explanatory 中选。
-8. 严禁诗化表达、隐喻、金句、含蓄暗示、空泛大词。
-9. 每 2~3 句必须解释一个专名或因果。
-10. 结尾要把主题讲清楚，不要只煽情。
-11. 不要出现「记者」「主持人」「主播」「采访」这些现代媒体身份，除非主题本身真实发生在现代新闻现场。
-12. 这是“现场视角”，不是记者报道；镜头可以像观众站在现场旁听。
-{"13. 已启用 POV 现场旁听模式：shot 必须写出观众仿佛站在人群边、门口、案前、船边、廊下或帐内近距离看见当前 speaker 说话；不要写成记者出镜、直播、采访。" if ADSD_ONSITE_POV_MODE else ""}
-14. 不要为了凑人数而加角色；如果一个人讲最清楚，就用独白；如果多人在场更自然，才用多人。
+5. **gender 只能是 "male" 或 "female"**——同一 speaker 在所有 turn 里 gender 必须保持一致；按角色名/年龄/职业最自然的性别选。
+6. text 是中文对白，每句 18~36 字，白话、直接、普通人能听懂。
+7. shot 是中文画面说明，要具体到地点、道具、人物动作；必须让当前 speaker 成为画面里的说话主体；如有其他角色，只作为倾听/反应对象。**shot 里要带上 speaker 的性别+大致年龄外貌**（如"中年男性"、"年轻女性"），让画面渲染时性别准确。
+8. emotion 只能从 neutral / tense / solemn / explanatory 中选。
+9. 严禁诗化表达、隐喻、金句、含蓄暗示、空泛大词。
+10. 每 2~3 句必须解释一个专名或因果。
+11. 结尾要把主题讲清楚，不要只煽情。
+12. 不要出现「记者」「主持人」「主播」「采访」这些现代媒体身份，除非主题本身真实发生在现代新闻现场。
+13. 这是“现场视角”，不是记者报道；镜头可以像观众站在现场旁听。
+{"14. 已启用 POV 现场旁听模式：shot 必须写出观众仿佛站在人群边、门口、案前、船边、廊下或帐内近距离看见当前 speaker 说话；不要写成记者出镜、直播、采访。" if ADSD_ONSITE_POV_MODE else ""}
+15. 不要为了凑人数而加角色；如果一个人讲最清楚，就用独白；如果多人在场更自然，才用多人。
 
 语言风格：
 {style_guide}
 
 输出示例格式：
 [
-  {{"speaker":"{fallback_role}","text":"这张告示刚贴出来，街口的人全围过来了。","shot":"街口墙边，{fallback_role}指着新贴告示，旁人凝神看","emotion":"tense"}}
+  {{"speaker":"{fallback_role}","gender":"male","text":"这张告示刚贴出来，街口的人全围过来了。","shot":"街口墙边，中年男性{fallback_role}指着新贴告示，旁人凝神看","emotion":"tense"}}
 ]"""
     raw = chat("GEMINI_3_1_FLASH_LITE", "你只输出严格 JSON 数组。", prompt, max_tokens=2600, timeout=180)
     arr = _extract_json_array(raw)
@@ -881,6 +895,7 @@ def _generate_adsd_dialogue_turns(topic: str, num_turns: int, tone: str, style_g
         raise RuntimeError(f"ADSD 对话句数不匹配：got {len(arr)}, need {num_turns}")
     turns = []
     speakers_seen: list[str] = []
+    speaker_gender_map: dict[str, str] = {}  # 同一 speaker 跨 turn 锁定 gender
     banned_speakers = {"记者", "主持人", "主播", "职员", "采访者"}
     for i, item in enumerate(arr):
         speaker = str(item.get("speaker", "")).strip()
@@ -895,12 +910,22 @@ def _generate_adsd_dialogue_turns(topic: str, num_turns: int, tone: str, style_g
         emotion = str(item.get("emotion", "neutral")).strip().lower()
         if emotion not in ("neutral", "tense", "solemn", "explanatory"):
             emotion = "neutral"
+        # gender：首次出现以 LLM 给的值为准，后续锁定
+        gender_raw = str(item.get("gender", "")).strip().lower()
+        if gender_raw not in ("male", "female"):
+            gender_raw = ""
+        if speaker in speaker_gender_map:
+            gender = speaker_gender_map[speaker]
+        else:
+            gender = gender_raw or "male"  # 缺省 male，避免 fallback 全女声
+            speaker_gender_map[speaker] = gender
         if not text or len(text) > 80:
             raise RuntimeError(f"ADSD 第 {i+1} 句台词异常：{text}")
-        voice = _voice_for_speaker(speaker)
+        voice = _voice_for_speaker(speaker, gender)
         turns.append({
             "dialogue_turn": i + 1,
             "speaker": speaker,
+            "gender": gender,
             "speaker_id": voice["voice_id"],
             "speaker_name": voice["voice_name"],
             "text": text,
@@ -916,12 +941,20 @@ def _generate_adsd_dialogue_turns(topic: str, num_turns: int, tone: str, style_g
     return turns
 
 
-def _adsd_visual_contract(speaker: str, lip_sync: bool | None = None) -> str:
+def _adsd_visual_contract(speaker: str, lip_sync: bool | None = None, gender: str | None = None) -> str:
     """Prompt contract for ADSD: keep the active speaker visually accountable."""
     if lip_sync is None:
         lip_sync = ADSD_LIP_SYNC_EXPERIMENT
+    g = (gender or "").strip().lower()
+    if g == "female":
+        gender_phrase = "a female character"
+    elif g == "male":
+        gender_phrase = "a male character"
+    else:
+        gender_phrase = "the historical onsite character"
     anchor = (
-        f"Active speaker is the historical onsite character labelled '{speaker}'. "
+        f"Active speaker is {gender_phrase} labelled '{speaker}'. "
+        f"The speaker MUST be rendered as {g if g in ('male', 'female') else 'consistent in gender across all scenes'}; do not switch the speaker's gender between scenes. "
         "Show this person as the clear speaking subject inside the period scene, face readable in three-quarter view, "
         "with any other onsite characters only listening or reacting nearby. No modern reporter, no TV host, no microphone"
     )
@@ -1527,10 +1560,13 @@ THUMBNAIL_ANCHOR: 封面视觉锚，用 4~6 个短语描述：主体、主色（
         shot_tmpl = shot_blueprint[i] if i < len(shot_blueprint) else ""
         subject = visuals[i].get("prompt", "")
         if dialogue_meta:
-            visual_contract = _adsd_visual_contract(dialogue_meta.get("speaker", ""))
+            visual_contract = _adsd_visual_contract(
+                dialogue_meta.get("speaker", ""),
+                gender=dialogue_meta.get("gender"),
+            )
             subject = (
                 f"{dialogue_meta.get('shot', '')}. "
-                f"Dialogue speaker: {dialogue_meta.get('speaker', '')}; "
+                f"Dialogue speaker: {dialogue_meta.get('speaker', '')} ({dialogue_meta.get('gender', 'unknown')}); "
                 f"{visual_contract}. "
                 f"{subject}"
             )
