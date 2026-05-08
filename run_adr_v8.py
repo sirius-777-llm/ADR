@@ -1046,7 +1046,7 @@ def _adsd_visual_contract(speaker: str, lip_sync: bool | None = None, gender: st
     if vs and len(vs.split()) >= 4:
         # LLM 主路径：直接用 visual_subject 锁定外形
         anchor = (
-            f"Active speaker is {vs}, labelled '{speaker}'. "
+            f"Active speaker is {vs}, internally identified as '{speaker}' for voice continuity only; do not render this name as text. "
             f"APPEARANCE LOCK: render this exact subject consistently across every scene; "
             f"the same speaker name must always have the same appearance/species/form. "
             "Show as the clear speaking subject inside the period scene, face/head readable in three-quarter view, "
@@ -1065,7 +1065,7 @@ def _adsd_visual_contract(speaker: str, lip_sync: bool | None = None, gender: st
             gender_phrase = "the historical onsite character"
             gender_negative = "consistent gender across all scenes"
         anchor = (
-            f"Active speaker is {gender_phrase} labelled '{speaker}'. "
+            f"Active speaker is {gender_phrase}, internally identified as '{speaker}' for voice continuity only; do not render this name as text. "
             f"GENDER LOCK (fallback): render as {g.upper() if g in ('male', 'female') else 'CONSISTENT GENDER'} across every scene; "
             f"the same speaker name must always have the same gender. {gender_negative}. "
             "Show this person as the clear speaking subject inside the period scene, face readable in three-quarter view, "
@@ -3556,7 +3556,7 @@ def _lip_sync_slot_duration(script: list[dict], idx: int) -> float:
 
 def _adsd_lip_sync_prompt(scene: dict, safe_retry: bool = False) -> str:
     speaker = scene.get("speaker") or "speaker"
-    role = f"historical onsite character labelled {speaker}"
+    role = f"historical onsite character internally identified as {speaker}"
     pov = (
         " First-person onsite observer POV: viewer stands beside the active speaker or at the crowd/door/table edge, "
         "close enough to see the face and mouth, with framing chosen by topic-era immersion."
@@ -3568,17 +3568,19 @@ def _adsd_lip_sync_prompt(scene: dict, safe_retry: bool = False) -> str:
             f"Active speaker is the {role}; any other onsite characters listen silently. "
             "The active speaker follows the provided Chinese audio reference with natural mouth movement. "
             f"Visible mouth, stable face, subtle head motion, realistic lighting.{pov} "
-            "Keep the scene immersive for its topic era, no subtitles, no text overlay, no logos, no watermark, no branded style references."
+            "Keep the scene immersive for its topic era. Absolutely no subtitles, no captions, no text overlay, "
+            "no written dialogue, no speaker name labels, no logos, no watermark, no branded style references."
         )
-    text = scene.get("text", "")
     shot = scene.get("shot", "")
     return (
         "Historically grounded period dialogue scene. "
-        f"Active speaker is the {role}; any other people only listen or react. "
-        f'台词:"{text}" The active speaker says exactly this line. '
-        f"Mouth movement must synchronize with the provided audio reference; keep the mouth visible with natural jaw movement.{pov} "
+        f"Active speaker is the {role}; any other people only listen or react. Do not display the speaker name. "
+        "Use the uploaded Chinese audio reference as the only dialogue source. "
+        "Do not render, write, subtitle, caption, or overlay the spoken words anywhere in the frame. "
+        f"Mouth movement must synchronize with the audio reference; keep the mouth visible with natural jaw movement.{pov} "
         f"Scene action: {shot}. "
-        "Keep the same face and period clothing, keep framing immersive for its topic era, no subtitles, no text overlay, no logo, no watermark."
+        "Keep the same face and period clothing, keep framing immersive for its topic era. "
+        "Absolutely no subtitles, no captions, no text overlay, no written dialogue, no logo, no watermark."
     )[:2000]
 
 
