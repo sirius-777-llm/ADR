@@ -2690,6 +2690,93 @@ def step345_timeline(script: list[dict], voice_path: str) -> list[dict]:
     return script
 
 
+def step345_bgm_only_timeline(script: list[dict], bgm_path: str, voice_path: str) -> list[dict]:
+    """ADR/ADS BGM-only timeline: let BGM duration drive shot lengths instead of TTS."""
+    bgm_dur = ffprobe_duration(bgm_path)
+    if bgm_dur <= 0:
+        raise RuntimeError("BGM-only 时间轴失败：BGM 时长无效")
+    n = max(1, len(script))
+    cps = float(os.environ.get("ADR_BGM_ONLY_CPS", "2.4"))
+    max_total = float(os.environ.get("ADR_BGM_ONLY_MAX_DURATION", "90"))
+    min_shot_cfg = float(os.environ.get("ADR_BGM_ONLY_MIN_SHOT", "2.5"))
+    max_shot = float(os.environ.get("ADR_BGM_ONLY_MAX_SHOT", "8.0"))
+    outro = float(os.environ.get("ADR_BGM_ONLY_OUTRO", "0.8"))
+
+    target_total = min(bgm_dur, max_total)
+    scene_total = max(1.0, target_total - outro)
+    min_shot = min_shot_cfg
+    if scene_total < n * min_shot:
+        min_shot = max(1.0, scene_total / n)
+    max_shot = max(max_shot, min_shot, scene_total / n)
+
+    chars = [max(1, len(str(s.get("text", "")))) for s in script]
+    base = [max(min_shot, c / max(cps, 0.1)) for c in chars]
+
+    if sum(base) > scene_total:
+        floor_total = n * min_shot
+        if scene_total <= floor_total:
+            durations = [scene_total / n for _ in script]
+        else:
+            extra_budget = scene_total - floor_total
+            extras = [max(0.0, b - min_shot) for b in base]
+            extra_sum = sum(extras) or 1.0
+            durations = [min_shot + extra_budget * e / extra_sum for e in extras]
+    else:
+        durations = base[:]
+        remaining = scene_total - sum(durations)
+        expandable = [max(0.0, max_shot - d) for d in durations]
+        expandable_sum = sum(expandable)
+        if remaining > 0 and expandable_sum > 0:
+            durations = [d + remaining * e / expandable_sum for d, e in zip(durations, expandable)]
+        elif remaining > 0 and durations:
+            durations[-1] += remaining
+
+    cursor = 0.0
+    timeline = []
+    for i, (s, dur) in enumerate(zip(script, durations)):
+        dur = max(1.0, float(dur))
+        sub_start = cursor + SUB_DELAY
+        sub_end = cursor + dur + SUB_DELAY
+        s.update({
+            "audio_start": cursor,
+            "sub_start": sub_start,
+            "sub_end": sub_end,
+            "dur": dur,
+            "vid_duration": dur,
+            "img_path": str(OUTPUT_DIR / f"img_{i}.jpg"),
+            "vid_path": str(OUTPUT_DIR / f"seg_{i}.mp4"),
+            "bgm_only": True,
+        })
+        timeline.append({
+            "scene": i + 1,
+            "text": s.get("text", ""),
+            "start": round(cursor, 3),
+            "end": round(cursor + dur, 3),
+            "duration": round(dur, 3),
+            "chars": chars[i],
+            "reading_cps": round(chars[i] / dur, 3) if dur > 0 else None,
+        })
+        cursor += dur
+
+    (OUTPUT_DIR / "bgm_only_timeline.json").write_text(
+        json.dumps({
+            "policy": "bgm_duration_driven",
+            "bgm_path": bgm_path,
+            "bgm_duration": bgm_dur,
+            "target_total": target_total,
+            "scene_total": cursor,
+            "cps_limit": cps,
+            "min_shot": min_shot,
+            "max_shot": max_shot,
+            "timeline": timeline,
+            "created_at": datetime.now().isoformat(timespec="seconds"),
+        }, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    tg(f"✅ BGM-driven 时间轴完成：BGM {bgm_dur:.1f}s → 成片目标 {target_total:.1f}s，{n} 镜，阅读上限 {cps:.1f}字/s")
+    return script
+
+
 # ── 第六步：并行生成图片 + BGM + 视频片段 ────────────────────────────────────
 def _extract_img_url(data: dict):
     """从轮询结果中提取图片 URL，兼容多种响应格式。"""
@@ -3028,16 +3115,19 @@ def generate_bgm(topic: str, tone: str = "中性") -> str | None:
     return None
 
 
-def step6_parallel(script: list[dict], topic: str) -> str | None:
+def step6_parallel(script: list[dict], topic: str, pregenerated_bgm_path: str | None = None) -> str | None:
     n = len(script)
-    tg(f"🚀 并行生成：{n} 张图片 + BGM（图片生成即审批，BGM 后台同步跑）...")
+    if pregenerated_bgm_path:
+        tg(f"🚀 并行生成：{n} 张图片（复用 BGM-driven 已生成音乐）...")
+    else:
+        tg(f"🚀 并行生成：{n} 张图片 + BGM（图片生成即审批，BGM 后台同步跑）...")
 
     MAX_REDO = 3
     bgm_tone = script[0].get("tone", "中性") if script else "中性"
     media_workers = max(2, min(20, int(os.environ.get("ADR_MEDIA_WORKERS", "20"))))
     # BGM 后台启动，不阻塞审批
     with ThreadPoolExecutor(max_workers=media_workers) as ex:
-        bgm_fut = ex.submit(generate_bgm, topic, bgm_tone)
+        bgm_fut = None if pregenerated_bgm_path else ex.submit(generate_bgm, topic, bgm_tone)
 
         # 图片：每张生成完立刻审批，不等全部完成
         img_futs = {ex.submit(generate_image, s, i): i for i, s in enumerate(script)}
@@ -3153,28 +3243,31 @@ def step6_parallel(script: list[dict], topic: str) -> str | None:
                 tg(f"✅ 异常张审核完成，进入合成阶段")
             else:
                 tg(f"⏭️ 全部 {n} 张通过智能审核，自动进入合成阶段")
-            bgm_path = None
-            try:
-                bgm_path = bgm_fut.result(timeout=180)
-                if bgm_path:
-                    tg(f"🎵 BGM 就绪: {bgm_path}")
-                else:
-                    tg("⚠️ BGM generate_bgm 返回 None，尝试兜底...")
+            bgm_path = pregenerated_bgm_path
+            if bgm_path:
+                tg(f"🎵 BGM-driven 复用 BGM: {bgm_path}")
+            else:
+                try:
+                    bgm_path = bgm_fut.result(timeout=180)
+                    if bgm_path:
+                        tg(f"🎵 BGM 就绪: {bgm_path}")
+                    else:
+                        tg("⚠️ BGM generate_bgm 返回 None，尝试兜底...")
+                        fallback = str(OUTPUT_DIR / "bgm.mp3")
+                        if os.path.exists(fallback) and os.path.getsize(fallback) > 10000:
+                            bgm_path = fallback
+                            tg(f"🎵 BGM 兜底成功: {fallback}")
+                        else:
+                            tg("❌ BGM 兜底失败：文件不存在或太小")
+                except Exception as e:
+                    log(f"BGM 失败: {e}")
+                    tg(f"⚠️ BGM future 异常: {e}，尝试兜底...")
                     fallback = str(OUTPUT_DIR / "bgm.mp3")
                     if os.path.exists(fallback) and os.path.getsize(fallback) > 10000:
                         bgm_path = fallback
                         tg(f"🎵 BGM 兜底成功: {fallback}")
                     else:
-                        tg("❌ BGM 兜底失败：文件不存在或太小")
-            except Exception as e:
-                log(f"BGM 失败: {e}")
-                tg(f"⚠️ BGM future 异常: {e}，尝试兜底...")
-                fallback = str(OUTPUT_DIR / "bgm.mp3")
-                if os.path.exists(fallback) and os.path.getsize(fallback) > 10000:
-                    bgm_path = fallback
-                    tg(f"🎵 BGM 兜底成功: {fallback}")
-                else:
-                    tg("❌ BGM 完全失败，视频将无背景音乐")
+                        tg("❌ BGM 完全失败，视频将无背景音乐")
             return bgm_path
 
         # ★ 审批已在 as_completed 循环中每张图完成时即推（含兜底图），无需统一重发
@@ -3265,24 +3358,27 @@ def step6_parallel(script: list[dict], topic: str) -> str | None:
         tg(f"✅ 全部 {n} 张图片审批完成")
 
         # 等 BGM（审批期间 BGM 已在后台跑完了）
-        bgm_path = None
-        try:
-            bgm_path = bgm_fut.result(timeout=180)
-            if bgm_path:
-                tg(f"🎵 BGM 就绪: {bgm_path}")
-            else:
-                tg("⚠️ BGM generate_bgm 返回 None，尝试兜底...")
+        bgm_path = pregenerated_bgm_path
+        if bgm_path:
+            tg(f"🎵 BGM-driven 复用 BGM: {bgm_path}")
+        else:
+            try:
+                bgm_path = bgm_fut.result(timeout=180)
+                if bgm_path:
+                    tg(f"🎵 BGM 就绪: {bgm_path}")
+                else:
+                    tg("⚠️ BGM generate_bgm 返回 None，尝试兜底...")
+                    fallback = str(OUTPUT_DIR / "bgm.mp3")
+                    if os.path.exists(fallback) and os.path.getsize(fallback) > 10000:
+                        bgm_path = fallback
+                        tg(f"🎵 BGM 兜底成功: {fallback}")
+            except Exception as e:
+                log(f"BGM 失败: {e}")
+                tg(f"⚠️ BGM future 异常: {e}，尝试兜底...")
                 fallback = str(OUTPUT_DIR / "bgm.mp3")
                 if os.path.exists(fallback) and os.path.getsize(fallback) > 10000:
                     bgm_path = fallback
                     tg(f"🎵 BGM 兜底成功: {fallback}")
-        except Exception as e:
-            log(f"BGM 失败: {e}")
-            tg(f"⚠️ BGM future 异常: {e}，尝试兜底...")
-            fallback = str(OUTPUT_DIR / "bgm.mp3")
-            if os.path.exists(fallback) and os.path.getsize(fallback) > 10000:
-                bgm_path = fallback
-                tg(f"🎵 BGM 兜底成功: {fallback}")
 
     return bgm_path
 
@@ -4442,6 +4538,115 @@ def _write_adsd_delivery_qa(final_path: str) -> dict | None:
         "created_at": datetime.now().isoformat(timespec="seconds"),
     }
     (OUTPUT_DIR / "delivery_qa.json").write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    return payload
+
+
+def _write_bgm_only_qa(final_path: str, script: list[dict]) -> dict:
+    """Gate ADR/ADS BGM-only delivery: final audio must be BGM, not silence/TTS."""
+    issues: list[str] = []
+    warnings: list[str] = []
+    final = Path(final_path)
+    bgm = OUTPUT_DIR / "bgm.mp3"
+    timeline = _read_output_json("bgm_only_timeline.json")
+    cps_limit = float(os.environ.get("ADR_BGM_ONLY_CPS", "2.4"))
+    min_shot = float(os.environ.get("ADR_BGM_ONLY_MIN_SHOT", "2.5"))
+    max_shot = float(os.environ.get("ADR_BGM_ONLY_MAX_SHOT", "8.0"))
+
+    if not final.exists() or final.stat().st_size < 10000:
+        issues.append(f"final video missing or too small: {final_path}")
+    if not bgm.exists() or bgm.stat().st_size < 10000:
+        issues.append("BGM missing or too small")
+    for forbidden in ("master_voice.mp3", "dialogue_master.mp3"):
+        if (OUTPUT_DIR / forbidden).exists():
+            issues.append(f"unexpected TTS master exists in BGM-only mode: {forbidden}")
+
+    video_dur = audio_dur = final_dur = None
+    mean_volume = None
+    try:
+        final_dur = ffprobe_duration(final_path)
+        probe = subprocess.check_output([
+            "ffprobe", "-v", "error",
+            "-show_entries", "stream=codec_type,duration",
+            "-of", "json",
+            final_path,
+        ], stderr=subprocess.DEVNULL)
+        streams = json.loads(probe.decode()).get("streams", [])
+        video_dur = next((float(s["duration"]) for s in streams if s.get("codec_type") == "video" and s.get("duration")), None)
+        audio_dur = next((float(s["duration"]) for s in streams if s.get("codec_type") == "audio" and s.get("duration")), None)
+        if video_dur is None or audio_dur is None:
+            issues.append("final video/audio stream duration missing")
+        elif abs(video_dur - audio_dur) > 0.35:
+            issues.append(f"audio_video_delta too large: {abs(video_dur - audio_dur):.3f}s")
+    except Exception as e:
+        issues.append(f"ffprobe failed: {e}")
+
+    try:
+        result = subprocess.run([
+            "ffmpeg", "-hide_banner", "-nostats", "-i", final_path,
+            "-af", "volumedetect", "-f", "null", "-"
+        ], capture_output=True, text=True, timeout=45)
+        m = re.search(r"mean_volume:\s*(-?\d+(?:\.\d+)?) dB", result.stderr)
+        if m:
+            mean_volume = float(m.group(1))
+            if mean_volume < -55:
+                issues.append(f"final audio appears silent: mean_volume={mean_volume}dB")
+        else:
+            warnings.append("mean_volume unavailable")
+    except Exception as e:
+        warnings.append(f"volumedetect failed: {e}")
+
+    timeline_rows = []
+    if isinstance(timeline, dict) and isinstance(timeline.get("timeline"), list):
+        timeline_rows = timeline.get("timeline") or []
+    else:
+        issues.append("bgm_only_timeline.json missing")
+
+    max_reading_cps = 0.0
+    too_fast = []
+    bad_duration = []
+    for row in timeline_rows:
+        try:
+            dur = float(row.get("duration") or 0)
+            reading_cps = float(row.get("reading_cps") or 0)
+        except Exception:
+            continue
+        max_reading_cps = max(max_reading_cps, reading_cps)
+        if reading_cps > cps_limit * 1.2:
+            too_fast.append(row.get("scene"))
+        if dur < min_shot * 0.8 or dur > max_shot * 1.2:
+            bad_duration.append(row.get("scene"))
+    if too_fast:
+        issues.append(f"subtitle reading speed too high at scenes: {too_fast[:8]}")
+    if bad_duration:
+        warnings.append(f"shot duration outside soft range at scenes: {bad_duration[:8]}")
+
+    payload = {
+        "mode": "BGM_ONLY",
+        "final_path": final_path,
+        "bgm_path": str(bgm),
+        "pass": len(issues) == 0,
+        "issues": issues,
+        "warnings": warnings,
+        "checks": {
+            "final_duration": final_dur,
+            "video_duration": video_dur,
+            "audio_duration": audio_dur,
+            "audio_video_delta": abs(video_dur - audio_dur) if video_dur is not None and audio_dur is not None else None,
+            "mean_volume_db": mean_volume,
+            "scene_count": len(script),
+            "timeline_scene_count": len(timeline_rows),
+            "max_reading_cps": round(max_reading_cps, 3),
+            "cps_limit": cps_limit,
+            "bgm_exists": bgm.exists(),
+            "silent_voice_exists": (OUTPUT_DIR / "silent_voice.mp3").exists(),
+            "tts_master_absent": not (OUTPUT_DIR / "master_voice.mp3").exists() and not (OUTPUT_DIR / "dialogue_master.mp3").exists(),
+        },
+        "created_at": datetime.now().isoformat(timespec="seconds"),
+    }
+    (OUTPUT_DIR / "bgm_only_qa.json").write_text(
         json.dumps(payload, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
@@ -5706,6 +5911,22 @@ def _generate_cover_image(topic: str, short_title: str, script: list[dict]) -> s
 
 
 def step10_deliver(final_path: str, topic: str, script: list[dict]):
+    if NO_VOICE:
+        bgm_qa = _write_bgm_only_qa(final_path, script)
+        if not bgm_qa.get("pass"):
+            issues = "\n".join(f"• {x}" for x in bgm_qa.get("issues", [])[:8])
+            tg(
+                "🛑 ADR/ADS BGM-only 发布已阻断：QA 未通过\n\n"
+                f"{issues}\n\n"
+                f"成片已保留在本地：{final_path}\n"
+                f"QA：{OUTPUT_DIR / 'bgm_only_qa.json'}"
+            )
+            log(f"BGM-only QA blocked: {bgm_qa.get('issues')}")
+            return
+        warn_lines = "\n".join(f"• {x}" for x in bgm_qa.get("warnings", [])[:5])
+        warn_note = f"\n\n提示：\n{warn_lines}" if warn_lines else ""
+        tg(f"✅ ADR/ADS BGM-only 发布门禁通过：BGM 音轨/时长/字幕节奏 QA OK{warn_note}")
+
     if ADS_DIALOGUE_MODE:
         delivery_qa = _write_adsd_delivery_qa(final_path)
         if delivery_qa and not delivery_qa.get("pass"):
@@ -5971,11 +6192,19 @@ def main():
 
     try:
         t = time.time(); script, spk_id, spk_name = step1_script(topic);       timings["剧本+制片人准则+画面提示词+音色"] = time.time() - t
+        bgm_path = None
         if NO_VOICE:
             t = time.time()
-            # ADR/ADS BGM-only: 不调用 Podcast/TTS；静音轨只用于复用现有时间轴算法。
-            total_chars = sum(len(s["text"]) for s in script)
-            est_dur = max(20.0, min(300.0, total_chars / 3.0 + len(script) * 0.5))  # 每句留 0.5s 间隔
+            bgm_tone = script[0].get("tone", "中性") if script else "中性"
+            bgm_path = generate_bgm(topic, bgm_tone)
+            if not bgm_path:
+                raise RuntimeError("ADR/ADS BGM-only 模式 BGM 生成失败，停止交付")
+            timings["BGM-only BGM 生成"] = time.time() - t
+
+            t = time.time()
+            bgm_dur = ffprobe_duration(bgm_path)
+            max_total = float(os.environ.get("ADR_BGM_ONLY_MAX_DURATION", "90"))
+            est_dur = min(bgm_dur, max_total)
             voice_path = str(OUTPUT_DIR / "silent_voice.mp3")
             subprocess.run([
                 "ffmpeg", "-y", "-f", "lavfi",
@@ -5991,8 +6220,11 @@ def main():
                 t = time.time(); voice_path = step2_dialogue_voice(script); timings["ADSD TTS 音轨+ASR"] = time.time() - t
             else:
                 t = time.time(); voice_path = step2_master_voice(script, spk_id, spk_name); timings["Podcast 音轨"] = time.time() - t
-        t = time.time(); script     = step345_timeline(script, voice_path);   timings["时间轴计算"] = time.time() - t
-        t = time.time(); bgm_path   = step6_parallel(script, topic);          timings["图片+BGM 并发"] = time.time() - t
+        if NO_VOICE:
+            t = time.time(); script = step345_bgm_only_timeline(script, bgm_path, voice_path); timings["BGM-driven 时间轴计算"] = time.time() - t
+        else:
+            t = time.time(); script = step345_timeline(script, voice_path);   timings["时间轴计算"] = time.time() - t
+        t = time.time(); bgm_path   = step6_parallel(script, topic, bgm_path if NO_VOICE else None); timings["图片+BGM 并发"] = time.time() - t
         if ADS_DIALOGUE_MODE and ADSD_LIP_SYNC_EXPERIMENT:
             t = time.time(); step66_adsd_lip_sync(script);                    timings["ADSD 口型同步"] = time.time() - t
         elif WITH_MOTION:
