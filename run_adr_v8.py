@@ -2053,7 +2053,8 @@ def _write_adsd_asr_text_qa(script: list[dict], asr_data: dict) -> dict | None:
                     missing_chunks.append({"turn": i + 1, "speaker": turn.get("speaker"), "chunk": chunk})
                     break
         strict_pass = ratio >= 0.92 and not missing_chunks
-        tolerant_pass = ratio >= 0.985 and len(missing_chunks) <= 2
+        # tolerant 放宽到 95%+ / missing ≤ 5，吸收英文专有名词被 ASR 听岔的误差
+        tolerant_pass = ratio >= 0.95 and len(missing_chunks) <= 5
         qa = {
             "expected_chars": len(expected),
             "recognized_chars": len(recognized),
