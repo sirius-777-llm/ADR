@@ -2690,8 +2690,131 @@ def step345_timeline(script: list[dict], voice_path: str) -> list[dict]:
     return script
 
 
+def _analyze_bgm_energy_cuts(bgm_path: str, target_total: float) -> dict:
+    """Analyze local BGM energy and return candidate cut points for BGM-only editing."""
+    window = float(os.environ.get("ADR_BGM_ONLY_ENERGY_WINDOW", "0.5"))
+    min_gap = float(os.environ.get("ADR_BGM_ONLY_ENERGY_MIN_GAP", "1.2"))
+    samples: list[dict] = []
+    candidates: list[dict] = []
+    try:
+        result = subprocess.run([
+            "ffmpeg", "-hide_banner", "-nostats", "-i", bgm_path,
+            "-af", (
+                f"aresample=16000,asetnsamples=n={max(1, int(16000 * window))},"
+                "astats=metadata=1:reset=1,"
+                "ametadata=print:key=lavfi.astats.Overall.RMS_level"
+            ),
+            "-f", "null", "-"
+        ], capture_output=True, text=True, timeout=90)
+        current_t = None
+        for line in result.stderr.splitlines():
+            m_t = re.search(r"pts_time:([0-9.]+)", line)
+            if m_t:
+                current_t = float(m_t.group(1))
+                continue
+            m_rms = re.search(r"lavfi\.astats\.Overall\.RMS_level=(-?(?:inf|\d+(?:\.\d+)?))", line)
+            if m_rms and current_t is not None and m_rms.group(1) != "-inf":
+                if 0.5 <= current_t <= target_total - 0.5:
+                    samples.append({"t": round(current_t, 3), "rms_db": round(float(m_rms.group(1)), 3)})
+        if len(samples) >= 4:
+            diffs = []
+            for i in range(1, len(samples)):
+                diff = samples[i]["rms_db"] - samples[i - 1]["rms_db"]
+                diffs.append((samples[i]["t"], diff, samples[i]["rms_db"]))
+            sorted_diffs = sorted(diffs, key=lambda x: abs(x[1]), reverse=True)
+            chosen: list[tuple[float, float, float]] = []
+            for t, diff, rms in sorted_diffs:
+                if all(abs(t - prev[0]) >= min_gap for prev in chosen):
+                    chosen.append((t, diff, rms))
+                if len(chosen) >= 80:
+                    break
+            candidates = [
+                {"t": round(t, 3), "delta_db": round(diff, 3), "rms_db": round(rms, 3)}
+                for t, diff, rms in sorted(chosen, key=lambda x: x[0])
+            ]
+    except Exception as e:
+        log(f"BGM energy 分析失败，保留时长驱动切点: {e}")
+    payload = {
+        "policy": "ffmpeg_astats_rms_delta",
+        "window": window,
+        "min_gap": min_gap,
+        "sample_count": len(samples),
+        "candidate_count": len(candidates),
+        "samples_preview": samples[:20],
+        "candidates": candidates,
+    }
+    try:
+        (OUTPUT_DIR / "bgm_energy_cuts.json").write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+    except Exception as e:
+        log(f"bgm_energy_cuts.json 写入失败: {e}")
+    return payload
+
+
+def _snap_bgm_only_boundaries(
+    boundaries: list[float],
+    durations: list[float],
+    chars: list[int],
+    energy_cuts: list[dict],
+    scene_total: float,
+    min_shot: float,
+    cps: float,
+) -> tuple[list[float], list[dict]]:
+    """Snap inner scene boundaries to nearby BGM energy changes without hurting readability."""
+    if len(boundaries) <= 2 or not energy_cuts:
+        return boundaries, []
+    snap_window = float(os.environ.get("ADR_BGM_ONLY_SNAP_WINDOW", "0.65"))
+    max_cps = cps * float(os.environ.get("ADR_BGM_ONLY_CPS_TOLERANCE", "1.2"))
+    min_delta_db = float(os.environ.get("ADR_BGM_ONLY_MIN_DELTA_DB", "1.5"))
+    used: set[float] = set()
+    snapped = boundaries[:]
+    records: list[dict] = []
+
+    def _valid_interval(boundary_idx: int, candidate: float) -> bool:
+        left_scene_idx = boundary_idx - 1
+        right_scene_idx = boundary_idx
+        prev_b = snapped[boundary_idx - 1] if boundary_idx - 1 >= 0 else 0.0
+        next_b = snapped[boundary_idx + 1] if boundary_idx + 1 < len(snapped) else scene_total
+        left_dur = candidate - prev_b
+        right_dur = next_b - candidate
+        if left_dur < min_shot * 0.9 or right_dur < min_shot * 0.9:
+            return False
+        if chars[left_scene_idx] / max(left_dur, 0.1) > max_cps:
+            return False
+        if chars[right_scene_idx] / max(right_dur, 0.1) > max_cps:
+            return False
+        return True
+
+    for idx in range(1, len(boundaries) - 1):
+        original = snapped[idx]
+        ranked = sorted(
+            (
+                cut for cut in energy_cuts
+                if cut.get("t") not in used and abs(float(cut.get("t", 0)) - original) <= snap_window
+                and abs(float(cut.get("delta_db", 0))) >= min_delta_db
+            ),
+            key=lambda c: (-abs(float(c.get("delta_db", 0))), abs(float(c.get("t", 0)) - original)),
+        )
+        for cut in ranked:
+            candidate = float(cut.get("t"))
+            if _valid_interval(idx, candidate):
+                snapped[idx] = candidate
+                used.add(cut.get("t"))
+                records.append({
+                    "boundary_after_scene": idx,
+                    "from": round(original, 3),
+                    "to": round(candidate, 3),
+                    "delta": round(candidate - original, 3),
+                    "energy_delta_db": cut.get("delta_db"),
+                })
+                break
+    return snapped, records
+
+
 def step345_bgm_only_timeline(script: list[dict], bgm_path: str, voice_path: str) -> list[dict]:
-    """ADR/ADS BGM-only timeline: let BGM duration drive shot lengths instead of TTS."""
+    """ADR/ADS BGM-only timeline: let BGM duration and energy changes drive shot lengths."""
     bgm_dur = ffprobe_duration(bgm_path)
     if bgm_dur <= 0:
         raise RuntimeError("BGM-only 时间轴失败：BGM 时长无效")
@@ -2731,6 +2854,21 @@ def step345_bgm_only_timeline(script: list[dict], bgm_path: str, voice_path: str
         elif remaining > 0 and durations:
             durations[-1] += remaining
 
+    boundaries = [0.0]
+    for dur in durations:
+        boundaries.append(boundaries[-1] + float(dur))
+    boundaries[-1] = scene_total
+    energy_payload = _analyze_bgm_energy_cuts(bgm_path, target_total)
+    energy_cuts = energy_payload.get("candidates") if isinstance(energy_payload, dict) else []
+    snapped_boundaries, snap_records = _snap_bgm_only_boundaries(
+        boundaries, durations, chars, energy_cuts or [], scene_total, min_shot, cps
+    )
+    durations = [
+        max(1.0, snapped_boundaries[i + 1] - snapped_boundaries[i])
+        for i in range(len(script))
+    ]
+    snap_rate = (len(snap_records) / max(1, len(script) - 1)) if len(script) > 1 else 0.0
+
     cursor = 0.0
     timeline = []
     for i, (s, dur) in enumerate(zip(script, durations)):
@@ -2761,6 +2899,7 @@ def step345_bgm_only_timeline(script: list[dict], bgm_path: str, voice_path: str
     (OUTPUT_DIR / "bgm_only_timeline.json").write_text(
         json.dumps({
             "policy": "bgm_duration_driven",
+            "energy_policy": energy_payload.get("policy") if isinstance(energy_payload, dict) else None,
             "bgm_path": bgm_path,
             "bgm_duration": bgm_dur,
             "target_total": target_total,
@@ -2768,12 +2907,16 @@ def step345_bgm_only_timeline(script: list[dict], bgm_path: str, voice_path: str
             "cps_limit": cps,
             "min_shot": min_shot,
             "max_shot": max_shot,
+            "energy_candidate_count": len(energy_cuts or []),
+            "snap_count": len(snap_records),
+            "snap_rate": round(snap_rate, 4),
+            "snap_records": snap_records,
             "timeline": timeline,
             "created_at": datetime.now().isoformat(timespec="seconds"),
         }, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
-    tg(f"✅ BGM-driven 时间轴完成：BGM {bgm_dur:.1f}s → 成片目标 {target_total:.1f}s，{n} 镜，阅读上限 {cps:.1f}字/s")
+    tg(f"✅ BGM-driven 时间轴完成：BGM {bgm_dur:.1f}s → 成片目标 {target_total:.1f}s，{n} 镜，能量吸附 {len(snap_records)}/{max(1, n-1)}，阅读上限 {cps:.1f}字/s")
     return script
 
 
@@ -4599,10 +4742,18 @@ def _write_bgm_only_qa(final_path: str, script: list[dict]) -> dict:
         warnings.append(f"volumedetect failed: {e}")
 
     timeline_rows = []
+    snap_rate = 0.0
+    energy_candidate_count = 0
     if isinstance(timeline, dict) and isinstance(timeline.get("timeline"), list):
         timeline_rows = timeline.get("timeline") or []
+        snap_rate = float(timeline.get("snap_rate") or 0.0)
+        energy_candidate_count = int(timeline.get("energy_candidate_count") or 0)
     else:
         issues.append("bgm_only_timeline.json missing")
+    if energy_candidate_count <= 0:
+        warnings.append("BGM energy cut analysis produced no candidates")
+    elif len(timeline_rows) > 1 and snap_rate < 0.15:
+        warnings.append(f"BGM energy snap rate low: {snap_rate:.3f}")
 
     max_reading_cps = 0.0
     too_fast = []
@@ -4640,6 +4791,8 @@ def _write_bgm_only_qa(final_path: str, script: list[dict]) -> dict:
             "timeline_scene_count": len(timeline_rows),
             "max_reading_cps": round(max_reading_cps, 3),
             "cps_limit": cps_limit,
+            "energy_candidate_count": energy_candidate_count,
+            "snap_rate": round(snap_rate, 4),
             "bgm_exists": bgm.exists(),
             "silent_voice_exists": (OUTPUT_DIR / "silent_voice.mp3").exists(),
             "tts_master_absent": not (OUTPUT_DIR / "master_voice.mp3").exists() and not (OUTPUT_DIR / "dialogue_master.mp3").exists(),
