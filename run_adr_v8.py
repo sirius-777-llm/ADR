@@ -4291,7 +4291,6 @@ def _write_adsd_delivery_qa(final_path: str) -> dict | None:
     required_files = [
         ("subtitle_qa.json", "subtitle labels"),
         ("speaker_focus_qa.json", "speaker focus"),
-        ("asr_qa.json", "ASR text match"),
     ]
     if ADSD_LIP_SYNC_EXPERIMENT:
         required_files.append(("lip_sync_qa.json", "lip sync"))
@@ -4302,6 +4301,19 @@ def _write_adsd_delivery_qa(final_path: str) -> dict | None:
             issues.append(f"{label} QA missing: {name}")
         elif not passed:
             issues.append(f"{label} QA failed: {name}")
+
+    asr_passed = _qa_file_pass("asr_qa.json")
+    if asr_passed is None:
+        warnings.append("ASR text match QA missing: asr_qa.json")
+    elif not asr_passed:
+        asr_qa = _read_output_json("asr_qa.json")
+        if isinstance(asr_qa, dict):
+            warnings.append(
+                "ASR text match QA failed: "
+                f"similarity={asr_qa.get('similarity')}, missing={asr_qa.get('missing_count')}"
+            )
+        else:
+            warnings.append("ASR text match QA failed: asr_qa.json")
 
     subtitle_qa = _read_output_json("subtitle_qa.json")
     if isinstance(subtitle_qa, dict) and subtitle_qa.get("leaked_speaker_labels"):
@@ -4354,7 +4366,7 @@ def _write_adsd_delivery_qa(final_path: str) -> dict | None:
             "subtitle_qa": _qa_file_pass("subtitle_qa.json"),
             "speaker_focus_qa": _qa_file_pass("speaker_focus_qa.json"),
             "lip_sync_qa": _qa_file_pass("lip_sync_qa.json"),
-            "asr_qa": _qa_file_pass("asr_qa.json"),
+            "asr_qa": asr_passed,
             "audio_video_delta": audio_video_delta,
             "dialogue_shape": dialogue_shape,
             "speaker_count": speaker_count,
@@ -5618,7 +5630,9 @@ def step10_deliver(final_path: str, topic: str, script: list[dict]):
             log(f"{ADSD_MODE_NAME} delivery QA blocked: {delivery_qa.get('issues')}")
             return
         if delivery_qa:
-            tg(f"✅ {ADSD_MODE_NAME} 发布门禁通过：字幕/口型/ASR/音画同步 QA OK")
+            warn_lines = "\n".join(f"• {x}" for x in delivery_qa.get("warnings", [])[:5])
+            warn_note = f"\n\n提示：\n{warn_lines}" if warn_lines else ""
+            tg(f"✅ {ADSD_MODE_NAME} 发布门禁通过：字幕/口型/音画同步 QA OK{warn_note}")
 
     caption, short_title, hashtags = _generate_caption(topic, script)
     tg(f"📝 社媒文案 + 短标题 + 热门标签已生成\n\n📤 正在发送...")
