@@ -1916,7 +1916,7 @@ def _tts_turn_to_audio(turn: dict, idx: int, max_retries: int = 3) -> tuple[str,
     raise RuntimeError(f"ADSD TTS {idx+1} 重试失败：{last_err}")
 
 
-def _asr_verify_dialogue_audio(audio_path: str) -> dict | None:
+def _asr_verify_dialogue_audio(audio_path: str, label: str = "ADSD ASR", result_name: str = "speech_recognize_result.json") -> dict | None:
     """Upload ADSD master audio through Telegram and verify transcript with WeryAI ASR."""
     if os.environ.get("ADR_ADSD_SKIP_ASR", "").strip().lower() in ("1", "true", "yes", "on"):
         return None
@@ -1946,8 +1946,8 @@ def _asr_verify_dialogue_audio(audio_path: str) -> dict | None:
         task_id = r2.get("data", {}).get("task_id") or (r2.get("data", {}).get("task_ids") or [None])[0]
         if not task_id:
             raise RuntimeError(f"speech-recognize 无 task_id: {json.dumps(r2, ensure_ascii=False)[:200]}")
-        data = poll_task_status(task_id, "ADSD ASR", max_wait=240)
-        (OUTPUT_DIR / "speech_recognize_result.json").write_text(
+        data = poll_task_status(task_id, label, max_wait=240)
+        (OUTPUT_DIR / result_name).write_text(
             json.dumps(data, ensure_ascii=False, indent=2),
             encoding="utf-8",
         )
@@ -1956,6 +1956,48 @@ def _asr_verify_dialogue_audio(audio_path: str) -> dict | None:
         log(f"ADSD ASR 校验失败（不阻断）：{e}")
         tg(f"⚠️ ADSD ASR 校验失败，不阻断成片：{e}")
         return None
+
+
+def _asr_verify_dialogue_turns(script: list[dict]) -> dict | None:
+    """Fallback ASR: recognize each TTS turn independently, then concatenate text."""
+    parts = []
+    records = []
+    for i, turn in enumerate(script):
+        audio_path = turn.get("dialogue_audio_mp3") or turn.get("dialogue_audio")
+        if not audio_path or not os.path.exists(audio_path):
+            records.append({"turn": i + 1, "speaker": turn.get("speaker"), "ok": False, "error": "audio_missing"})
+            continue
+        data = _asr_verify_dialogue_audio(
+            audio_path,
+            label=f"ADSD ASR turn {i+1}",
+            result_name=f"speech_recognize_turn_{i+1:02d}.json",
+        )
+        text = (data or {}).get("speech_text", "")
+        if text:
+            parts.append(text)
+        records.append({
+            "turn": i + 1,
+            "speaker": turn.get("speaker"),
+            "ok": bool(text),
+            "speech_text": text,
+            "task_id": (data or {}).get("task_id"),
+            "task_status": (data or {}).get("task_status"),
+        })
+    if not parts:
+        return None
+    payload = {
+        "task_id": "per-turn-fallback",
+        "task_status": "succeed" if all(r.get("ok") for r in records) else "partial",
+        "speech_text": "".join(parts),
+        "fallback": "per_turn_asr",
+        "records": records,
+        "created_at": datetime.now().isoformat(timespec="seconds"),
+    }
+    (OUTPUT_DIR / "speech_recognize_result.json").write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    return payload
 
 
 def _normalize_cn_number_token(token: str) -> str:
@@ -2150,11 +2192,24 @@ def step2_dialogue_voice(script: list[dict]) -> str:
     if asr_data and asr_data.get("speech_text"):
         asr_qa = _write_adsd_asr_text_qa(script, asr_data)
         if asr_qa and not asr_qa.get("pass"):
-            samples = [m.get("chunk") for m in asr_qa.get("missing_chunks", [])[:5]]
-            tg(
-                f"⚠️ ADSD ASR 文本一致性需复查：similarity={asr_qa.get('similarity')}, "
-                f"missing={asr_qa.get('missing_count')}，样例：{', '.join(samples)}"
-            )
+            expected_chars = int(asr_qa.get("expected_chars") or 0)
+            recognized_chars = int(asr_qa.get("recognized_chars") or 0)
+            if expected_chars and recognized_chars < expected_chars * 0.65:
+                tg(
+                    f"⚠️ ADSD 主音轨 ASR 过短：{recognized_chars}/{expected_chars} 字，"
+                    "启动逐 turn ASR 兜底..."
+                )
+                turn_asr = _asr_verify_dialogue_turns(script)
+                if turn_asr and turn_asr.get("speech_text"):
+                    asr_qa = _write_adsd_asr_text_qa(script, turn_asr)
+            if asr_qa and not asr_qa.get("pass"):
+                samples = [m.get("chunk") for m in asr_qa.get("missing_chunks", [])[:5]]
+                tg(
+                    f"⚠️ ADSD ASR 文本一致性需复查：similarity={asr_qa.get('similarity')}, "
+                    f"missing={asr_qa.get('missing_count')}，样例：{', '.join(samples)}"
+                )
+            else:
+                tg(f"✅ ADSD ASR 文本一致性通过 similarity={asr_qa.get('similarity') if asr_qa else 'n/a'}")
         else:
             tg(f"✅ ADSD ASR 文本一致性通过 similarity={asr_qa.get('similarity') if asr_qa else 'n/a'}")
     tg(f"✅ {ADSD_MODE_NAME} 主音轨完成：{total_dur:.2f}s，时间轴 {timeline_path}")
