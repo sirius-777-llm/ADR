@@ -144,6 +144,11 @@ ADSD_ONSITE_POV_MODE = (
     or "--onsite-pov" in sys.argv
     or os.environ.get("ADR_ADSD_ONSITE_POV", "").strip().lower() in ("1", "true", "yes", "on")
 )
+ADSD_LIPS_CHANGE_REPAIR = (
+    "--adsd-lips-change" in sys.argv
+    or "--lips-change" in sys.argv
+    or os.environ.get("ADR_ADSD_LIPS_CHANGE", "").strip().lower() in ("1", "true", "yes", "on")
+)
 
 # --ads-reporter：把 ADS 的"拟现场第一人称记者感"并入 ADR 动态化。
 # 该模式自动开启 --with-motion，并约束剧本、分镜与 motion prompt；
