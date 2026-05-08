@@ -3401,6 +3401,91 @@ def _postprocess_lip_sync_segment(src_video: str, scene: dict, target_dur: float
     return os.path.exists(vid_path) and os.path.getsize(vid_path) > 10000
 
 
+def _lips_change_repair_segment(idx: int, scene: dict, target_dur: float) -> tuple[bool, dict]:
+    """Second-stage lips repair using WeryAI video-lips-change on an existing segment."""
+    info = {
+        "enabled": ADSD_LIPS_CHANGE_REPAIR,
+        "interface": "video-lips-change",
+        "turn": idx + 1,
+        "speaker": scene.get("speaker"),
+        "source_video": scene.get("vid_path"),
+        "source_audio": scene.get("dialogue_audio_mp3") or scene.get("dialogue_audio"),
+    }
+    if not ADSD_LIPS_CHANGE_REPAIR:
+        return False, info
+    source_video = scene.get("vid_path")
+    source_audio = scene.get("dialogue_audio_mp3") or scene.get("dialogue_audio")
+    if not source_video or not os.path.exists(source_video):
+        info.update({"pass": False, "reason": "missing_source_video"})
+        return False, info
+    if not source_audio or not os.path.exists(source_audio):
+        info.update({"pass": False, "reason": "missing_source_audio"})
+        return False, info
+    try:
+        video_url = _upload_to_weryai(source_video)
+        audio_url = _upload_to_weryai(source_audio)
+        task_id = None
+        response = None
+        for attempt in range(3):
+            try:
+                _wait_motion_submit_slot(f"lips-change {idx+1}")
+                response = req_post("/generation/video-lips-change", {
+                    "video_url": video_url,
+                    "audio_url": audio_url,
+                }, timeout=30)
+                task_id = response.get("data", {}).get("task_id") or (response.get("data", {}).get("task_ids") or [None])[0]
+                if task_id:
+                    break
+            except Exception as e:
+                if attempt < 2:
+                    wait_s = 5 * (attempt + 1)
+                    log(f"[lips-change {idx}] submit 失败（第 {attempt+1}/3 次）：{e}，{wait_s}s 后重试")
+                    time.sleep(wait_s)
+                    continue
+                raise
+        if not task_id:
+            info.update({"pass": False, "reason": "submit_without_task_id", "response": response})
+            return False, info
+        for iteration in range(181):
+            try:
+                s = req_get(f"/generation/{task_id}/status")
+                data = s.get("data", {})
+                st = data.get("task_status", "")
+                if iteration == 0 or iteration % 12 == 0 or st in ("succeed", "failed"):
+                    log(f"[lips-change {idx}] poll #{iteration+1}: {st}")
+                if st == "succeed":
+                    vid_url = _extract_video_url(data)
+                    if not vid_url:
+                        info.update({"pass": False, "task_id": task_id, "reason": "succeed_without_video_url"})
+                        return False, info
+                    raw_path = str(OUTPUT_DIR / f"lips_change_raw_{idx}.mp4")
+                    urllib.request.urlretrieve(vid_url, raw_path)
+                    ok = _postprocess_lip_sync_segment(raw_path, scene, target_dur)
+                    final_dur = ffprobe_duration(scene["vid_path"]) if ok else None
+                    info.update({
+                        "pass": ok,
+                        "task_id": task_id,
+                        "raw_video_path": raw_path,
+                        "final_segment_path": scene["vid_path"],
+                        "final_segment_duration": final_dur,
+                        "duration_delta": abs((final_dur or 0) - target_dur) if final_dur is not None else None,
+                        "clip_duration_match_pass": final_dur is not None and abs(final_dur - target_dur) <= 0.25,
+                    })
+                    return ok, info
+                if st == "failed":
+                    info.update({"pass": False, "task_id": task_id, "reason": "task_failed", "response": data})
+                    return False, info
+            except Exception as e:
+                if iteration in (0, 12, 60, 120):
+                    log(f"[lips-change {idx}] poll 异常: {e}")
+            time.sleep(5)
+        info.update({"pass": False, "task_id": task_id, "reason": "poll_timeout"})
+        return False, info
+    except Exception as e:
+        info.update({"pass": False, "reason": str(e)})
+        return False, info
+
+
 def _lip_sync_poll_download_and_process(idx: int, task_id: str, scene: dict, target_dur: float) -> tuple[bool, dict]:
     info = {
         "turn": idx + 1,
@@ -3513,6 +3598,13 @@ def _lip_sync_one_scene(idx: int, scene: dict, target_dur: float, aspect_ratio: 
                 "image_url": image_url,
                 "audio_url": audio_url,
             })
+            if ok and ADSD_LIPS_CHANGE_REPAIR:
+                repair_ok, repair_info = _lips_change_repair_segment(idx, scene, target_dur)
+                info["lips_change_repair"] = repair_info
+                ok = repair_ok
+                info["pass"] = ok
+                if ok:
+                    info["candidate"] = "almighty_reference_then_video_lips_change"
             attempts.append({k: v for k, v in info.items() if k not in ("image_url", "audio_url", "response")})
             if ok:
                 info["attempts"] = attempts
@@ -3554,8 +3646,9 @@ def step66_adsd_lip_sync(script: list[dict]):
     success_cnt = sum(1 for v in results.values() if v)
     qa = {
         "mode": ADSD_MODE_NAME,
-        "interface": "almighty-reference-to-video",
+        "interface": "almighty-reference-to-video+video-lips-change" if ADSD_LIPS_CHANGE_REPAIR else "almighty-reference-to-video",
         "model": "WERYDANCE_2_0",
+        "lips_change_repair_enabled": ADSD_LIPS_CHANGE_REPAIR,
         "onsite_pov_mode": ADSD_ONSITE_POV_MODE,
         "total": n,
         "success_count": success_cnt,
@@ -4071,6 +4164,7 @@ def _write_adsd_delivery_qa(final_path: str) -> dict | None:
         "mode": ADSD_MODE_NAME,
         "onsite_pov_mode": ADSD_ONSITE_POV_MODE,
         "lip_sync_experiment": ADSD_LIP_SYNC_EXPERIMENT,
+        "lips_change_repair_enabled": ADSD_LIPS_CHANGE_REPAIR,
         "final_path": final_path,
         "pass": len(issues) == 0,
         "issues": issues,
@@ -4083,6 +4177,7 @@ def _write_adsd_delivery_qa(final_path: str) -> dict | None:
             "audio_video_delta": audio_video_delta,
             "dialogue_shape": dialogue_shape,
             "speaker_count": speaker_count,
+            "lips_change_repair_enabled": ADSD_LIPS_CHANGE_REPAIR,
         },
         "created_at": datetime.now().isoformat(timespec="seconds"),
     }
