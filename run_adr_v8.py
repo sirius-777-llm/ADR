@@ -1522,11 +1522,16 @@ THUMBNAIL_ANCHOR: 封面视觉锚，用 4~6 个短语描述：主体、主色（
     tg(f"✅ 画面提示词就绪，情绪标签分布：{emotion_summary}")
 
     # 音色选择：根据主题和情绪由 LLM 推荐最合适的音色
+    voice_style_samples = " / ".join(
+        lines[i]
+        for i in sorted({0, len(lines) // 2, len(lines) - 1})
+        if 0 <= i < len(lines)
+    )
     voice_prompt = f"""你是纪录片音频导演。根据主题和情绪，从以下音色中选择最合适的一个。
 
 主题：{topic}
 情绪分布：{emotion_summary}
-台词风格：{lines[0]} / {lines[4]} / {lines[-1]}
+台词风格：{voice_style_samples}
 
 可选音色：
 • 古今先生 pingshu-c7c18f5a — 评书风格，沧桑厚重，适合古代史、传奇人物、战争
