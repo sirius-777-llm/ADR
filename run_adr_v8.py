@@ -2107,6 +2107,8 @@ def step2_dialogue_voice(script: list[dict]) -> str:
         timeline.append({
             "turn": i + 1,
             "speaker": turn.get("speaker"),
+            "dialogue_shape": turn.get("dialogue_shape"),
+            "speaker_count": turn.get("speaker_count"),
             "voice_id": turn.get("speaker_id"),
             "voice_name": turn.get("speaker_name"),
             "text": turn.get("text"),
