@@ -4694,7 +4694,6 @@ def _write_bgm_only_qa(final_path: str, script: list[dict]) -> dict:
     final = Path(final_path)
     bgm = OUTPUT_DIR / "bgm.mp3"
     timeline = _read_output_json("bgm_only_timeline.json")
-    cps_limit = float(os.environ.get("ADR_BGM_ONLY_CPS", "2.4"))
     min_shot = float(os.environ.get("ADR_BGM_ONLY_MIN_SHOT", "2.5"))
     max_shot = float(os.environ.get("ADR_BGM_ONLY_MAX_SHOT", "8.0"))
 
@@ -4705,6 +4704,8 @@ def _write_bgm_only_qa(final_path: str, script: list[dict]) -> dict:
     for forbidden in ("master_voice.mp3", "dialogue_master.mp3"):
         if (OUTPUT_DIR / forbidden).exists():
             issues.append(f"unexpected TTS master exists in BGM-only mode: {forbidden}")
+    if (OUTPUT_DIR / "subs.ass").exists():
+        issues.append("unexpected subtitle file exists in BGM-only mode: subs.ass")
 
     video_dur = audio_dur = final_dur = None
     mean_volume = None
@@ -4755,22 +4756,14 @@ def _write_bgm_only_qa(final_path: str, script: list[dict]) -> dict:
     elif len(timeline_rows) > 1 and snap_rate < 0.15:
         warnings.append(f"BGM energy snap rate low: {snap_rate:.3f}")
 
-    max_reading_cps = 0.0
-    too_fast = []
     bad_duration = []
     for row in timeline_rows:
         try:
             dur = float(row.get("duration") or 0)
-            reading_cps = float(row.get("reading_cps") or 0)
         except Exception:
             continue
-        max_reading_cps = max(max_reading_cps, reading_cps)
-        if reading_cps > cps_limit * 1.2:
-            too_fast.append(row.get("scene"))
         if dur < min_shot * 0.8 or dur > max_shot * 1.2:
             bad_duration.append(row.get("scene"))
-    if too_fast:
-        issues.append(f"subtitle reading speed too high at scenes: {too_fast[:8]}")
     if bad_duration:
         warnings.append(f"shot duration outside soft range at scenes: {bad_duration[:8]}")
 
@@ -4789,10 +4782,10 @@ def _write_bgm_only_qa(final_path: str, script: list[dict]) -> dict:
             "mean_volume_db": mean_volume,
             "scene_count": len(script),
             "timeline_scene_count": len(timeline_rows),
-            "max_reading_cps": round(max_reading_cps, 3),
-            "cps_limit": cps_limit,
             "energy_candidate_count": energy_candidate_count,
             "snap_rate": round(snap_rate, 4),
+            "subtitle_file_absent": not (OUTPUT_DIR / "subs.ass").exists(),
+            "subtitles_rendered": False,
             "bgm_exists": bgm.exists(),
             "silent_voice_exists": (OUTPUT_DIR / "silent_voice.mp3").exists(),
             "tts_master_absent": not (OUTPUT_DIR / "master_voice.mp3").exists() and not (OUTPUT_DIR / "dialogue_master.mp3").exists(),
@@ -4823,12 +4816,13 @@ def step9_render(raw_path: str, voice_path: str, bgm_path: str | None, ass_path:
         raise RuntimeError("ADR/ADS BGM-only 模式要求必须有 BGM；BGM 生成失败，阻断静音成片交付")
     render_audio_offset = 0.0 if (ADS_DIALOGUE_MODE and ADSD_LIP_SYNC_EXPERIMENT) else AUDIO_DELAY
     if NO_VOICE:
-        sync_note = "BGM-only 模式：无旁白 TTS，静音轨仅用于时间轴占位"
+        sync_note = "BGM-only 模式：无旁白 TTS、无字幕，静音轨仅用于时间轴占位"
         audio_note = "BGM-only ✓"
     else:
         sync_note = "口型同步模式：音频不延迟" if render_audio_offset == 0 else "画面 → +{:.1f}s 字幕 → +{:.1f}s 配音".format(SUB_DELAY, render_audio_offset)
         audio_note = "主音轨 ✓" + (" BGM ✓" if bgm_path else "")
-    tg(f"🎬 最终合成中... 视频轨 ✓ {audio_note} 字幕烧录 ✓\n{sync_note}")
+    subtitle_note = "无字幕 ✓" if NO_VOICE else "字幕烧录 ✓"
+    tg(f"🎬 最终合成中... 视频轨 ✓ {audio_note} {subtitle_note}\n{sync_note}")
 
     # ★ 音画同步修正：WERYDANCE 每段固定 5s × N，但配音总时长 ≠ 5N（往往更长）
     # 若配音比视频长 > 1s，整体用 setpts 拉伸视频到配音时长，避免 -shortest 截断尾部内容
@@ -4857,10 +4851,12 @@ def step9_render(raw_path: str, voice_path: str, bgm_path: str | None, ass_path:
 
     fmt_tag = ADSD_MODE_NAME if ADS_DIALOGUE_MODE else ("VDAR" if IS_VERTICAL else "HDAR")
     final_path = str(OUTPUT_DIR / f"ADR_V8_{fmt_tag}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.mp4")
-    ass_escaped = ass_path.replace("\\", "/").replace(":", "\\:")
+    ass_escaped = ass_path.replace("\\", "/").replace(":", "\\:") if ass_path else ""
+    vf_base = f"scale={VIDEO_W}:{VIDEO_H},setsar=1,setdar={ASPECT_RATIO},tpad=stop_mode=clone:stop_duration=1.5"
+    vf_with_subtitles = f"{vf_base},ass={ass_escaped}" if ass_path else vf_base
 
     # -itsoffset AUDIO_DELAY 延迟音频，画面先出
-    # 字幕已在 step8 中加了 SUB_DELAY 偏移，在画面和配音之间
+    # 非 BGM-only 字幕已在 step8 中加了 SUB_DELAY 偏移，在画面和配音之间
     offset = str(render_audio_offset)
 
     if bgm_path:
@@ -4871,7 +4867,7 @@ def step9_render(raw_path: str, voice_path: str, bgm_path: str | None, ass_path:
                 "-filter_complex", "[1:a]volume=0.85[aout]",
                 "-map", "0:v",
                 "-map", "[aout]",
-                "-vf", f"scale={VIDEO_W}:{VIDEO_H},setsar=1,setdar={ASPECT_RATIO},tpad=stop_mode=clone:stop_duration=1.5,ass={ass_escaped}",
+                "-vf", vf_base,
                 "-c:v", "libx264", "-crf", "20", "-preset", "medium",
                 "-c:a", "aac", "-b:a", "128k",
                 "-aspect", ASPECT_RATIO,
@@ -4888,7 +4884,7 @@ def step9_render(raw_path: str, voice_path: str, bgm_path: str | None, ass_path:
                 "[1:a]apad=pad_dur=1.5,volume=1.5[va];[2:a]volume=0.6[ba];[va][ba]amix=inputs=2:duration=first[aout]",
                 "-map", "0:v",
                 "-map", "[aout]",
-                "-vf", f"scale={VIDEO_W}:{VIDEO_H},setsar=1,setdar={ASPECT_RATIO},tpad=stop_mode=clone:stop_duration=1.5,ass={ass_escaped}",
+                "-vf", vf_with_subtitles,
                 "-c:v", "libx264", "-crf", "20", "-preset", "medium",
                 "-c:a", "aac", "-b:a", "128k",
                 "-aspect", ASPECT_RATIO,
@@ -4903,7 +4899,7 @@ def step9_render(raw_path: str, voice_path: str, bgm_path: str | None, ass_path:
             "-filter_complex", "[1:a]apad=pad_dur=1.5[aout]",
             "-map", "0:v",
             "-map", "[aout]",
-            "-vf", f"scale={VIDEO_W}:{VIDEO_H},setsar=1,setdar={ASPECT_RATIO},tpad=stop_mode=clone:stop_duration=1.5,ass={ass_escaped}",
+            "-vf", vf_with_subtitles,
             "-c:v", "libx264", "-crf", "20", "-preset", "medium",
             "-c:a", "aac", "-b:a", "128k",
             "-aspect", ASPECT_RATIO,
@@ -6383,7 +6379,12 @@ def main():
         elif WITH_MOTION:
             t = time.time(); step65_motion(script);                            timings["动态化 (WERYDANCE)"] = time.time() - t
         t = time.time(); raw_path   = step7_concat(script);                   timings["视频拼接"] = time.time() - t
-        t = time.time(); ass_path   = step8_subtitles(script);                timings["字幕生成"] = time.time() - t
+        if NO_VOICE:
+            ass_path = ""
+            timings["字幕生成"] = 0.0
+            tg("⏭️ BGM-only 模式：跳过字幕生成与字幕烧录")
+        else:
+            t = time.time(); ass_path = step8_subtitles(script);              timings["字幕生成"] = time.time() - t
         t = time.time(); final_path = step9_render(raw_path, voice_path, bgm_path, ass_path, topic); timings["最终合成"] = time.time() - t
         t = time.time(); step10_deliver(final_path, topic, script);           timings["TG 推送"] = time.time() - t
 
