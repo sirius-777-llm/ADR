@@ -124,12 +124,22 @@ SKIP_APPROVAL = "--with-approval" not in sys.argv
 if "--skip-approval" in sys.argv:
     SKIP_APPROVAL = True  # 显式 skip 也支持
 WITH_MOTION = "--with-motion" in sys.argv  # 每分镜走 WERYDANCE_2_0 生成带运动视频，~2x 时长 + $0.3/scene
-NO_VOICE    = "--no-voice" in sys.argv    # 跳过 Podcast / TTS，用静音轨占位；成片只有画面 + 字幕 + BGM
+BGM_ONLY_REQUESTED = (
+    "--bgm-only" in sys.argv
+    or "--no-tts" in sys.argv
+    or "--no-narration" in sys.argv
+    or "--no-voice" in sys.argv
+    or os.environ.get("ADR_BGM_ONLY", "").strip().lower() in ("1", "true", "yes", "on")
+)
 ADS_DIALOGUE_MODE = (
     "--ads-dialogue" in sys.argv
     or "--adsd" in sys.argv
     or os.environ.get("ADR_ADS_DIALOGUE", "").strip().lower() in ("1", "true", "yes", "on")
 )
+if ADS_DIALOGUE_MODE and BGM_ONLY_REQUESTED:
+    print("ERROR: --bgm-only/--no-tts/--no-voice 目前只支持 ADR/ADS，不支持 ADSD 对白模式。", file=sys.stderr)
+    sys.exit(2)
+NO_VOICE = BGM_ONLY_REQUESTED  # ADR/ADS: 跳过 Podcast/TTS，用静音时间轴占位；成片音轨只有 BGM
 ADSD_LIP_SYNC_EXPERIMENT = (
     "--adsd-lip-sync" in sys.argv
     or "--lip-sync" in sys.argv
@@ -4451,9 +4461,16 @@ def step9_render(raw_path: str, voice_path: str, bgm_path: str | None, ass_path:
             tg("❌ step9 BGM 最终兜底也失败：bgm.mp3 不存在或太小，视频将无BGM")
     else:
         tg(f"🎵 step9 BGM 正常传入: {bgm_path}")
+    if NO_VOICE and not bgm_path:
+        raise RuntimeError("ADR/ADS BGM-only 模式要求必须有 BGM；BGM 生成失败，阻断静音成片交付")
     render_audio_offset = 0.0 if (ADS_DIALOGUE_MODE and ADSD_LIP_SYNC_EXPERIMENT) else AUDIO_DELAY
-    sync_note = "口型同步模式：音频不延迟" if render_audio_offset == 0 else "画面 → +{:.1f}s 字幕 → +{:.1f}s 配音".format(SUB_DELAY, render_audio_offset)
-    tg("🎬 最终合成中... 视频轨 ✓ 主音轨 ✓" + (" BGM ✓" if bgm_path else "") + f" 字幕烧录 ✓\n{sync_note}")
+    if NO_VOICE:
+        sync_note = "BGM-only 模式：无旁白 TTS，静音轨仅用于时间轴占位"
+        audio_note = "BGM-only ✓"
+    else:
+        sync_note = "口型同步模式：音频不延迟" if render_audio_offset == 0 else "画面 → +{:.1f}s 字幕 → +{:.1f}s 配音".format(SUB_DELAY, render_audio_offset)
+        audio_note = "主音轨 ✓" + (" BGM ✓" if bgm_path else "")
+    tg(f"🎬 最终合成中... 视频轨 ✓ {audio_note} 字幕烧录 ✓\n{sync_note}")
 
     # ★ 音画同步修正：WERYDANCE 每段固定 5s × N，但配音总时长 ≠ 5N（往往更长）
     # 若配音比视频长 > 1s，整体用 setpts 拉伸视频到配音时长，避免 -shortest 截断尾部内容
@@ -4489,22 +4506,38 @@ def step9_render(raw_path: str, voice_path: str, bgm_path: str | None, ass_path:
     offset = str(render_audio_offset)
 
     if bgm_path:
-        ffmpeg(
-            "-i", raw_path,
-            "-itsoffset", offset, "-i", voice_path,
-            "-itsoffset", offset, "-i", bgm_path,
-            "-filter_complex",
-            "[1:a]apad=pad_dur=1.5,volume=1.5[va];[2:a]volume=0.6[ba];[va][ba]amix=inputs=2:duration=first[aout]",
-            "-map", "0:v",
-            "-map", "[aout]",
-            "-vf", f"scale={VIDEO_W}:{VIDEO_H},setsar=1,setdar={ASPECT_RATIO},tpad=stop_mode=clone:stop_duration=1.5,ass={ass_escaped}",
-            "-c:v", "libx264", "-crf", "20", "-preset", "medium",
-            "-c:a", "aac", "-b:a", "128k",
-            "-aspect", ASPECT_RATIO,
-            "-movflags", "+faststart",
-            "-shortest",
-            final_path,
-        )
+        if NO_VOICE:
+            ffmpeg(
+                "-i", raw_path,
+                "-itsoffset", offset, "-i", bgm_path,
+                "-filter_complex", "[1:a]volume=0.85[aout]",
+                "-map", "0:v",
+                "-map", "[aout]",
+                "-vf", f"scale={VIDEO_W}:{VIDEO_H},setsar=1,setdar={ASPECT_RATIO},tpad=stop_mode=clone:stop_duration=1.5,ass={ass_escaped}",
+                "-c:v", "libx264", "-crf", "20", "-preset", "medium",
+                "-c:a", "aac", "-b:a", "128k",
+                "-aspect", ASPECT_RATIO,
+                "-movflags", "+faststart",
+                "-shortest",
+                final_path,
+            )
+        else:
+            ffmpeg(
+                "-i", raw_path,
+                "-itsoffset", offset, "-i", voice_path,
+                "-itsoffset", offset, "-i", bgm_path,
+                "-filter_complex",
+                "[1:a]apad=pad_dur=1.5,volume=1.5[va];[2:a]volume=0.6[ba];[va][ba]amix=inputs=2:duration=first[aout]",
+                "-map", "0:v",
+                "-map", "[aout]",
+                "-vf", f"scale={VIDEO_W}:{VIDEO_H},setsar=1,setdar={ASPECT_RATIO},tpad=stop_mode=clone:stop_duration=1.5,ass={ass_escaped}",
+                "-c:v", "libx264", "-crf", "20", "-preset", "medium",
+                "-c:a", "aac", "-b:a", "128k",
+                "-aspect", ASPECT_RATIO,
+                "-movflags", "+faststart",
+                "-shortest",
+                final_path,
+            )
     else:
         ffmpeg(
             "-i", raw_path,
@@ -5940,7 +5973,7 @@ def main():
         t = time.time(); script, spk_id, spk_name = step1_script(topic);       timings["剧本+制片人准则+画面提示词+音色"] = time.time() - t
         if NO_VOICE:
             t = time.time()
-            # 生成静音轨占位：时长按中文 3 字/秒 估算；min 20s（避免太短），cap 300s
+            # ADR/ADS BGM-only: 不调用 Podcast/TTS；静音轨只用于复用现有时间轴算法。
             total_chars = sum(len(s["text"]) for s in script)
             est_dur = max(20.0, min(300.0, total_chars / 3.0 + len(script) * 0.5))  # 每句留 0.5s 间隔
             voice_path = str(OUTPUT_DIR / "silent_voice.mp3")
@@ -5951,8 +5984,8 @@ def main():
                 "-c:a", "libmp3lame", "-b:a", "64k",
                 voice_path,
             ], capture_output=True, timeout=30, check=True)
-            tg(f"🔇 无配音模式：已生成 {est_dur:.1f}s 静音轨（{total_chars} 字 ÷ 3/s + 间隔）")
-            timings["静音轨生成"] = time.time() - t
+            tg(f"🔇 ADR/ADS BGM-only：跳过旁白 TTS，生成 {est_dur:.1f}s 静音时间轴占位（最终音轨只保留 BGM）")
+            timings["BGM-only 静音时间轴"] = time.time() - t
         else:
             if ADS_DIALOGUE_MODE:
                 t = time.time(); voice_path = step2_dialogue_voice(script); timings["ADSD TTS 音轨+ASR"] = time.time() - t
