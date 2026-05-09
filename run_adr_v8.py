@@ -740,6 +740,27 @@ def ffprobe_duration(path: str) -> float:
     return float(out.decode().strip())
 
 
+def ffprobe_video_size(path: str) -> tuple[int | None, int | None]:
+    try:
+        out = subprocess.check_output(
+            [
+                "ffprobe", "-v", "error",
+                "-select_streams", "v:0",
+                "-show_entries", "stream=width,height",
+                "-of", "csv=s=x:p=0",
+                path,
+            ],
+            stderr=subprocess.DEVNULL,
+        )
+        text = out.decode().strip()
+        if "x" not in text:
+            return None, None
+        w, h = text.split("x", 1)
+        return int(w), int(h)
+    except Exception:
+        return None, None
+
+
 def ffmpeg(*args, timeout: int = 120):
     """ffmpeg 包装：默认 120s timeout 防止损坏图/坏文件让进程无限挂起。
     单图转视频段调用方应传 timeout=30；长视频合成传 timeout=600。"""
@@ -3035,6 +3056,69 @@ def _extract_video_url(data: dict) -> str | None:
     return None
 
 
+def _count_bands(flags: list[bool]) -> int:
+    bands = 0
+    in_band = False
+    for flag in flags:
+        if flag and not in_band:
+            bands += 1
+            in_band = True
+        elif not flag:
+            in_band = False
+    return bands
+
+
+def _detect_contact_sheet_like_image(path: str) -> dict:
+    """Detect obvious contact sheets/grids using full-width/height white separators."""
+    info = {
+        "path": path,
+        "contact_sheet": False,
+        "horizontal_separator_bands": 0,
+        "vertical_separator_bands": 0,
+    }
+    try:
+        w, h = 96, 54
+        raw = subprocess.check_output(
+            [
+                "ffmpeg", "-v", "error", "-i", path,
+                "-vf", f"scale={w}:{h},format=gray",
+                "-f", "rawvideo", "-",
+            ],
+            stderr=subprocess.DEVNULL,
+            timeout=20,
+        )
+        if len(raw) < w * h:
+            return info
+        pixels = list(raw[: w * h])
+        row_flags = []
+        row_uniform_flags = []
+        for y in range(h):
+            row = pixels[y * w:(y + 1) * w]
+            row_flags.append(sum(px >= 235 for px in row) / w >= 0.72)
+            mean = sum(row) / w
+            std = (sum((px - mean) ** 2 for px in row) / w) ** 0.5
+            row_uniform_flags.append(mean >= 110 and std <= 28)
+        col_flags = []
+        col_uniform_flags = []
+        for x in range(w):
+            col = [pixels[y * w + x] for y in range(h)]
+            col_flags.append(sum(px >= 235 for px in col) / h >= 0.72)
+            mean = sum(col) / h
+            std = (sum((px - mean) ** 2 for px in col) / h) ** 0.5
+            col_uniform_flags.append(mean >= 110 and std <= 28)
+        h_bands = max(_count_bands(row_flags), _count_bands(row_uniform_flags))
+        v_bands = max(_count_bands(col_flags), _count_bands(col_uniform_flags))
+        info.update({
+            "horizontal_separator_bands": h_bands,
+            "vertical_separator_bands": v_bands,
+            "contact_sheet": h_bands > 0 or v_bands > 0,
+        })
+        return info
+    except Exception as e:
+        info["error"] = str(e)
+        return info
+
+
 _weryai_upload_lock = threading.Lock()
 
 
@@ -3259,11 +3343,12 @@ def generate_storyboard_images_gpt_image2(script: list[dict], topic: str) -> boo
         "model": "GPT_IMAGE_2",
         "aspect_ratio": _aspect,
         "requested_count": n,
-        "batch_size": min(4, int(os.environ.get("ADR_GPT_IMAGE2_STORYBOARD_BATCH", "4"))),
+        "batch_size": min(4, int(os.environ.get("ADR_GPT_IMAGE2_STORYBOARD_BATCH", "1"))),
         "batch_poll_timeout_sec": float(os.environ.get("ADR_GPT_IMAGE2_STORYBOARD_POLL_MAX", "240")),
         "batches": [],
         "downloaded_count": 0,
         "rendered_count": 0,
+        "contact_sheet_checks": [],
         "issues": [],
         "created_at": datetime.now().isoformat(timespec="seconds"),
     }
@@ -3283,15 +3368,26 @@ def generate_storyboard_images_gpt_image2(script: list[dict], topic: str) -> boo
                     f"{local_i}. Visual prompt: {prompt[:900]}\n   Internal story beat: {text[:160]}"
                 )
             batch_count = len(batch_script)
-            storyboard_prompt = (
-                f"Create exactly {batch_count} separate storyboard images for scenes {start+1}-{end} "
-                f"of one short video about: {topic}.\n"
-                f"Aspect ratio: {ASPECT_RATIO}. This is batch {batch_idx}/{total_batches}; keep the same visual identity as a continuous series. "
-                "Do NOT create a collage, contact sheet, grid, comic page, or multi-panel image. Return separate standalone images, "
-                "one image per numbered scene. Keep consistent palette, lighting, era, costumes, and subject continuity. "
-                "No watermarks, no captions, no subtitles, no random text.\n\n"
-                "Scenes:\n" + "\n".join(scene_lines)
-            )
+            if batch_count == 1:
+                storyboard_prompt = (
+                    f"Create one single full-frame cinematic storyboard image for scene {start+1} "
+                    f"of one short video about: {topic}.\n"
+                    f"Aspect ratio: {ASPECT_RATIO}. This is scene {start+1}/{n}; keep the same visual identity as a continuous series. "
+                    "The entire output must be one uninterrupted shot, not a layout. "
+                    "Strictly forbidden: collage, contact sheet, grid, comic page, split screen, panels, frames, borders, white divider lines, captions, subtitles, watermarks, random text. "
+                    "Keep consistent palette, lighting, era, costumes, and subject continuity.\n\n"
+                    "Scene:\n" + "\n".join(scene_lines)
+                )
+            else:
+                storyboard_prompt = (
+                    f"Create exactly {batch_count} separate storyboard images for scenes {start+1}-{end} "
+                    f"of one short video about: {topic}.\n"
+                    f"Aspect ratio: {ASPECT_RATIO}. This is batch {batch_idx}/{total_batches}; keep the same visual identity as a continuous series. "
+                    "Do NOT create a collage, contact sheet, grid, comic page, split screen, panels, frames, borders, or multi-panel image. Return separate standalone full-frame images, "
+                    "one image per numbered scene. Keep consistent palette, lighting, era, costumes, and subject continuity. "
+                    "No watermarks, no captions, no subtitles, no random text.\n\n"
+                    "Scenes:\n" + "\n".join(scene_lines)
+                )
             if len(storyboard_prompt) > 18000:
                 storyboard_prompt = storyboard_prompt[:18000]
                 qa.setdefault("warnings", []).append(f"batch_{batch_idx}_prompt_truncated")
@@ -3341,6 +3437,12 @@ def generate_storyboard_images_gpt_image2(script: list[dict], topic: str) -> boo
             path = script[i]["img_path"]
             urllib.request.urlretrieve(url, path)
             qa["downloaded_count"] += 1
+            contact_check = _detect_contact_sheet_like_image(path)
+            contact_check["scene"] = i + 1
+            qa["contact_sheet_checks"].append(contact_check)
+            if contact_check.get("contact_sheet"):
+                qa["issues"].append(f"scene_{i+1}_contact_sheet_detected")
+                raise RuntimeError(f"scene {i+1} storyboard looks like a contact sheet/grid: {contact_check}")
             script[i]["storyboard_mode"] = True
             script[i]["storyboard_source_url"] = url
             _render_still_segment(script[i])
@@ -4626,7 +4728,11 @@ def step7_concat(script: list[dict]) -> str:
         "-c", "copy", raw_path,
     )
     dur = ffprobe_duration(raw_path)
-    tg(f"✅ 视频轨拼接完成，总时长 {dur:.2f}s，分辨率 {VIDEO_W}×{VIDEO_H}")
+    actual_w, actual_h = ffprobe_video_size(raw_path)
+    if actual_w and actual_h:
+        tg(f"✅ 视频轨拼接完成，总时长 {dur:.2f}s，分辨率 {actual_w}×{actual_h}")
+    else:
+        tg(f"✅ 视频轨拼接完成，总时长 {dur:.2f}s，分辨率未知（目标 {VIDEO_W}×{VIDEO_H}）")
     return raw_path
 
 
