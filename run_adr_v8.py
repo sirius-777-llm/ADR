@@ -493,6 +493,32 @@ def poll_task_status(task_id: str, label: str = "task", max_wait: float = 180.0)
     raise RuntimeError(f"{label} 轮询超时（{max_wait:.0f}s）")
 
 
+def poll_storyboard_task(task_id: str, label: str, max_wait: float) -> dict:
+    """GPT Image 2 storyboard poller with bounded wait and periodic progress logs."""
+    polls = max(1, int(max_wait / POLL_INTERVAL))
+    log_every = max(1, int(30 / POLL_INTERVAL))
+    last_status = ""
+    for i in range(polls):
+        time.sleep(POLL_INTERVAL)
+        try:
+            resp = req_get(f"/generation/{task_id}/status")
+            data = resp.get("data", {})
+            status = data.get("task_status", "")
+            last_status = status or last_status
+            if i == 0 or (i + 1) % log_every == 0 or status in ("succeed", "success", "fail", "failed", "canceled"):
+                elapsed = (i + 1) * POLL_INTERVAL
+                log(f"[{label}] poll #{i+1}: task_status={status or 'unknown'} elapsed={elapsed}s/{max_wait:.0f}s")
+            if status in ("succeed", "success"):
+                return data
+            if status in ("fail", "failed", "canceled"):
+                raise RuntimeError(f"{label} failed: {json.dumps(data, ensure_ascii=False)[:300]}")
+        except RuntimeError:
+            raise
+        except Exception as e:
+            log(f"{label} 轮询异常: {e}")
+    raise RuntimeError(f"{label} 轮询超时（{max_wait:.0f}s, last_status={last_status or 'unknown'}）")
+
+
 def chat(model: str, system: str, user: str, max_tokens: int = 4096, timeout: int = 180) -> str:
     """调用 WeryAI Chat Completion，返回回复文本。3 次重试防瞬断/限流/无 choices。
     timeout 默认 180s，对慢推理模型（GPT-5.4 / Claude Opus / DeepSeek-R1）需传更大值如 600s。"""
@@ -3180,7 +3206,7 @@ def generate_image(scene: dict, idx: int, _max_retries: int = 3) -> int:
 
 
 def generate_storyboard_images_gpt_image2(script: list[dict], topic: str) -> bool:
-    """Primary ADR/ADS image path: one GPT_IMAGE_2 request for the whole storyboard.
+    """Primary ADR/ADS image path: GPT_IMAGE_2 storyboard batches, old per-scene path as fallback.
 
     If anything is incomplete, return False so step6 can fall back to per-scene generation.
     """
@@ -3207,6 +3233,9 @@ def generate_storyboard_images_gpt_image2(script: list[dict], topic: str) -> boo
         "model": "GPT_IMAGE_2",
         "aspect_ratio": _aspect,
         "requested_count": n,
+        "batch_size": min(4, int(os.environ.get("ADR_GPT_IMAGE2_STORYBOARD_BATCH", "4"))),
+        "batch_poll_timeout_sec": float(os.environ.get("ADR_GPT_IMAGE2_STORYBOARD_POLL_MAX", "240")),
+        "batches": [],
         "downloaded_count": 0,
         "rendered_count": 0,
         "issues": [],
@@ -3214,47 +3243,69 @@ def generate_storyboard_images_gpt_image2(script: list[dict], topic: str) -> boo
     }
 
     try:
-        scene_lines = []
-        for i, scene in enumerate(script):
-            prompt = re.sub(r"\s+", " ", str(scene.get("prompt") or "")).strip()
-            text = re.sub(r"\s+", " ", str(scene.get("text") or "")).strip()
-            scene_lines.append(
-                f"{i+1}. Visual prompt: {prompt[:650]}\n   Internal story beat: {text[:160]}"
-            )
-        storyboard_prompt = (
-            f"Create exactly {n} separate storyboard images for one short video about: {topic}.\n"
-            f"Aspect ratio: {ASPECT_RATIO}. Do NOT create a collage, contact sheet, grid, comic page, or multi-panel image. "
-            "Return separate standalone images, one image per numbered scene. Keep consistent visual identity, palette, lighting, "
-            "era, costumes, and subject continuity across the whole series. No watermarks, no captions, no subtitles, no random text.\n\n"
-            "Scenes:\n" + "\n".join(scene_lines)
-        )
-        if len(storyboard_prompt) > 18000:
-            storyboard_prompt = storyboard_prompt[:18000]
-            qa["warnings"] = ["prompt_truncated_to_18000_chars"]
-
-        _wait_image_submit_slot("GPT Image 2 storyboard")
-        r = req_post("/generation/text-to-image", {
-            "model": "GPT_IMAGE_2",
-            "prompt": storyboard_prompt,
-            "aspect_ratio": _aspect,
-            "image_number": n,
-            **_extra,
-        }, timeout=45)
-        data_part = r.get("data", {})
-        task_ids = data_part.get("task_ids") or ([data_part["task_id"]] if data_part.get("task_id") else [])
-        if not task_ids:
-            qa["issues"].append(f"submit_without_task_id: {json.dumps(r, ensure_ascii=False)[:200]}")
-            raise RuntimeError("storyboard submit returned no task_id")
-        qa["task_ids"] = task_ids
-
         img_urls: list[str] = []
-        if len(task_ids) == 1:
-            data = poll(task_ids[0], "GPT Image 2 storyboard")
-            img_urls.extend(_extract_img_urls(data))
-        else:
+        batch_size = max(1, min(4, int(qa["batch_size"])))
+        total_batches = math.ceil(n / batch_size)
+        for batch_idx, start in enumerate(range(0, n, batch_size), start=1):
+            end = min(n, start + batch_size)
+            batch_script = script[start:end]
+            scene_lines = []
+            for local_i, scene in enumerate(batch_script, start=start + 1):
+                prompt = re.sub(r"\s+", " ", str(scene.get("prompt") or "")).strip()
+                text = re.sub(r"\s+", " ", str(scene.get("text") or "")).strip()
+                scene_lines.append(
+                    f"{local_i}. Visual prompt: {prompt[:900]}\n   Internal story beat: {text[:160]}"
+                )
+            batch_count = len(batch_script)
+            storyboard_prompt = (
+                f"Create exactly {batch_count} separate storyboard images for scenes {start+1}-{end} "
+                f"of one short video about: {topic}.\n"
+                f"Aspect ratio: {ASPECT_RATIO}. This is batch {batch_idx}/{total_batches}; keep the same visual identity as a continuous series. "
+                "Do NOT create a collage, contact sheet, grid, comic page, or multi-panel image. Return separate standalone images, "
+                "one image per numbered scene. Keep consistent palette, lighting, era, costumes, and subject continuity. "
+                "No watermarks, no captions, no subtitles, no random text.\n\n"
+                "Scenes:\n" + "\n".join(scene_lines)
+            )
+            if len(storyboard_prompt) > 18000:
+                storyboard_prompt = storyboard_prompt[:18000]
+                qa.setdefault("warnings", []).append(f"batch_{batch_idx}_prompt_truncated")
+
+            _wait_image_submit_slot(f"GPT Image 2 storyboard batch {batch_idx}/{total_batches}")
+            r = req_post("/generation/text-to-image", {
+                "model": "GPT_IMAGE_2",
+                "prompt": storyboard_prompt,
+                "aspect_ratio": _aspect,
+                "image_number": batch_count,
+                **_extra,
+            }, timeout=45)
+            data_part = r.get("data", {})
+            task_ids = data_part.get("task_ids") or ([data_part["task_id"]] if data_part.get("task_id") else [])
+            batch_qa = {
+                "batch": batch_idx,
+                "scene_start": start + 1,
+                "scene_end": end,
+                "requested_count": batch_count,
+                "task_ids": task_ids,
+                "image_count": 0,
+            }
+            qa["batches"].append(batch_qa)
+            if not task_ids:
+                qa["issues"].append(f"batch_{batch_idx}_submit_without_task_id: {json.dumps(r, ensure_ascii=False)[:200]}")
+                raise RuntimeError(f"storyboard batch {batch_idx} returned no task_id")
+
+            batch_urls: list[str] = []
             for j, tid in enumerate(task_ids):
-                data = poll(tid, f"GPT Image 2 storyboard {j+1}/{len(task_ids)}")
-                img_urls.extend(_extract_img_urls(data))
+                data = poll_storyboard_task(
+                    tid,
+                    f"GPT Image 2 storyboard batch {batch_idx}/{total_batches} task {j+1}/{len(task_ids)}",
+                    qa["batch_poll_timeout_sec"],
+                )
+                batch_urls.extend(_extract_img_urls(data))
+            batch_qa["image_count"] = len(batch_urls)
+            if len(batch_urls) < batch_count:
+                qa["issues"].append(f"batch_{batch_idx}_image_count_mismatch: got {len(batch_urls)}, need {batch_count}")
+                raise RuntimeError(f"storyboard batch {batch_idx} image count mismatch: got {len(batch_urls)}, need {batch_count}")
+            img_urls.extend(batch_urls[:batch_count])
 
         if len(img_urls) < n:
             qa["issues"].append(f"image_count_mismatch: got {len(img_urls)}, need {n}")
