@@ -4179,12 +4179,13 @@ def _build_annotated_storyboard_reference(scene: dict, idx: int, motion_prompt: 
         board = Image.new("RGB", (W, H), (246, 246, 242))
         draw = ImageDraw.Draw(board)
         margin = max(24, W // 44)
-        top_h = max(72, int(H * 0.085))
-        bottom_h = max(150, int(H * 0.18))
+        top_h = max(70, int(H * 0.075))
+        right_w = max(360, int(W * 0.22))
+        gutter = max(18, W // 110)
         frame_x1 = margin
         frame_y1 = top_h
-        frame_x2 = W - margin
-        frame_y2 = H - bottom_h - margin // 2
+        frame_x2 = W - margin - right_w - gutter
+        frame_y2 = H - margin
         frame_w = frame_x2 - frame_x1
         frame_h = frame_y2 - frame_y1
         src_copy = src.copy()
@@ -4198,30 +4199,63 @@ def _build_annotated_storyboard_reference(scene: dict, idx: int, motion_prompt: 
 
         title_font = _storyboard_font(max(26, W // 46), bold=True)
         label_font = _storyboard_font(max(20, W // 70), bold=True)
-        body_font = _storyboard_font(max(18, W // 86))
+        body_font = _storyboard_font(max(18, W // 92))
+        small_font = _storyboard_font(max(15, W // 120))
         slate = f"SHOT {idx + 1:02d} / {dur}s"
         draw.text((margin, max(14, top_h // 4)), slate, fill=(20, 20, 20), font=title_font)
-        draw.text((W - margin - int(W * 0.33), max(18, top_h // 3)), "ADR ANNOTATED STORYBOARD", fill=(80, 80, 80), font=label_font)
+        header = "ADR DIRECTOR BOARD"
+        hb = draw.textbbox((0, 0), header, font=label_font)
+        draw.text((W - margin - right_w + (right_w - (hb[2] - hb[0])) // 2, max(18, top_h // 3)), header, fill=(80, 80, 80), font=label_font)
 
-        panel_y = H - bottom_h
-        draw.rectangle([0, panel_y, W, H], fill=(18, 18, 18))
-        text_x = margin
-        y = panel_y + max(16, bottom_h // 11)
-        max_w = W - margin * 2
+        panel_x1 = W - margin - right_w
+        panel_x2 = W - margin
+        panel_y1 = top_h
+        panel_y2 = H - margin
+        draw.rounded_rectangle(
+            [panel_x1, panel_y1, panel_x2, panel_y2],
+            radius=max(10, W // 180),
+            fill=(18, 18, 18),
+        )
+        draw.text((panel_x1 + 24, panel_y1 + 24), "DIRECTOR NOTES", fill=(245, 245, 238), font=label_font)
+        draw.text((panel_x1 + 24, panel_y1 + 24 + max(26, W // 70)), "read as instructions, not final pixels", fill=(150, 150, 142), font=small_font)
+
+        text_x = panel_x1 + 24
+        y = panel_y1 + max(92, int(H * 0.085))
+        max_w = right_w - 48
         rows = [
-            ("ACTION", _short_board_text(scene.get("prompt") or scene.get("text"), 230)),
-            ("DIALOGUE/VO", _short_board_text(scene.get("text"), 170)),
-            ("CAMERA", _short_board_text(motion_prompt, 210)),
-            ("SFX", "period ambience, crowd bed, cloth and paper movement, natural room or street tone"),
+            ("ACTION", _short_board_text(scene.get("prompt") or scene.get("text"), 210), 3),
+            ("CAMERA", _short_board_text(motion_prompt, 210), 3),
+            ("DIALOGUE/VO", _short_board_text(scene.get("text"), 150), 2),
+            ("SFX", "period ambience, crowd bed, cloth and paper movement", 2),
         ]
-        line_h = max(25, int(bottom_h * 0.17))
-        for label, value in rows:
-            label_text = f"{label}: "
-            draw.text((text_x, y), label_text, fill=(235, 235, 235), font=label_font)
-            label_w = draw.textbbox((0, 0), label_text, font=label_font)[2]
-            lines = _wrap_board_text(draw, value, body_font, max_w - label_w, 1)
-            draw.text((text_x + label_w, y), lines[0] if lines else "", fill=(220, 220, 210), font=body_font)
-            y += line_h
+        card_gap = max(14, H // 90)
+        for label, value, max_lines in rows:
+            label_h = draw.textbbox((0, 0), label, font=label_font)[3]
+            lines = _wrap_board_text(draw, value, body_font, max_w, max_lines)
+            line_step = max(32, int(H * 0.028))
+            card_h = max(96, 28 + label_h + 12 + len(lines) * line_step + 18)
+            draw.rounded_rectangle(
+                [panel_x1 + 14, y, panel_x2 - 14, y + card_h],
+                radius=max(7, W // 260),
+                fill=(35, 35, 35),
+                outline=(78, 78, 72),
+                width=1,
+            )
+            draw.text((text_x, y + 14), label, fill=(245, 245, 238), font=label_font)
+            ty = y + 14 + max(28, int(H * 0.035))
+            for line in lines:
+                draw.text((text_x, ty), line, fill=(220, 220, 210), font=body_font)
+                ty += line_step
+            y += card_h + card_gap
+
+        footer = "VISUAL SOURCE = CENTER FRAME"
+        fb = draw.textbbox((0, 0), footer, font=small_font)
+        draw.text(
+            (panel_x1 + (right_w - (fb[2] - fb[0])) // 2, panel_y2 - max(36, H // 34)),
+            footer,
+            fill=(145, 145, 138),
+            font=small_font,
+        )
         board.save(out_path, "PNG", optimize=True)
         scene["annotated_storyboard_path"] = out_path
         return out_path
@@ -4236,9 +4270,10 @@ def _motion_reference_prompt(scene: dict, motion_prompt: str, safe_retry: bool =
         prefix = (
             "Read the uploaded annotated storyboard as a director board. Use the central frame as "
             "the visual reference for character identity, costume, era, composition, lighting, and "
-            "scene geography. Interpret arrows, camera labels, action notes, dialogue/VO, and SFX "
-            "as production instructions. The final video must be only the cinematic scene, not a "
-            "storyboard page; remove or ignore all borders, panels, labels, arrows, notes, and UI text. "
+            "scene geography. Treat the right-side director notes, arrows, camera labels, action notes, "
+            "dialogue/VO, and SFX as production instructions only. The final video must be only the "
+            "cinematic scene, not a storyboard page; remove or ignore all side panels, borders, labels, "
+            "arrows, notes, and UI text. "
         )
     else:
         prefix = (
