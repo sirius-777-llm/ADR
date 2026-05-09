@@ -158,6 +158,11 @@ GPT_IMAGE2_DIRECT_ANNOTATED_STORYBOARD = (
     or "--with-direct-annotated-storyboards" in sys.argv
     or os.environ.get("ADR_GPT_IMAGE2_DIRECT_ANNOTATED_STORYBOARD", "").strip().lower() in ("1", "true", "yes", "on")
 )
+GPT_IMAGE2_STORYBOARD_GRID = (
+    "--with-storyboard-grid" in sys.argv
+    or "--with-storyboard-grid-4k" in sys.argv
+    or os.environ.get("ADR_GPT_IMAGE2_STORYBOARD_GRID", "").strip().lower() in ("1", "true", "yes", "on")
+)
 ADSD_LIP_SYNC_EXPERIMENT = (
     "--adsd-lip-sync" in sys.argv
     or "--lip-sync" in sys.argv
@@ -3479,6 +3484,261 @@ def generate_storyboard_images_gpt_image2(script: list[dict], topic: str) -> boo
             log(f"storyboard_qa.json 写入失败: {e}")
 
 
+def _storyboard_grid_aspect() -> str:
+    override = os.environ.get("ADR_GPT_IMAGE2_STORYBOARD_GRID_ASPECT", "").strip()
+    if override:
+        return override
+    return "9:16(4k)" if IS_VERTICAL else "16:9(4k)"
+
+
+def _storyboard_grid_cols_rows(count: int) -> tuple[int, int]:
+    if IS_VERTICAL:
+        if count <= 4:
+            return 2, 2
+        if count <= 6:
+            return 2, 3
+        if count <= 9:
+            return 3, 3
+        return 4, 4
+    if count <= 4:
+        return 2, 2
+    if count <= 6:
+        return 3, 2
+    if count <= 9:
+        return 3, 3
+    return 4, 4
+
+
+def _storyboard_grid_prompt(batch_script: list[dict], start: int, total: int, topic: str, cols: int, rows: int, aspect: str) -> str:
+    lines = []
+    for local_i, scene in enumerate(batch_script, start=start + 1):
+        prompt = re.sub(r"\s+", " ", str(scene.get("prompt") or scene.get("text") or "")).strip()
+        text = re.sub(r"\s+", " ", str(scene.get("text") or "")).strip()
+        lines.append(f"{local_i:02d}. Visual: {prompt[:520]}\n    Beat: {text[:120]}")
+    count = len(batch_script)
+    return f"""Create one single {aspect} cinematic storyboard grid for a documentary sequence.
+Topic: {topic}
+Grid: exact {cols} columns x {rows} rows, {count} panels filled in reading order left-to-right then top-to-bottom. Leave unused panels empty only if the grid has more cells than requested.
+
+Panel rules:
+- Each panel is a clean cinematic frame, not a text card.
+- No shot numbers, no labels, no captions, no subtitles, no speech bubbles, no watermarks, no logos.
+- No arrows or motion graphics; motion will be handled separately.
+- Thin panel separators are acceptable, but keep every panel visually clean so it can be cropped into a standalone reference image.
+- Keep one consistent era, palette, lighting, location logic, costume design, and subject identity across all panels.
+- Each panel must be distinct and readable at 4K.
+
+Shot beats:
+{chr(10).join(lines)}"""
+
+
+def _qa_clean_storyboard_panel(path: Path) -> dict:
+    """Lightweight QA for cropped grid panels before they become motion references."""
+    qa = {
+        "panel_qa": "clean_ref_crop",
+        "pass": False,
+        "issues": [],
+    }
+    try:
+        from PIL import Image
+        im = Image.open(path).convert("L")
+        W, H = im.size
+        qa["width"] = W
+        qa["height"] = H
+        if W != VIDEO_W or H != VIDEO_H:
+            qa["issues"].append(f"size_mismatch:{W}x{H}")
+
+        pix = im.load()
+
+        def dark_ratio(box: tuple[int, int, int, int]) -> float:
+            x1, y1, x2, y2 = box
+            total = max(1, (x2 - x1) * (y2 - y1))
+            dark = 0
+            for y in range(y1, y2):
+                for x in range(x1, x2):
+                    if pix[x, y] < 8:
+                        dark += 1
+            return dark / total
+
+        def bright_ratio(box: tuple[int, int, int, int]) -> float:
+            x1, y1, x2, y2 = box
+            total = max(1, (x2 - x1) * (y2 - y1))
+            bright = 0
+            for y in range(y1, y2):
+                for x in range(x1, x2):
+                    if pix[x, y] > 238:
+                        bright += 1
+            return bright / total
+
+        edge_h = max(8, int(H * 0.025))
+        edge_w = max(8, int(W * 0.025))
+        qa["top_black_ratio"] = round(dark_ratio((0, 0, W, edge_h)), 4)
+        qa["bottom_black_ratio"] = round(dark_ratio((0, H - edge_h, W, H)), 4)
+        qa["left_black_ratio"] = round(dark_ratio((0, 0, edge_w, H)), 4)
+        qa["right_black_ratio"] = round(dark_ratio((W - edge_w, 0, W, H)), 4)
+        corner_box = (0, 0, int(W * 0.14), int(H * 0.16))
+        lower_center_box = (int(W * 0.25), int(H * 0.55), int(W * 0.75), H)
+        qa["top_left_bright_ratio"] = round(bright_ratio(corner_box), 4)
+        qa["lower_center_bright_ratio"] = round(bright_ratio(lower_center_box), 4)
+        if max(qa["top_black_ratio"], qa["bottom_black_ratio"]) > 0.42:
+            qa["issues"].append("possible_horizontal_letterbox")
+        if max(qa["left_black_ratio"], qa["right_black_ratio"]) > 0.42:
+            qa["issues"].append("possible_vertical_letterbox")
+        if qa["top_left_bright_ratio"] > 0.12:
+            qa["issues"].append("possible_shot_number_residue")
+        if qa["lower_center_bright_ratio"] > 0.003:
+            qa["issues"].append("possible_arrow_or_motion_marker_residue")
+        qa["pass"] = not qa["issues"]
+    except Exception as e:
+        qa["issues"].append(f"qa_exception:{e}")
+    return qa
+
+
+def _crop_storyboard_grid_panels(grid_path: Path, batch_script: list[dict], start: int, cols: int, rows: int, qa_batch: dict) -> None:
+    from PIL import Image, ImageOps
+    im = Image.open(grid_path).convert("RGB")
+    W, H = im.size
+    cell_w = W / cols
+    cell_h = H / rows
+    inset_x = max(10, int(cell_w * float(os.environ.get("ADR_STORYBOARD_GRID_CROP_INSET_X", "0.045"))))
+    inset_top = max(10, int(cell_h * float(os.environ.get("ADR_STORYBOARD_GRID_CROP_INSET_TOP", "0.13"))))
+    inset_bottom = max(10, int(cell_h * float(os.environ.get("ADR_STORYBOARD_GRID_CROP_INSET_BOTTOM", "0.045"))))
+    qa_batch["grid_width"] = W
+    qa_batch["grid_height"] = H
+    qa_batch["crop_inset_x"] = inset_x
+    qa_batch["crop_inset_top"] = inset_top
+    qa_batch["crop_inset_bottom"] = inset_bottom
+    qa_batch["panel_records"] = []
+    for local_i, scene in enumerate(batch_script):
+        panel_idx = local_i
+        row = panel_idx // cols
+        col = panel_idx % cols
+        left = int(col * cell_w) + inset_x
+        top = int(row * cell_h) + inset_top
+        right = int((col + 1) * cell_w) - inset_x
+        bottom = int((row + 1) * cell_h) - inset_bottom
+        crop = im.crop((left, top, right, bottom))
+        target_w = VIDEO_W
+        target_h = VIDEO_H
+        canvas = ImageOps.fit(crop, (target_w, target_h), method=Image.Resampling.LANCZOS, centering=(0.5, 0.5))
+        panel_path = Path(scene["img_path"])
+        canvas.save(panel_path, "JPEG", quality=94, optimize=True)
+        qa = _qa_clean_storyboard_panel(panel_path)
+        scene["storyboard_grid_mode"] = True
+        scene["storyboard_grid_source"] = str(grid_path)
+        scene["storyboard_grid_panel"] = start + local_i + 1
+        _render_still_segment(scene)
+        qa_batch["panel_records"].append({
+            "scene": start + local_i + 1,
+            "row": row + 1,
+            "col": col + 1,
+            "path": str(panel_path),
+            "bytes": panel_path.stat().st_size if panel_path.exists() else 0,
+            **qa,
+            "pass": panel_path.exists() and panel_path.stat().st_size > 10000 and qa.get("pass"),
+        })
+
+
+def generate_storyboard_grid_gpt_image2(script: list[dict], topic: str) -> bool:
+    """Optional 4K multi-shot storyboard grid path.
+
+    It uses GPT_IMAGE_2 to make 4K grids, then crops clean panels into normal img_N references.
+    This is a safer production primitive than feeding a whole grid directly into WERYDANCE.
+    """
+    if ADS_DIALOGUE_MODE or not GPT_IMAGE2_STORYBOARD_GRID:
+        return False
+    n = len(script)
+    if n <= 0:
+        return False
+    max_n = int(os.environ.get("ADR_GPT_IMAGE2_STORYBOARD_GRID_MAX", "32"))
+    if n > max_n:
+        log(f"GPT Image 2 storyboard grid 跳过：分镜数 {n} 超过上限 {max_n}")
+        return False
+    aspect = _storyboard_grid_aspect()
+    batch_size = max(1, min(16, int(os.environ.get("ADR_GPT_IMAGE2_STORYBOARD_GRID_BATCH", "16"))))
+    poll_max = float(os.environ.get("ADR_GPT_IMAGE2_STORYBOARD_GRID_POLL_MAX", "300"))
+    qa = {
+        "mode": "gpt_image2_storyboard_grid_4k",
+        "enabled": True,
+        "used": False,
+        "model": "GPT_IMAGE_2",
+        "aspect_ratio": aspect,
+        "batch_size": batch_size,
+        "requested_count": n,
+        "rendered_count": 0,
+        "batches": [],
+        "issues": [],
+        "policy": "4k_grid_generate_then_crop_clean_panels_for_motion_refs",
+        "created_at": datetime.now().isoformat(timespec="seconds"),
+    }
+    try:
+        for batch_idx, start in enumerate(range(0, n, batch_size), start=1):
+            end = min(n, start + batch_size)
+            batch_script = script[start:end]
+            cols, rows = _storyboard_grid_cols_rows(len(batch_script))
+            prompt = _storyboard_grid_prompt(batch_script, start, n, topic, cols, rows, aspect)
+            if len(prompt) > 18000:
+                prompt = prompt[:18000]
+                qa.setdefault("warnings", []).append(f"batch_{batch_idx}_prompt_truncated")
+            _wait_image_submit_slot(f"GPT Image 2 storyboard grid {batch_idx}")
+            r = req_post("/generation/text-to-image", {
+                "model": "GPT_IMAGE_2",
+                "prompt": prompt,
+                "aspect_ratio": aspect,
+                "image_number": 1,
+                "quality": "high",
+            }, timeout=45)
+            task_id = (r.get("data", {}).get("task_ids") or [r.get("data", {}).get("task_id") or None])[0]
+            batch_qa = {
+                "batch": batch_idx,
+                "scene_start": start + 1,
+                "scene_end": end,
+                "grid": f"{cols}x{rows}",
+                "task_id": task_id,
+                "pass": False,
+            }
+            qa["batches"].append(batch_qa)
+            if not task_id:
+                batch_qa["reason"] = f"submit_without_task_id: {json.dumps(r, ensure_ascii=False)[:200]}"
+                qa["issues"].append(f"batch_{batch_idx}_submit_without_task_id")
+                raise RuntimeError(batch_qa["reason"])
+            data = poll_storyboard_task(task_id, f"GPT Image 2 storyboard grid {batch_idx}", poll_max)
+            urls = _extract_img_urls(data)
+            if not urls:
+                batch_qa["reason"] = "succeed_without_image_url"
+                qa["issues"].append(f"batch_{batch_idx}_without_image_url")
+                raise RuntimeError(batch_qa["reason"])
+            grid_path = OUTPUT_DIR / f"storyboard_grid_{batch_idx:02d}.png"
+            urllib.request.urlretrieve(urls[0], grid_path)
+            batch_qa["grid_path"] = str(grid_path)
+            batch_qa["grid_bytes"] = grid_path.stat().st_size if grid_path.exists() else 0
+            _crop_storyboard_grid_panels(grid_path, batch_script, start, cols, rows, batch_qa)
+            rendered = sum(1 for r in batch_qa.get("panel_records", []) if r.get("pass"))
+            qa["rendered_count"] += rendered
+            batch_qa["pass"] = rendered == len(batch_script)
+            if not batch_qa["pass"]:
+                qa["issues"].append(f"batch_{batch_idx}_crop_incomplete")
+                raise RuntimeError(f"storyboard grid batch {batch_idx} crop incomplete")
+        qa["used"] = True
+        qa["pass"] = qa["rendered_count"] == n
+        tg(f"🧩 GPT Image 2 4K storyboard grid 成功：{qa['rendered_count']}/{n} 格已裁成 clean refs")
+        return qa["pass"]
+    except Exception as e:
+        qa["pass"] = False
+        qa["issues"].append(str(e))
+        log(f"GPT Image 2 storyboard grid 失败，回退普通图片路径：{e}")
+        tg(f"⚠️ GPT Image 2 4K storyboard grid 失败，自动回退普通图片路径：{str(e)[:160]}")
+        return False
+    finally:
+        try:
+            (OUTPUT_DIR / "storyboard_grid_qa.json").write_text(
+                json.dumps(qa, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+        except Exception as e:
+            log(f"storyboard_grid_qa.json 写入失败: {e}")
+
+
 def _gpt_image2_direct_annotated_aspect() -> str:
     override = os.environ.get("ADR_GPT_IMAGE2_DIRECT_ANNOTATED_ASPECT", "").strip()
     if override:
@@ -3760,7 +4020,7 @@ def step6_parallel(script: list[dict], topic: str, pregenerated_bgm_path: str | 
 
         completed = {}  # idx -> True
         approval_sent = set()  # 已推过审批的 idx，避免兜底重发
-        storyboard_used = generate_storyboard_images_gpt_image2(script, topic)
+        storyboard_used = generate_storyboard_grid_gpt_image2(script, topic) or generate_storyboard_images_gpt_image2(script, topic)
         if storyboard_used:
             completed = {i: True for i in range(n)}
             if not SKIP_APPROVAL:
