@@ -3326,7 +3326,7 @@ def step6_parallel(script: list[dict], topic: str, pregenerated_bgm_path: str | 
         # ── 审批流程 ────────────────────────────────────────────────────
         if SKIP_APPROVAL:
             # ★ v0.2 智能异常检测：用 Gemini Vision 批量审 22 张图
-            # 异常张（文字错/风格离群/内容偏离）单独推审批；其他自动通过
+            # 免审核模式下只提醒和记录，不进入人工审批等待；人工审批只由 --with-approval 启用。
             tg(f"🔍 智能异常检测：Vision 扫描 {n} 张图...")
             anomaly_idxs = _llm_check_scenes_anomalies(script)
             qa_path = OUTPUT_DIR / "scene_qa.json"
@@ -3335,57 +3335,21 @@ def step6_parallel(script: list[dict], topic: str, pregenerated_bgm_path: str | 
                 "total": n,
                 "anomaly_indices": sorted(int(i) for i in anomaly_idxs),
                 "anomaly_scene_numbers": sorted(int(i) + 1 for i in anomaly_idxs),
-                "policy": "auto_approve_adsd" if ADS_DIALOGUE_MODE else "manual_review_anomalies",
+                "policy": "warn_only_skip_approval",
                 "created_at": datetime.now().isoformat(timespec="seconds"),
             }
             try:
                 qa_path.write_text(json.dumps(qa_payload, ensure_ascii=False, indent=2), encoding="utf-8")
             except Exception as e:
                 log(f"scene_qa.json 写入失败: {e}")
-            if ADS_DIALOGUE_MODE:
-                if anomaly_idxs:
-                    tg(
-                        f"⚠️ {ADSD_MODE_NAME} 场景 QA：Vision 标记 {len(anomaly_idxs)} 张疑似异常 "
-                        f"{sorted(i+1 for i in anomaly_idxs)}，已记录 {qa_path.name} 并自动放行"
-                    )
-                else:
-                    tg(f"✅ {ADSD_MODE_NAME} 场景 QA：全部 {n} 张通过，自动进入合成阶段")
-                anomaly_idxs = set()
             if anomaly_idxs:
-                tg(f"⚠️ 异常检测：{len(anomaly_idxs)} 张需要你审核：{sorted(i+1 for i in anomaly_idxs)}\n（其他 {n - len(anomaly_idxs)} 张自动通过）")
-                # 推送异常张到 Telegram
-                for idx in sorted(anomaly_idxs):
-                    _send_for_approval(script[idx]["img_path"], idx, script[idx]["text"])
-                # 等异常张审批（5min 超时自动通过）
-                approved_anomalies = set()
-                t0 = time.time()
-                while len(approved_anomalies) < len(anomaly_idxs) and time.time() - t0 < 320:
-                    for idx in anomaly_idxs:
-                        if idx in approved_anomalies:
-                            continue
-                        if (APPROVAL_DIR / f"{idx}.approved").exists():
-                            approved_anomalies.add(idx)
-                            tg(f"✅ 图 {idx+1} 通过 ({len(approved_anomalies)}/{len(anomaly_idxs)})")
-                        elif (APPROVAL_DIR / f"{idx}.rejected").exists():
-                            # 拒绝 → 用相邻图顶替（兜底逻辑）
-                            import shutil
-                            for offset in range(1, n):
-                                for cand in (idx - offset, idx + offset):
-                                    if 0 <= cand < n and cand not in anomaly_idxs:
-                                        shutil.copy(str(OUTPUT_DIR / f"img_{cand}.jpg"), str(OUTPUT_DIR / f"img_{idx}.jpg"))
-                                        tg(f"🔄 图 {idx+1} 被拒，复用图 {cand+1} 顶替")
-                                        approved_anomalies.add(idx)
-                                        break
-                                if idx in approved_anomalies:
-                                    break
-                    time.sleep(2)
-                # 超时自动通过剩余
-                for idx in anomaly_idxs:
-                    if idx not in approved_anomalies:
-                        approved_anomalies.add(idx)
-                tg(f"✅ 异常张审核完成，进入合成阶段")
+                mode_name = ADSD_MODE_NAME if ADS_DIALOGUE_MODE else ("VDAR" if IS_VERTICAL else "HDAR")
+                tg(
+                    f"⚠️ {mode_name} 场景 QA 提醒：Vision 标记 {len(anomaly_idxs)} 张疑似异常 "
+                    f"{sorted(i+1 for i in anomaly_idxs)}，已记录 {qa_path.name}；免审核模式不等待人工确认，继续合成"
+                )
             else:
-                tg(f"⏭️ 全部 {n} 张通过智能审核，自动进入合成阶段")
+                tg(f"✅ 场景 QA：全部 {n} 张未发现严重异常，自动进入合成阶段")
             bgm_path = pregenerated_bgm_path
             if bgm_path:
                 tg(f"🎵 BGM-driven 复用 BGM: {bgm_path}")
@@ -5546,12 +5510,12 @@ def _llm_check_scenes_anomalies(script: list) -> set:
                     "role": "user",
                     "content": [
                         {"type": "text", "text": (
-                            f"这是一张抽卡黄历视频的分镜图（实体卡片样式，金/朱砂边 + 卡名 + 中央插画）。\n"
+                            f"这是一张自动生成短视频的分镜图，题材可能是历史、文化、现实寓言、黄历或纯画面 BGM 视频。\n"
                             f"对应台词：\"{scene['text']}\"\n\n"
                             f"请保守宽容地判断这张图是否有以下两类**严重**异常：\n"
                             "1. 文字明显错误：图里渲染的中文字/数字/日期严重错乱（出现伪汉字、不存在的成语、错字明显）\n"
-                            "2. 内容严重偏离：图主体物件和台词主题完全无关（如台词说'忌动土'但画了红喜字喜庆场景）\n\n"
-                            "宽容原则：色调差异、角度差异、风格细微差异都算正常，不要标记。\n"
+                            "2. 内容严重偏离：画面主体和台词/主题完全无关，或出现明显时代/文化错位（如晚清题材出现现代手机、古代中国题材画成欧洲宫廷）\n\n"
+                            "宽容原则：色调差异、镜头角度差异、风格细微差异、抽象隐喻、无字幕画面都算正常，不要标记。\n"
                             "只回答 OK 或 ANOMALY 一个词，不加解释。"
                         )},
                         {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}}
