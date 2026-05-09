@@ -144,6 +144,10 @@ GPT_IMAGE2_STORYBOARD = (
     "--no-storyboard" not in sys.argv
     and os.environ.get("ADR_GPT_IMAGE2_STORYBOARD", "1").strip().lower() not in ("0", "false", "no", "off")
 )
+STORYBOARD_REFERENCE_MOTION = (
+    "--no-reference-motion" not in sys.argv
+    and os.environ.get("ADR_STORYBOARD_REFERENCE_MOTION", "1").strip().lower() not in ("0", "false", "no", "off")
+)
 ADSD_LIP_SYNC_EXPERIMENT = (
     "--adsd-lip-sync" in sys.argv
     or "--lip-sync" in sys.argv
@@ -390,7 +394,7 @@ def _wait_motion_submit_slot(label: str = ""):
         elapsed = time.time() - _motion_last_submit_ts
         wait_s = max(0.0, MOTION_SUBMIT_MIN_INTERVAL - elapsed)
         if wait_s > 0:
-            log(f"{label} text-to-video submit 节流等待 {wait_s:.1f}s")
+            log(f"{label} WERYDANCE submit 节流等待 {wait_s:.1f}s")
             time.sleep(wait_s)
         _motion_last_submit_ts = time.time()
 
@@ -3034,10 +3038,32 @@ def _extract_video_url(data: dict) -> str | None:
 _weryai_upload_lock = threading.Lock()
 
 
+def _guess_upload_mime(file_path: str) -> str:
+    """Prefer file signatures over extensions because WeryAI image URLs may save PNG bytes as .jpg."""
+    try:
+        with open(file_path, "rb") as f:
+            head = f.read(16)
+        if head.startswith(b"\x89PNG\r\n\x1a\n"):
+            return "image/png"
+        if head.startswith(b"\xff\xd8\xff"):
+            return "image/jpeg"
+        if head.startswith(b"RIFF") and head[8:12] == b"WEBP":
+            return "image/webp"
+        if head[4:8] == b"ftyp":
+            return "video/mp4"
+        if head.startswith(b"ID3") or head.startswith(b"\xff\xfb"):
+            return "audio/mpeg"
+        if head.startswith(b"RIFF") and head[8:12] == b"WAVE":
+            return "audio/wav"
+    except Exception:
+        pass
+    import mimetypes
+    return mimetypes.guess_type(file_path)[0] or "application/octet-stream"
+
+
 def _upload_to_weryai(file_path: str) -> str:
     """Upload a local media file to WeryAI official storage and return its URL."""
-    import mimetypes
-    mime = mimetypes.guess_type(file_path)[0] or "application/octet-stream"
+    mime = _guess_upload_mime(file_path)
     last_err = None
     for attempt in range(3):
         try:
@@ -3767,10 +3793,71 @@ Output strict JSON array of {n} strings:
 
 
 _motion_tasks_lock = threading.Lock()
+_motion_qa_lock = threading.Lock()
 
 
 def _motion_tasks_file() -> Path:
     return OUTPUT_DIR / "motion_tasks.json"
+
+
+def _motion_qa_file() -> Path:
+    return OUTPUT_DIR / "motion_qa.json"
+
+
+def _append_motion_qa(record: dict) -> None:
+    """Append one motion-generation QA event without racing parallel workers."""
+    payload = {
+        "created_at": datetime.now().isoformat(timespec="seconds"),
+        "storyboard_reference_motion_enabled": STORYBOARD_REFERENCE_MOTION,
+        "records": [],
+    }
+    with _motion_qa_lock:
+        p = _motion_qa_file()
+        if p.exists():
+            try:
+                loaded = json.loads(p.read_text(encoding="utf-8"))
+                if isinstance(loaded, dict):
+                    payload.update(loaded)
+                    payload.setdefault("records", [])
+            except Exception:
+                payload.setdefault("warnings", []).append("previous_motion_qa_unreadable")
+        record = dict(record)
+        record.setdefault("timestamp", datetime.now().isoformat(timespec="seconds"))
+        payload["records"].append(record)
+        p.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _finalize_motion_qa(total: int, success_count: int) -> None:
+    with _motion_qa_lock:
+        p = _motion_qa_file()
+        payload = {
+            "created_at": datetime.now().isoformat(timespec="seconds"),
+            "storyboard_reference_motion_enabled": STORYBOARD_REFERENCE_MOTION,
+            "records": [],
+        }
+        if p.exists():
+            try:
+                loaded = json.loads(p.read_text(encoding="utf-8"))
+                if isinstance(loaded, dict):
+                    payload.update(loaded)
+                    payload.setdefault("records", [])
+            except Exception:
+                payload.setdefault("warnings", []).append("motion_qa_finalize_read_failed")
+        records = payload.get("records") or []
+        reference_success = sum(1 for r in records if r.get("path") == "image-to-video" and r.get("pass"))
+        text_success = sum(1 for r in records if r.get("path") == "text-to-video" and r.get("pass"))
+        payload.update({
+            "total": total,
+            "success_count": success_count,
+            "success_rate": round(success_count / max(total, 1), 4),
+            "reference_success_count": reference_success,
+            "text_fallback_success_count": text_success,
+            "static_fallback_count": max(0, total - success_count),
+            "pass": success_count >= max(1, math.ceil(total * 0.7)),
+            "policy": "storyboard_image_to_video_first_text_to_video_fallback_static_last",
+            "finalized_at": datetime.now().isoformat(timespec="seconds"),
+        })
+        p.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
 _lip_sync_tasks_lock = threading.Lock()
@@ -3846,12 +3933,7 @@ def _motion_poll_and_download(idx: int, task_id: str, vid_path: str) -> bool:
             continue
         st = s.get("data", {}).get("task_status", "")
         if st == "succeed":
-            videos = (
-                s.get("data", {}).get("videos")
-                or s.get("data", {}).get("task_result", {}).get("videos")
-                or []
-            )
-            vid_url = videos[0] if videos else ""
+            vid_url = _extract_video_url(s.get("data", {}))
             if not vid_url:
                 log(f"[motion {idx}] 成功但无视频 URL")
                 return False
@@ -3904,6 +3986,112 @@ def _build_motion_video_prompt(scene: dict, motion_prompt: str, safe_retry: bool
     return f"{scene_prompt}. Camera motion: {motion_prompt}" if scene_prompt else motion_prompt
 
 
+def _motion_reference_prompt(scene: dict, motion_prompt: str, safe_retry: bool = False) -> str:
+    base = _build_motion_video_prompt(scene, motion_prompt, safe_retry=safe_retry)
+    prefix = (
+        "Use the uploaded storyboard frame as the strict visual reference for character identity, "
+        "costume, era, composition, lighting, and scene geography. Animate only plausible motion "
+        "within that frame; do not redesign the shot. "
+    )
+    suffix = (
+        " No subtitles, no captions, no text overlay, no watermark, no logo. "
+        "Preserve faces, clothing, props, color palette, and historical setting from the reference image."
+    )
+    return (prefix + base + suffix)[:2000]
+
+
+def _try_motion_reference_video(idx: int, scene: dict, motion_prompt: str, aspect_ratio: str, dur: int, safe_retry: bool = False) -> tuple[bool, bool]:
+    """Try storyboard image-to-video first.
+
+    Returns (handled, ok). handled=True means a reference-video task was submitted or conclusively attempted;
+    handled=False lets the caller use the legacy text-to-video path without treating this as a failure.
+    """
+    if ADS_DIALOGUE_MODE or not STORYBOARD_REFERENCE_MOTION:
+        return False, False
+    img_path = scene.get("img_path")
+    if not img_path or not os.path.exists(img_path):
+        _append_motion_qa({
+            "turn": idx + 1,
+            "path": "image-to-video",
+            "pass": False,
+            "fallback_to_text": True,
+            "reason": "missing_storyboard_image",
+        })
+        return False, False
+
+    full_prompt = _motion_reference_prompt(scene, motion_prompt, safe_retry=safe_retry)
+    try:
+        image_url = _upload_to_weryai(img_path)
+    except Exception as e:
+        log(f"[motion {idx}] storyboard image upload 失败，回退 text-to-video: {e}")
+        _append_motion_qa({
+            "turn": idx + 1,
+            "path": "image-to-video",
+            "pass": False,
+            "fallback_to_text": True,
+            "reason": f"upload_failed: {e}",
+        })
+        return False, False
+
+    task_id = None
+    response = None
+    for submit_attempt in range(3):
+        try:
+            _wait_motion_submit_slot(f"motion reference {idx+1}")
+            response = req_post("/generation/image-to-video", {
+                "model": "WERYDANCE_2_0",
+                "image": image_url,
+                "prompt": full_prompt,
+                "negative_prompt": "no subtitles, no text overlay, no watermark, no captions, no burned-in text, no logo",
+                "duration": dur,
+                "aspect_ratio": aspect_ratio,
+                "resolution": "1080p",
+                "generate_audio": "false",
+            }, timeout=30)
+            task_id = response.get("data", {}).get("task_id") or (response.get("data", {}).get("task_ids") or [None])[0]
+            if task_id:
+                break
+        except Exception as e:
+            if submit_attempt < 2:
+                wait_s = 5 * (submit_attempt + 1)
+                log(f"[motion {idx}] image-to-video submit 失败（第 {submit_attempt+1}/3 次）：{e}，{wait_s}s 后重试")
+                time.sleep(wait_s)
+                continue
+            response = {"exception": str(e)}
+
+    if not task_id:
+        log(f"[motion {idx}] image-to-video 无 task_id，回退 text-to-video: {response}")
+        _append_motion_qa({
+            "turn": idx + 1,
+            "path": "image-to-video",
+            "pass": False,
+            "fallback_to_text": True,
+            "reason": "submit_without_task_id",
+            "response": response,
+        })
+        return False, False
+
+    _save_motion_task(idx, task_id)
+    ok = _motion_poll_and_download(idx, task_id, scene["vid_path"])
+    timed_out_or_reusable = str(idx) in _load_motion_tasks()
+    _append_motion_qa({
+        "turn": idx + 1,
+        "path": "image-to-video",
+        "model": "WERYDANCE_2_0",
+        "task_id": task_id,
+        "pass": ok,
+        "fallback_to_text": (not ok and not timed_out_or_reusable),
+        "timed_out_or_reusable": timed_out_or_reusable,
+        "storyboard_mode": bool(scene.get("storyboard_mode")),
+        "image_path": img_path,
+        "duration": dur,
+        "aspect_ratio": aspect_ratio,
+    })
+    if not ok and timed_out_or_reusable:
+        return True, False
+    return ok, ok
+
+
 def _motion_one_scene(idx: int, scene: dict, motion_prompt: str, aspect_ratio: str, safe_retry: bool = False) -> bool:
     """对单个 scene 调 WERYDANCE_2_0 生成 motion 版 seg_N.mp4；成功返回 True"""
     img_path = scene["img_path"]
@@ -3935,7 +4123,16 @@ def _motion_one_scene(idx: int, scene: dict, motion_prompt: str, aspect_ratio: s
             log(f"[motion {idx}] 查历史任务失败: {e}，走新提交")
 
     try:
-        # Phase 1 改造：直接 text-to-video（Seedance 2.0），绕过"照片晃动"，走真正摄影机运动
+        handled_reference, reference_ok = _try_motion_reference_video(
+            idx, scene, motion_prompt, aspect_ratio, dur, safe_retry=safe_retry
+        )
+        if reference_ok:
+            return True
+        if handled_reference:
+            log(f"[motion {idx}] image-to-video 已提交但未完成/未通过，保留现有静态片段，不重复烧 text-to-video")
+            return False
+
+        # 兜底：直接 text-to-video（Seedance 2.0），绕过"照片晃动"，走真正摄影机运动
         # ADSD 使用降噪 prompt，避免把上游静帧 prompt 的风格词带入 WERYDANCE 触发版权拦截。
         full_prompt = _build_motion_video_prompt(scene, motion_prompt, safe_retry=safe_retry)
         if ADS_DIALOGUE_MODE and not ADSD_RICH_MOTION_PROMPT and not safe_retry:
@@ -3969,13 +4166,30 @@ def _motion_one_scene(idx: int, scene: dict, motion_prompt: str, aspect_ratio: s
             return False
         if not task_id:
             log(f"[motion {idx}] text-to-video 3 次提交仍失败")
+            _append_motion_qa({
+                "turn": idx + 1,
+                "path": "text-to-video",
+                "pass": False,
+                "reason": "submit_without_task_id",
+            })
             return False
 
         # ★ 立即持久化：轮询任何阶段失败/超时，下次 rerun 都能复用
         _save_motion_task(idx, task_id)
 
         # 轮询 + 下载
-        return _motion_poll_and_download(idx, task_id, vid_path)
+        ok = _motion_poll_and_download(idx, task_id, vid_path)
+        _append_motion_qa({
+            "turn": idx + 1,
+            "path": "text-to-video",
+            "model": "WERYDANCE_2_0",
+            "task_id": task_id,
+            "pass": ok,
+            "duration": dur,
+            "aspect_ratio": aspect_ratio,
+            "fallback_path": True,
+        })
+        return ok
     except Exception as e:
         log(f"[motion {idx}] 异常: {type(e).__name__}: {e}")
         return False
@@ -4347,7 +4561,8 @@ def step65_motion(script: list[dict]):
     """把静态 seg_N.mp4 替换为 WERYDANCE_2_0 动态版本（并发 + 单轮内失败自动重试 1 次）"""
     n = len(script)
     reporter_tag = " · ADS拟现场记者" if ADS_REPORTER_MODE else ""
-    tg(f"🎬 动态化启动{reporter_tag}：WERYDANCE_2_0 × {n} 分镜并发生成运动视频...")
+    mode_tag = "故事板图生视频优先" if STORYBOARD_REFERENCE_MOTION and not ADS_DIALOGUE_MODE else "文本生视频"
+    tg(f"🎬 动态化启动{reporter_tag}：WERYDANCE_2_0 × {n} 分镜并发生成运动视频（{mode_tag}）...")
 
     # 1. 生成每个分镜的 motion prompt
     motion_prompts = _generate_motion_prompts(script)
@@ -4390,6 +4605,7 @@ def step65_motion(script: list[dict]):
         _run_batch(failed_r1, "round 2", safe_retry=True)
 
     success_cnt = sum(1 for v in results.values() if v)
+    _finalize_motion_qa(n, success_cnt)
     if ADS_DIALOGUE_MODE:
         speaker_qa = _write_adsd_speaker_focus_qa(script, results)
         if speaker_qa and not speaker_qa.get("pass"):
