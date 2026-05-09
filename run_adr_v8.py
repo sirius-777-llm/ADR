@@ -153,6 +153,11 @@ STORYBOARD_ANNOTATED_MOTION = (
     and "--no-annotated-motion" not in sys.argv
     and os.environ.get("ADR_STORYBOARD_ANNOTATED_MOTION", "1").strip().lower() not in ("0", "false", "no", "off")
 )
+GPT_IMAGE2_DIRECT_ANNOTATED_STORYBOARD = (
+    "--with-direct-annotated-storyboard" in sys.argv
+    or "--with-direct-annotated-storyboards" in sys.argv
+    or os.environ.get("ADR_GPT_IMAGE2_DIRECT_ANNOTATED_STORYBOARD", "").strip().lower() in ("1", "true", "yes", "on")
+)
 ADSD_LIP_SYNC_EXPERIMENT = (
     "--adsd-lip-sync" in sys.argv
     or "--lip-sync" in sys.argv
@@ -3474,6 +3479,141 @@ def generate_storyboard_images_gpt_image2(script: list[dict], topic: str) -> boo
             log(f"storyboard_qa.json 写入失败: {e}")
 
 
+def _gpt_image2_direct_annotated_aspect() -> str:
+    override = os.environ.get("ADR_GPT_IMAGE2_DIRECT_ANNOTATED_ASPECT", "").strip()
+    if override:
+        return override
+    return "9:16(4k)" if IS_VERTICAL else "16:9(4k)"
+
+
+def _gpt_image2_direct_annotated_prompt(scene: dict, idx: int, total: int, topic: str, aspect: str) -> str:
+    visual = _short_board_text(scene.get("prompt") or scene.get("text"), 650)
+    text = _short_board_text(scene.get("text"), 220)
+    duration = int(round(max(1, float(scene.get("vid_duration") or scene.get("dur") or 5))))
+    return f"""Create one single {aspect} high-resolution annotated cinematic storyboard board for a historical documentary shot.
+Topic: {topic}
+Shot: {idx + 1}/{total}
+Visual source description: {visual}
+
+Layout requirements:
+- Output must be one finished director storyboard board, not multiple separate images.
+- Use 4K-quality detail, crisp labels, clean typography, and professional film previsualization layout.
+- Left/center: one large cinematic frame with the scene itself.
+- Right side: a clean dark Director Notes panel with four short labeled sections: ACTION, CAMERA, DIALOGUE/VO, SFX.
+- Top left: SHOT {idx + 1:02d} / {duration}s.
+- Add one simple white camera direction arrow inside the image frame.
+- Keep all text short, legible, and correctly spelled in English.
+- No random extra text, no watermark, no logo, no comic panels, no contact sheet.
+
+Director notes content:
+ACTION: {_short_board_text(visual, 120)}
+CAMERA: slow cinematic push-in, subtle period atmosphere, plausible motion only.
+DIALOGUE/VO: {_short_board_text(text, 120)}
+SFX: period ambience, crowd bed, cloth and paper movement."""
+
+
+def generate_gpt_image2_direct_annotated_storyboards(script: list[dict], topic: str) -> bool:
+    """Optional 4K GPT_IMAGE_2 director boards for human QA only.
+
+    These boards are intentionally not used as the default WERYDANCE reference because QA showed
+    model-generated side panels can be preserved in the video. The motion path keeps using the
+    programmatic board or clean keyframe.
+    """
+    if ADS_DIALOGUE_MODE or not GPT_IMAGE2_DIRECT_ANNOTATED_STORYBOARD:
+        return False
+    n = len(script)
+    if n <= 0:
+        return False
+    max_n = max(1, int(os.environ.get("ADR_GPT_IMAGE2_DIRECT_ANNOTATED_MAX", "6")))
+    take_n = min(n, max_n)
+    aspect = _gpt_image2_direct_annotated_aspect()
+    poll_max = float(os.environ.get("ADR_GPT_IMAGE2_DIRECT_ANNOTATED_POLL_MAX", "300"))
+    qa = {
+        "mode": "gpt_image2_direct_annotated_storyboard_4k",
+        "enabled": True,
+        "used": False,
+        "model": "GPT_IMAGE_2",
+        "aspect_ratio": aspect,
+        "requested_count": take_n,
+        "total_scene_count": n,
+        "motion_input_allowed": False,
+        "policy": "human_QA_director_board_only_not_default_werydance_input",
+        "records": [],
+        "issues": [],
+        "created_at": datetime.now().isoformat(timespec="seconds"),
+    }
+    try:
+        for i, scene in enumerate(script[:take_n]):
+            prompt = _gpt_image2_direct_annotated_prompt(scene, i, n, topic, aspect)
+            if len(prompt) > 18000:
+                prompt = prompt[:18000]
+                qa.setdefault("warnings", []).append(f"scene_{i+1}_prompt_truncated")
+            _wait_image_submit_slot(f"GPT Image 2 direct annotated storyboard {i+1}/{take_n}")
+            r = req_post("/generation/text-to-image", {
+                "model": "GPT_IMAGE_2",
+                "prompt": prompt,
+                "aspect_ratio": aspect,
+                "image_number": 1,
+                "quality": "high",
+            }, timeout=45)
+            task_id = (r.get("data", {}).get("task_ids") or [r.get("data", {}).get("task_id") or None])[0]
+            rec = {
+                "scene": i + 1,
+                "task_id": task_id,
+                "path": None,
+                "pass": False,
+            }
+            qa["records"].append(rec)
+            if not task_id:
+                rec["reason"] = f"submit_without_task_id: {json.dumps(r, ensure_ascii=False)[:200]}"
+                qa["issues"].append(f"scene_{i+1}_submit_without_task_id")
+                continue
+            data = poll_storyboard_task(
+                task_id,
+                f"GPT Image 2 direct annotated storyboard {i+1}/{take_n}",
+                poll_max,
+            )
+            urls = _extract_img_urls(data)
+            if not urls:
+                rec["reason"] = "succeed_without_image_url"
+                qa["issues"].append(f"scene_{i+1}_without_image_url")
+                continue
+            out_path = OUTPUT_DIR / f"annotated_storyboard_direct_{i}.png"
+            urllib.request.urlretrieve(urls[0], out_path)
+            rec["path"] = str(out_path)
+            rec["bytes"] = out_path.stat().st_size if out_path.exists() else 0
+            try:
+                from PIL import Image
+                with Image.open(out_path) as im:
+                    rec["width"], rec["height"] = im.size
+                    rec["resolution_pass"] = (im.size[1] >= 3840 if IS_VERTICAL else im.size[0] >= 3840)
+            except Exception as e:
+                rec["resolution_error"] = str(e)
+                rec["resolution_pass"] = False
+            rec["pass"] = bool(rec.get("bytes", 0) > 10000 and rec.get("resolution_pass"))
+            scene["direct_annotated_storyboard_path"] = str(out_path)
+        passed = sum(1 for r in qa["records"] if r.get("pass"))
+        qa["used"] = passed > 0
+        qa["pass"] = passed == take_n
+        qa["pass_count"] = passed
+        tg(f"🎞 GPT Image 2 4K annotated storyboard 看板完成：{passed}/{take_n}（仅QA看板，不直喂WERYDANCE）")
+        return bool(qa["used"])
+    except Exception as e:
+        qa["pass"] = False
+        qa["issues"].append(str(e))
+        log(f"GPT Image 2 4K annotated storyboard 看板失败: {e}")
+        tg(f"⚠️ GPT Image 2 4K annotated storyboard 看板失败：{str(e)[:160]}")
+        return False
+    finally:
+        try:
+            (OUTPUT_DIR / "direct_annotated_storyboard_qa.json").write_text(
+                json.dumps(qa, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+        except Exception as e:
+            log(f"direct_annotated_storyboard_qa.json 写入失败: {e}")
+
+
 def _llm_bgm_description(topic: str, tone: str) -> str | None:
     """LLM 主路径：根据主题+基调直接产出 BGM 英文 prompt。失败/质量异常返回 None，由调用方退回硬编码。"""
     prompt = f"""为纪录片配乐生成 weryai 音乐 API 的英文 prompt（25-45 词）。
@@ -3676,6 +3816,8 @@ def step6_parallel(script: list[dict], topic: str, pregenerated_bgm_path: str | 
                         approval_sent.add(idx)
                 except Exception as e:
                     raise RuntimeError(f"图 {idx+1} 兜底失败: {e}")
+
+        generate_gpt_image2_direct_annotated_storyboards(script, topic)
 
         # ── 审批流程 ────────────────────────────────────────────────────
         if SKIP_APPROVAL:
