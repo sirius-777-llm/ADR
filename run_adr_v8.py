@@ -140,6 +140,10 @@ if ADS_DIALOGUE_MODE and BGM_ONLY_REQUESTED:
     print("ERROR: --bgm-only/--no-tts/--no-voice 目前只支持 ADR/ADS，不支持 ADSD 对白模式。", file=sys.stderr)
     sys.exit(2)
 NO_VOICE = BGM_ONLY_REQUESTED  # ADR/ADS: 跳过 Podcast/TTS，用静音时间轴占位；成片音轨只有 BGM
+GPT_IMAGE2_STORYBOARD = (
+    "--no-storyboard" not in sys.argv
+    and os.environ.get("ADR_GPT_IMAGE2_STORYBOARD", "1").strip().lower() not in ("0", "false", "no", "off")
+)
 ADSD_LIP_SYNC_EXPERIMENT = (
     "--adsd-lip-sync" in sys.argv
     or "--lip-sync" in sys.argv
@@ -2943,6 +2947,39 @@ def _extract_img_url(data: dict):
     return None
 
 
+def _extract_img_urls(data: dict) -> list[str]:
+    """Extract all image URLs from a WeryAI task response."""
+    urls: list[str] = []
+
+    def _add(item):
+        if isinstance(item, str) and item.startswith("http"):
+            urls.append(item)
+        elif isinstance(item, dict):
+            for key in ("url", "image_url", "src"):
+                val = item.get(key)
+                if isinstance(val, str) and val.startswith("http"):
+                    urls.append(val)
+                    break
+
+    for container in (
+        data.get("images"),
+        (data.get("task_result") or {}).get("images"),
+    ):
+        if isinstance(container, list):
+            for item in container:
+                _add(item)
+        else:
+            _add(container)
+    for key in ("image_url",):
+        _add(data.get(key))
+        _add((data.get("task_result") or {}).get(key))
+    deduped = []
+    for url in urls:
+        if url not in deduped:
+            deduped.append(url)
+    return deduped
+
+
 def _extract_video_url(data: dict) -> str | None:
     """Extract a generated video URL from WeryAI task data."""
     candidates = [
@@ -3142,6 +3179,117 @@ def generate_image(scene: dict, idx: int, _max_retries: int = 3) -> int:
     return idx
 
 
+def generate_storyboard_images_gpt_image2(script: list[dict], topic: str) -> bool:
+    """Primary ADR/ADS image path: one GPT_IMAGE_2 request for the whole storyboard.
+
+    If anything is incomplete, return False so step6 can fall back to per-scene generation.
+    """
+    if ADS_DIALOGUE_MODE or not GPT_IMAGE2_STORYBOARD:
+        return False
+    n = len(script)
+    if n <= 0:
+        return False
+    max_n = int(os.environ.get("ADR_GPT_IMAGE2_STORYBOARD_MAX", "24"))
+    if n > max_n:
+        log(f"GPT Image 2 storyboard 跳过：分镜数 {n} 超过上限 {max_n}")
+        return False
+
+    _model, _aspect, _extra = pick_image_model(ASPECT_RATIO)
+    if _model != "GPT_IMAGE_2":
+        log(f"GPT Image 2 storyboard 跳过：当前图片模型为 {_model}")
+        return False
+
+    qa = {
+        "mode": "gpt_image2_storyboard",
+        "enabled": True,
+        "used": False,
+        "fallback": False,
+        "model": "GPT_IMAGE_2",
+        "aspect_ratio": _aspect,
+        "requested_count": n,
+        "downloaded_count": 0,
+        "rendered_count": 0,
+        "issues": [],
+        "created_at": datetime.now().isoformat(timespec="seconds"),
+    }
+
+    try:
+        scene_lines = []
+        for i, scene in enumerate(script):
+            prompt = re.sub(r"\s+", " ", str(scene.get("prompt") or "")).strip()
+            text = re.sub(r"\s+", " ", str(scene.get("text") or "")).strip()
+            scene_lines.append(
+                f"{i+1}. Visual prompt: {prompt[:650]}\n   Internal story beat: {text[:160]}"
+            )
+        storyboard_prompt = (
+            f"Create exactly {n} separate storyboard images for one short video about: {topic}.\n"
+            f"Aspect ratio: {ASPECT_RATIO}. Do NOT create a collage, contact sheet, grid, comic page, or multi-panel image. "
+            "Return separate standalone images, one image per numbered scene. Keep consistent visual identity, palette, lighting, "
+            "era, costumes, and subject continuity across the whole series. No watermarks, no captions, no subtitles, no random text.\n\n"
+            "Scenes:\n" + "\n".join(scene_lines)
+        )
+        if len(storyboard_prompt) > 18000:
+            storyboard_prompt = storyboard_prompt[:18000]
+            qa["warnings"] = ["prompt_truncated_to_18000_chars"]
+
+        _wait_image_submit_slot("GPT Image 2 storyboard")
+        r = req_post("/generation/text-to-image", {
+            "model": "GPT_IMAGE_2",
+            "prompt": storyboard_prompt,
+            "aspect_ratio": _aspect,
+            "image_number": n,
+            **_extra,
+        }, timeout=45)
+        data_part = r.get("data", {})
+        task_ids = data_part.get("task_ids") or ([data_part["task_id"]] if data_part.get("task_id") else [])
+        if not task_ids:
+            qa["issues"].append(f"submit_without_task_id: {json.dumps(r, ensure_ascii=False)[:200]}")
+            raise RuntimeError("storyboard submit returned no task_id")
+        qa["task_ids"] = task_ids
+
+        img_urls: list[str] = []
+        if len(task_ids) == 1:
+            data = poll(task_ids[0], "GPT Image 2 storyboard")
+            img_urls.extend(_extract_img_urls(data))
+        else:
+            for j, tid in enumerate(task_ids):
+                data = poll(tid, f"GPT Image 2 storyboard {j+1}/{len(task_ids)}")
+                img_urls.extend(_extract_img_urls(data))
+
+        if len(img_urls) < n:
+            qa["issues"].append(f"image_count_mismatch: got {len(img_urls)}, need {n}")
+            raise RuntimeError(f"storyboard image count mismatch: got {len(img_urls)}, need {n}")
+
+        for i, url in enumerate(img_urls[:n]):
+            path = script[i]["img_path"]
+            urllib.request.urlretrieve(url, path)
+            qa["downloaded_count"] += 1
+            script[i]["storyboard_mode"] = True
+            script[i]["storyboard_source_url"] = url
+            _render_still_segment(script[i])
+            qa["rendered_count"] += 1
+
+        qa["used"] = True
+        qa["pass"] = True
+        tg(f"🖼 GPT Image 2 一次性分镜成功：{qa['downloaded_count']}/{n} 张，已转视频")
+        return True
+    except Exception as e:
+        qa["fallback"] = True
+        qa["pass"] = False
+        qa["issues"].append(str(e))
+        log(f"GPT Image 2 storyboard 失败，回退逐张生成：{e}")
+        tg(f"⚠️ GPT Image 2 一次性分镜失败，自动回退逐张生成：{str(e)[:160]}")
+        return False
+    finally:
+        try:
+            (OUTPUT_DIR / "storyboard_qa.json").write_text(
+                json.dumps(qa, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+        except Exception as e:
+            log(f"storyboard_qa.json 写入失败: {e}")
+
+
 def _llm_bgm_description(topic: str, tone: str) -> str | None:
     """LLM 主路径：根据主题+基调直接产出 BGM 英文 prompt。失败/质量异常返回 None，由调用方退回硬编码。"""
     prompt = f"""为纪录片配乐生成 weryai 音乐 API 的英文 prompt（25-45 词）。
@@ -3286,25 +3434,33 @@ def step6_parallel(script: list[dict], topic: str, pregenerated_bgm_path: str | 
     with ThreadPoolExecutor(max_workers=media_workers) as ex:
         bgm_fut = None if pregenerated_bgm_path else ex.submit(generate_bgm, topic, bgm_tone)
 
-        # 图片：每张生成完立刻审批，不等全部完成
-        img_futs = {ex.submit(generate_image, s, i): i for i, s in enumerate(script)}
-
-        # ★ 每张图生成完立即推审批（不等所有 22 张完成才统一推）
-        # SKIP_APPROVAL 模式跳过推送
         completed = {}  # idx -> True
         approval_sent = set()  # 已推过审批的 idx，避免兜底重发
-        for f in as_completed(img_futs):
-            idx = img_futs[f]
-            try:
-                f.result()
-                completed[idx] = True
-                # ★ 立即推审批（图刚出来就让大哥审）
-                if not SKIP_APPROVAL:
+        storyboard_used = generate_storyboard_images_gpt_image2(script, topic)
+        if storyboard_used:
+            completed = {i: True for i in range(n)}
+            if not SKIP_APPROVAL:
+                for idx in range(n):
                     _send_for_approval(script[idx]["img_path"], idx, script[idx])
                     approval_sent.add(idx)
-            except Exception as e:
-                tg(f"⚠️ 图片 {idx+1} 生成失败：{e}")
-                completed[idx] = False
+        else:
+            # 图片：每张生成完立刻审批，不等全部完成
+            img_futs = {ex.submit(generate_image, s, i): i for i, s in enumerate(script)}
+
+            # ★ 每张图生成完立即推审批（不等所有 22 张完成才统一推）
+            # SKIP_APPROVAL 模式跳过推送
+            for f in as_completed(img_futs):
+                idx = img_futs[f]
+                try:
+                    f.result()
+                    completed[idx] = True
+                    # ★ 立即推审批（图刚出来就让大哥审）
+                    if not SKIP_APPROVAL:
+                        _send_for_approval(script[idx]["img_path"], idx, script[idx])
+                        approval_sent.add(idx)
+                except Exception as e:
+                    tg(f"⚠️ 图片 {idx+1} 生成失败：{e}")
+                    completed[idx] = False
 
         # 检查是否有图片缺失 → 用最近成功的图兜底（审核拦截/其他失败都不再 raise 崩管线）
         missing = [i for i in range(n) if not completed.get(i)]
