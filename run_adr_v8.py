@@ -148,6 +148,11 @@ STORYBOARD_REFERENCE_MOTION = (
     "--no-reference-motion" not in sys.argv
     and os.environ.get("ADR_STORYBOARD_REFERENCE_MOTION", "1").strip().lower() not in ("0", "false", "no", "off")
 )
+STORYBOARD_ANNOTATED_MOTION = (
+    "--clean-reference-motion" not in sys.argv
+    and "--no-annotated-motion" not in sys.argv
+    and os.environ.get("ADR_STORYBOARD_ANNOTATED_MOTION", "1").strip().lower() not in ("0", "false", "no", "off")
+)
 ADSD_LIP_SYNC_EXPERIMENT = (
     "--adsd-lip-sync" in sys.argv
     or "--lip-sync" in sys.argv
@@ -3911,6 +3916,7 @@ def _append_motion_qa(record: dict) -> None:
     payload = {
         "created_at": datetime.now().isoformat(timespec="seconds"),
         "storyboard_reference_motion_enabled": STORYBOARD_REFERENCE_MOTION,
+        "storyboard_annotated_motion_enabled": STORYBOARD_ANNOTATED_MOTION,
         "records": [],
     }
     with _motion_qa_lock:
@@ -3935,6 +3941,7 @@ def _finalize_motion_qa(total: int, success_count: int) -> None:
         payload = {
             "created_at": datetime.now().isoformat(timespec="seconds"),
             "storyboard_reference_motion_enabled": STORYBOARD_REFERENCE_MOTION,
+            "storyboard_annotated_motion_enabled": STORYBOARD_ANNOTATED_MOTION,
             "records": [],
         }
         if p.exists():
@@ -3947,16 +3954,18 @@ def _finalize_motion_qa(total: int, success_count: int) -> None:
                 payload.setdefault("warnings", []).append("motion_qa_finalize_read_failed")
         records = payload.get("records") or []
         reference_success = sum(1 for r in records if r.get("path") == "image-to-video" and r.get("pass"))
+        annotated_success = sum(1 for r in records if r.get("reference_mode") == "annotated_storyboard" and r.get("pass"))
         text_success = sum(1 for r in records if r.get("path") == "text-to-video" and r.get("pass"))
         payload.update({
             "total": total,
             "success_count": success_count,
             "success_rate": round(success_count / max(total, 1), 4),
             "reference_success_count": reference_success,
+            "annotated_reference_success_count": annotated_success,
             "text_fallback_success_count": text_success,
             "static_fallback_count": max(0, total - success_count),
             "pass": success_count >= max(1, math.ceil(total * 0.7)),
-            "policy": "storyboard_image_to_video_first_text_to_video_fallback_static_last",
+            "policy": "annotated_storyboard_image_to_video_first_clean_keyframe_fallback_text_to_video_static_last",
             "finalized_at": datetime.now().isoformat(timespec="seconds"),
         })
         p.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -4088,15 +4097,157 @@ def _build_motion_video_prompt(scene: dict, motion_prompt: str, safe_retry: bool
     return f"{scene_prompt}. Camera motion: {motion_prompt}" if scene_prompt else motion_prompt
 
 
-def _motion_reference_prompt(scene: dict, motion_prompt: str, safe_retry: bool = False) -> str:
-    base = _build_motion_video_prompt(scene, motion_prompt, safe_retry=safe_retry)
-    prefix = (
-        "Use the uploaded storyboard frame as the strict visual reference for character identity, "
-        "costume, era, composition, lighting, and scene geography. Animate only plausible motion "
-        "within that frame; do not redesign the shot. "
+def _short_board_text(value: object, limit: int = 170) -> str:
+    text = re.sub(r"\s+", " ", str(value or "")).strip()
+    if len(text) <= limit:
+        return text
+    return text[: max(0, limit - 3)].rstrip() + "..."
+
+
+def _wrap_board_text(draw, text: str, font, max_width: int, max_lines: int) -> list[str]:
+    if not text:
+        return []
+    tokens = text.split(" ")
+    if len(tokens) <= 1:
+        tokens = list(text)
+        joiner = ""
+    else:
+        joiner = " "
+    lines: list[str] = []
+    current = ""
+    for token in tokens:
+        candidate = token if not current else current + joiner + token
+        bbox = draw.textbbox((0, 0), candidate, font=font)
+        if bbox[2] - bbox[0] <= max_width:
+            current = candidate
+            continue
+        if current:
+            lines.append(current)
+        current = token
+        if len(lines) >= max_lines:
+            break
+    if current and len(lines) < max_lines:
+        lines.append(current)
+    if len(lines) > max_lines:
+        lines = lines[:max_lines]
+    if lines and len(lines) == max_lines and len("".join(tokens)) > len("".join(lines)):
+        lines[-1] = lines[-1].rstrip(". ") + "..."
+    return lines
+
+
+def _storyboard_font(size: int, bold: bool = False):
+    from PIL import ImageFont
+    paths = [
+        "/System/Library/Fonts/STHeiti Medium.ttc" if bold else "/System/Library/Fonts/Hiragino Sans GB.ttc",
+        "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
+        "/System/Library/Fonts/Supplemental/Arial.ttf",
+    ]
+    for path in paths:
+        try:
+            return ImageFont.truetype(path, size)
+        except Exception:
+            pass
+    return ImageFont.load_default()
+
+
+def _draw_storyboard_arrow(draw, frame_box: tuple[int, int, int, int]) -> None:
+    x1, y1, x2, y2 = frame_box
+    sx = x1 + int((x2 - x1) * 0.64)
+    sy = y1 + int((y2 - y1) * 0.24)
+    ex = x1 + int((x2 - x1) * 0.50)
+    ey = y1 + int((y2 - y1) * 0.42)
+    draw.line([(sx, sy), (ex, ey)], fill=(255, 255, 255, 230), width=max(5, (x2 - x1) // 210))
+    head = max(18, (x2 - x1) // 55)
+    draw.polygon(
+        [(ex, ey), (ex + head, ey - head // 3), (ex + head // 3, ey + head)],
+        fill=(255, 255, 255, 230),
     )
+
+
+def _build_annotated_storyboard_reference(scene: dict, idx: int, motion_prompt: str, dur: int) -> str:
+    """Create a director-board image for WERYDANCE while keeping the clean keyframe untouched."""
+    if not STORYBOARD_ANNOTATED_MOTION or ADS_DIALOGUE_MODE:
+        return scene.get("img_path", "")
+    img_path = scene.get("img_path")
+    if not img_path or not os.path.exists(img_path):
+        return img_path or ""
+    out_path = str(OUTPUT_DIR / f"annotated_storyboard_{idx}.png")
+    try:
+        from PIL import Image, ImageDraw
+        src = Image.open(img_path).convert("RGB")
+        W, H = src.size
+        board = Image.new("RGB", (W, H), (246, 246, 242))
+        draw = ImageDraw.Draw(board)
+        margin = max(24, W // 44)
+        top_h = max(72, int(H * 0.085))
+        bottom_h = max(150, int(H * 0.18))
+        frame_x1 = margin
+        frame_y1 = top_h
+        frame_x2 = W - margin
+        frame_y2 = H - bottom_h - margin // 2
+        frame_w = frame_x2 - frame_x1
+        frame_h = frame_y2 - frame_y1
+        src_copy = src.copy()
+        src_copy.thumbnail((frame_w, frame_h), Image.Resampling.LANCZOS)
+        ox = frame_x1 + (frame_w - src_copy.size[0]) // 2
+        oy = frame_y1 + (frame_h - src_copy.size[1]) // 2
+        draw.rectangle([frame_x1 - 4, frame_y1 - 4, frame_x2 + 4, frame_y2 + 4], fill=(18, 18, 18))
+        board.paste(src_copy, (ox, oy))
+        draw.rectangle([ox, oy, ox + src_copy.size[0], oy + src_copy.size[1]], outline=(255, 255, 255), width=max(2, W // 520))
+        _draw_storyboard_arrow(draw, (ox, oy, ox + src_copy.size[0], oy + src_copy.size[1]))
+
+        title_font = _storyboard_font(max(26, W // 46), bold=True)
+        label_font = _storyboard_font(max(20, W // 70), bold=True)
+        body_font = _storyboard_font(max(18, W // 86))
+        slate = f"SHOT {idx + 1:02d} / {dur}s"
+        draw.text((margin, max(14, top_h // 4)), slate, fill=(20, 20, 20), font=title_font)
+        draw.text((W - margin - int(W * 0.33), max(18, top_h // 3)), "ADR ANNOTATED STORYBOARD", fill=(80, 80, 80), font=label_font)
+
+        panel_y = H - bottom_h
+        draw.rectangle([0, panel_y, W, H], fill=(18, 18, 18))
+        text_x = margin
+        y = panel_y + max(16, bottom_h // 11)
+        max_w = W - margin * 2
+        rows = [
+            ("ACTION", _short_board_text(scene.get("prompt") or scene.get("text"), 230)),
+            ("DIALOGUE/VO", _short_board_text(scene.get("text"), 170)),
+            ("CAMERA", _short_board_text(motion_prompt, 210)),
+            ("SFX", "period ambience, crowd bed, cloth and paper movement, natural room or street tone"),
+        ]
+        line_h = max(25, int(bottom_h * 0.17))
+        for label, value in rows:
+            label_text = f"{label}: "
+            draw.text((text_x, y), label_text, fill=(235, 235, 235), font=label_font)
+            label_w = draw.textbbox((0, 0), label_text, font=label_font)[2]
+            lines = _wrap_board_text(draw, value, body_font, max_w - label_w, 1)
+            draw.text((text_x + label_w, y), lines[0] if lines else "", fill=(220, 220, 210), font=body_font)
+            y += line_h
+        board.save(out_path, "PNG", optimize=True)
+        scene["annotated_storyboard_path"] = out_path
+        return out_path
+    except Exception as e:
+        log(f"[motion {idx}] annotated storyboard 生成失败，改用 clean keyframe: {e}")
+        return img_path
+
+
+def _motion_reference_prompt(scene: dict, motion_prompt: str, safe_retry: bool = False, annotated: bool = False) -> str:
+    base = _build_motion_video_prompt(scene, motion_prompt, safe_retry=safe_retry)
+    if annotated:
+        prefix = (
+            "Read the uploaded annotated storyboard as a director board. Use the central frame as "
+            "the visual reference for character identity, costume, era, composition, lighting, and "
+            "scene geography. Interpret arrows, camera labels, action notes, dialogue/VO, and SFX "
+            "as production instructions. The final video must be only the cinematic scene, not a "
+            "storyboard page; remove or ignore all borders, panels, labels, arrows, notes, and UI text. "
+        )
+    else:
+        prefix = (
+            "Use the uploaded storyboard frame as the strict visual reference for character identity, "
+            "costume, era, composition, lighting, and scene geography. Animate only plausible motion "
+            "within that frame; do not redesign the shot. "
+        )
     suffix = (
-        " No subtitles, no captions, no text overlay, no watermark, no logo. "
+        " No subtitles, no captions, no text overlay, no watermark, no logo, no storyboard annotations. "
         "Preserve faces, clothing, props, color palette, and historical setting from the reference image."
     )
     return (prefix + base + suffix)[:2000]
@@ -4121,9 +4272,16 @@ def _try_motion_reference_video(idx: int, scene: dict, motion_prompt: str, aspec
         })
         return False, False
 
-    full_prompt = _motion_reference_prompt(scene, motion_prompt, safe_retry=safe_retry)
+    reference_path = _build_annotated_storyboard_reference(scene, idx, motion_prompt, dur)
+    reference_mode = "annotated_storyboard" if reference_path and reference_path != img_path else "clean_keyframe"
+    full_prompt = _motion_reference_prompt(
+        scene,
+        motion_prompt,
+        safe_retry=safe_retry,
+        annotated=(reference_mode == "annotated_storyboard"),
+    )
     try:
-        image_url = _upload_to_weryai(img_path)
+        image_url = _upload_to_weryai(reference_path or img_path)
     except Exception as e:
         log(f"[motion {idx}] storyboard image upload 失败，回退 text-to-video: {e}")
         _append_motion_qa({
@@ -4131,6 +4289,7 @@ def _try_motion_reference_video(idx: int, scene: dict, motion_prompt: str, aspec
             "path": "image-to-video",
             "pass": False,
             "fallback_to_text": True,
+            "reference_mode": reference_mode,
             "reason": f"upload_failed: {e}",
         })
         return False, False
@@ -4168,6 +4327,7 @@ def _try_motion_reference_video(idx: int, scene: dict, motion_prompt: str, aspec
             "path": "image-to-video",
             "pass": False,
             "fallback_to_text": True,
+            "reference_mode": reference_mode,
             "reason": "submit_without_task_id",
             "response": response,
         })
@@ -4184,8 +4344,10 @@ def _try_motion_reference_video(idx: int, scene: dict, motion_prompt: str, aspec
         "pass": ok,
         "fallback_to_text": (not ok and not timed_out_or_reusable),
         "timed_out_or_reusable": timed_out_or_reusable,
+        "reference_mode": reference_mode,
         "storyboard_mode": bool(scene.get("storyboard_mode")),
-        "image_path": img_path,
+        "image_path": reference_path or img_path,
+        "clean_image_path": img_path,
         "duration": dur,
         "aspect_ratio": aspect_ratio,
     })
@@ -4663,7 +4825,12 @@ def step65_motion(script: list[dict]):
     """把静态 seg_N.mp4 替换为 WERYDANCE_2_0 动态版本（并发 + 单轮内失败自动重试 1 次）"""
     n = len(script)
     reporter_tag = " · ADS拟现场记者" if ADS_REPORTER_MODE else ""
-    mode_tag = "故事板图生视频优先" if STORYBOARD_REFERENCE_MOTION and not ADS_DIALOGUE_MODE else "文本生视频"
+    if STORYBOARD_REFERENCE_MOTION and STORYBOARD_ANNOTATED_MOTION and not ADS_DIALOGUE_MODE:
+        mode_tag = "annotated storyboard 图生视频优先"
+    elif STORYBOARD_REFERENCE_MOTION and not ADS_DIALOGUE_MODE:
+        mode_tag = "故事板图生视频优先"
+    else:
+        mode_tag = "文本生视频"
     tg(f"🎬 动态化启动{reporter_tag}：WERYDANCE_2_0 × {n} 分镜并发生成运动视频（{mode_tag}）...")
 
     # 1. 生成每个分镜的 motion prompt
