@@ -3004,7 +3004,7 @@ def _upload_to_weryai(file_path: str) -> str:
 APPROVAL_DIR = Path("/tmp/adr_approval")
 
 
-def _send_for_approval(img_path: str, idx: int, text: str) -> None:
+def _send_for_approval(img_path: str, idx: int, scene_or_text) -> None:
     """发送图片到 TG 带审批按钮 + 写 pending 信号。
     5 次重试 + 渐进退避（5/10/20/40/80s），穿越 macOS 间歇 SSL 抖动。
     每次重试前先压缩图片（如果还是 PNG 大文件，转 JPG 减少传输撞 SSL 概率）。"""
@@ -3034,6 +3034,20 @@ def _send_for_approval(img_path: str, idx: int, text: str) -> None:
             {"text": "🔄 重做", "callback_data": f"adr_reject_{idx}"},
         ]]
     })
+    if isinstance(scene_or_text, dict):
+        scene = scene_or_text
+        if NO_VOICE:
+            visual_text = str(scene.get("prompt") or "").strip()
+            internal_text = str(scene.get("text") or "").strip()
+            caption = (
+                f"🖼 图 {idx+1} 审批（BGM-only，无字幕）\n\n"
+                f"视觉意图：{visual_text[:900]}\n\n"
+                f"内部文案（仅用于分镜节奏，不会出现在成片）：{internal_text[:180]}"
+            )
+        else:
+            caption = f"🖼 图 {idx+1} 审批\n\n{str(scene.get('text') or '')}"
+    else:
+        caption = f"🖼 图 {idx+1} 审批\n\n{str(scene_or_text)}"
 
     delays = [0, 5, 10, 20, 40, 80]  # 第 0-5 次尝试前的等待
     for attempt in range(6):
@@ -3043,7 +3057,7 @@ def _send_for_approval(img_path: str, idx: int, text: str) -> None:
             with open(upload_path, "rb") as f:
                 resp = requests.post(url, data={
                     "chat_id": TG_CHAT_ID,
-                    "caption": f"🖼 图 {idx+1} 审批\n\n{text}",
+                    "caption": caption,
                     "reply_markup": reply_markup,
                 }, files={"photo": f}, timeout=(15, 60))
             if resp.status_code == 200 and resp.json().get("ok"):
@@ -3286,7 +3300,7 @@ def step6_parallel(script: list[dict], topic: str, pregenerated_bgm_path: str | 
                 completed[idx] = True
                 # ★ 立即推审批（图刚出来就让大哥审）
                 if not SKIP_APPROVAL:
-                    _send_for_approval(script[idx]["img_path"], idx, script[idx]["text"])
+                    _send_for_approval(script[idx]["img_path"], idx, script[idx])
                     approval_sent.add(idx)
             except Exception as e:
                 tg(f"⚠️ 图片 {idx+1} 生成失败：{e}")
@@ -3318,7 +3332,7 @@ def step6_parallel(script: list[dict], topic: str, pregenerated_bgm_path: str | 
                     completed[idx] = True
                     # ★ 兜底图也补推审批（如果之前没推过）
                     if not SKIP_APPROVAL and idx not in approval_sent:
-                        _send_for_approval(dst, idx, script[idx]["text"])
+                        _send_for_approval(dst, idx, script[idx])
                         approval_sent.add(idx)
                 except Exception as e:
                     raise RuntimeError(f"图 {idx+1} 兜底失败: {e}")
@@ -3400,7 +3414,7 @@ def step6_parallel(script: list[dict], topic: str, pregenerated_bgm_path: str | 
                         continue
                     try:
                         fut.result()
-                        _send_for_approval(script[i]["img_path"], i, script[i]["text"])
+                        _send_for_approval(script[i]["img_path"], i, script[i])
                     except Exception as e:
                         tg(f"⚠️ 图 {i+1} 重做失败：{e}")
                     del regen_futs[i]
