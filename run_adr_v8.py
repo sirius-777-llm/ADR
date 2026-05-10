@@ -6485,13 +6485,13 @@ def _generate_caption(topic: str, script: list[dict]) -> tuple[str, str, str]:
                 elif low.startswith("TITLE:") or low.startswith("TITLE："):
                     t = s.split(":", 1)[-1].split("：", 1)[-1].strip()
                     if tone == "轻松" or is_almanac:
-                        t = re.sub(r'[\#《》【】""""''()（）\[\]]', '', t)
+                        t = re.sub(r"[#《》【】\"'()（）\[\]]", '', t)
                         t = re.sub(r'[a-zA-Z]', '', t)
                     elif tone == "庄重":
-                        t = re.sub(r'[\#《》【】""""''()（）\[\]!?！？]', '', t)
+                        t = re.sub(r"[#《》【】\"'()（）\[\]!?！？]", '', t)
                         t = re.sub(r'[a-zA-Z]', '', t)
                     else:
-                        t = re.sub(r'[\#《》【】""""''()（）\[\]!！]', '', t)
+                        t = re.sub(r"[#《》【】\"'()（）\[\]!！]", '', t)
                         t = re.sub(r'[a-zA-Z]', '', t)
                     t = _strip_topic_modifiers(t).strip()
                     if t: _t = t[:14]
@@ -6512,7 +6512,7 @@ def _generate_caption(topic: str, script: list[dict]) -> tuple[str, str, str]:
 
         caption, short_title, hashtags = best
         if SHORT_TITLE_OVERRIDE:
-            short_title = re.sub(r'[\#《》【】""""''()（）\[\]!！?？]', '', SHORT_TITLE_OVERRIDE).strip()[:16]
+            short_title = re.sub(r"[#《》【】\"'()（）\[\]!！?？]", '', SHORT_TITLE_OVERRIDE).strip()[:16]
             log(f"短标题 override → '{short_title}'")
         log(f"社媒文案最终选定：title_len={len(short_title)}, caption_len={len(caption)}, hashtag_count={len(hashtags.split())}")
     except Exception as e:
@@ -6786,7 +6786,7 @@ def _llm_bottom_note(topic: str, script_texts: list) -> str:
         raw = chat("GEMINI_25_FLASH", "你是中国古典编辑，擅长从典籍节气物象里提炼诗意注脚。", prompt).strip()
         raw = raw.split("\n")[0].strip()
         # 清洗：去掉标点 / 英文 / 特殊字符（保留中点 · 和中文）
-        raw = re.sub(r'[《》""""''【】\[\]()（）!?！？#。，、；：\-—…]', '', raw)
+        raw = re.sub(r"[《》\"'【】\[\]()（）!?！？#。，、；：—…-]", '', raw)
         raw = re.sub(r'[a-zA-Z0-9]', '', raw)
         raw = raw.strip()
         if 5 <= len(raw) <= 20:
