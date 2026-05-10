@@ -3586,9 +3586,9 @@ def _qa_clean_storyboard_panel(path: Path) -> dict:
         lower_center_box = (int(W * 0.25), int(H * 0.55), int(W * 0.75), H)
         qa["top_left_bright_ratio"] = round(bright_ratio(corner_box), 4)
         qa["lower_center_bright_ratio"] = round(bright_ratio(lower_center_box), 4)
-        if max(qa["top_black_ratio"], qa["bottom_black_ratio"]) > 0.42:
+        if min(qa["top_black_ratio"], qa["bottom_black_ratio"]) > 0.42:
             qa["issues"].append("possible_horizontal_letterbox")
-        if max(qa["left_black_ratio"], qa["right_black_ratio"]) > 0.42:
+        if min(qa["left_black_ratio"], qa["right_black_ratio"]) > 0.42:
             qa["issues"].append("possible_vertical_letterbox")
         if qa["top_left_bright_ratio"] > 0.12:
             qa["issues"].append("possible_shot_number_residue")
