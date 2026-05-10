@@ -5113,6 +5113,14 @@ def _grid_multiref_duration(group: list[dict]) -> int:
     return max(5, min(10, int(round(total))))
 
 
+def _grid_multiref_segment_max_stretch() -> float:
+    try:
+        raw = float(os.environ.get("ADR_GRID_MULTIREF_SEGMENT_MAX_STRETCH", "2.5"))
+    except Exception:
+        raw = 2.5
+    return max(1.0, min(4.0, raw))
+
+
 def _grid_multiref_prompt(group: list[dict], start_idx: int, motion_prompts: list[str]) -> str:
     lines = []
     for offset, scene in enumerate(group):
@@ -5244,6 +5252,7 @@ def _apply_grid_multiref_segments(script: list[dict], motion_qa: dict | None) ->
         "policy": "replace_only_successful_group_segments_static_fallback_for_failures",
         "target_width": VIDEO_W,
         "target_height": VIDEO_H,
+        "max_stretch_ratio": _grid_multiref_segment_max_stretch(),
         "records": [],
         "created_at": datetime.now().isoformat(timespec="seconds"),
     }
@@ -5325,6 +5334,11 @@ def _apply_grid_multiref_segments(script: list[dict], motion_qa: dict | None) ->
                 "speed_ratio": round(ratio, 4),
                 "pass": False,
             }
+            if ratio > qa["max_stretch_ratio"]:
+                seg_record["reason"] = "excessive_stretch_would_stutter"
+                group_record["segments"].append(seg_record)
+                cursor += target_dur
+                continue
             try:
                 vf = (
                     f"trim=start={source_start:.4f}:duration={source_dur:.4f},"
@@ -6071,13 +6085,17 @@ def step65_motion(script: list[dict]):
     results: dict[int, bool] = {}
     previs_qa = _generate_previs_page_motion_segments(script, motion_prompts, aspect)
     grid_motion_qa = _generate_grid_multiref_motion_segments(script, motion_prompts, aspect)
+    seg_qa = None
     if STORYBOARD_GRID_MULTIREF_SEGMENTS:
         seg_qa = _apply_grid_multiref_segments(script, grid_motion_qa)
         _write_storyboard_motion_compare_qa(grid_motion_qa, previs_qa, seg_qa)
         success_cnt = int((seg_qa or {}).get("success_count") or 0)
-        tg(f"✅ Grid multi-ref 实验动态化完成：{success_cnt}/{n} 段替换，其余保留既有兜底")
-        return
-    _write_storyboard_motion_compare_qa(grid_motion_qa, previs_qa, None)
+        if (seg_qa or {}).get("pass"):
+            tg(f"✅ Grid multi-ref 实验动态化完成：{success_cnt}/{n} 段替换，主时间线 QA 通过")
+            return
+        tg(f"⚠️ Grid multi-ref 切片未达主线标准：{success_cnt}/{n} 段可用，继续逐镜动态化补齐")
+    else:
+        _write_storyboard_motion_compare_qa(grid_motion_qa, previs_qa, None)
 
     def _run_batch(indices: list[int], round_label: str, safe_retry: bool = False):
         """跑一批 indices，更新 results。task_id 持久化保证重试时已成功的分镜不会重复烧钱。"""
@@ -6103,8 +6121,12 @@ def step65_motion(script: list[dict]):
                 else:
                     tg(f"⚠️ 分镜 {i+1}/{n} 动态化失败（重试后仍失败，保留静态版）")
 
-    # Round 1：全量并发
-    _run_batch(list(range(n)), "round 1")
+    # Round 1：全量并发；已通过 grid multi-ref 主线切片的镜头不重复烧钱。
+    initial_indices = [i for i in range(n) if not script[i].get("grid_multiref_segment_mode")]
+    for i in range(n):
+        if script[i].get("grid_multiref_segment_mode"):
+            results[i] = True
+    _run_batch(initial_indices, "round 1")
 
     # Round 2：失败的自动重试 1 次（task_id 持久化下已成功的不会重复烧钱）
     failed_r1 = [i for i, ok in results.items() if not ok]
