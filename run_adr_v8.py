@@ -5094,6 +5094,58 @@ def _write_grid_multiref_segment_qa(payload: dict) -> None:
         log(f"grid_multiref_segment_qa.json 写入失败: {e}")
 
 
+def _motion_compare_record(name: str, qa: dict | None, artifact_key: str = "path") -> dict:
+    qa = qa if isinstance(qa, dict) else None
+    records = (qa or {}).get("records") or []
+    passed = [r for r in records if r.get("pass")]
+    artifacts = [r.get(artifact_key) for r in passed if r.get(artifact_key)]
+    if not artifacts:
+        for record in records:
+            for segment in record.get("segments", []) if isinstance(record, dict) else []:
+                if segment.get("pass") and segment.get(artifact_key):
+                    artifacts.append(segment.get(artifact_key))
+    return {
+        "name": name,
+        "enabled": bool((qa or {}).get("enabled")),
+        "pass": bool((qa or {}).get("pass")),
+        "total_groups": (qa or {}).get("total_groups") or len(records),
+        "success_count": (qa or {}).get("success_count") or len(passed),
+        "artifacts": artifacts,
+        "policy": (qa or {}).get("policy"),
+        "manual_visual_checks_required": (qa or {}).get("manual_visual_checks_required") or [],
+    }
+
+
+def _write_storyboard_motion_compare_qa(
+    clean_refs_qa: dict | None = None,
+    previs_page_qa: dict | None = None,
+    segment_qa: dict | None = None,
+) -> dict:
+    clean = _motion_compare_record("clean_refs_multiref", clean_refs_qa)
+    previs = _motion_compare_record("previs_page", previs_page_qa)
+    segment = _motion_compare_record("grid_multiref_segments", segment_qa, artifact_key="target_path")
+    payload = {
+        "mode": "storyboard_motion_compare",
+        "recommendation": "clean_refs_multiref_segments" if segment.get("pass") else "clean_refs_multiref_sidecar" if clean.get("pass") else "previs_page_sidecar" if previs.get("pass") else "static_or_text_motion_fallback",
+        "default_policy": "do_not_enable_by_default_until_three_topic_smokes_pass",
+        "records": [clean, previs, segment],
+        "notes": [
+            "clean_refs_multiref is the current safer production experiment because panel borders and storyboard text are cropped before motion.",
+            "previs_page is a sidecar comparison path for whole-page storyboard understanding; do not route into final timeline yet.",
+            "grid_multiref_segments is allowed only behind --use-grid-multiref-segments and keeps static fallback for failed groups.",
+        ],
+        "created_at": datetime.now().isoformat(timespec="seconds"),
+    }
+    try:
+        (OUTPUT_DIR / "storyboard_motion_compare_qa.json").write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+    except Exception as e:
+        log(f"storyboard_motion_compare_qa.json 写入失败: {e}")
+    return payload
+
+
 def _scene_segment_duration(scene: dict) -> float:
     vid_path = scene.get("vid_path")
     if vid_path and os.path.exists(vid_path):
@@ -5949,13 +6001,15 @@ def step65_motion(script: list[dict]):
 
     aspect = "9:16" if IS_VERTICAL else "16:9"
     results: dict[int, bool] = {}
-    _generate_previs_page_motion_segments(script, motion_prompts, aspect)
+    previs_qa = _generate_previs_page_motion_segments(script, motion_prompts, aspect)
     grid_motion_qa = _generate_grid_multiref_motion_segments(script, motion_prompts, aspect)
     if STORYBOARD_GRID_MULTIREF_SEGMENTS:
         seg_qa = _apply_grid_multiref_segments(script, grid_motion_qa)
+        _write_storyboard_motion_compare_qa(grid_motion_qa, previs_qa, seg_qa)
         success_cnt = int((seg_qa or {}).get("success_count") or 0)
         tg(f"✅ Grid multi-ref 实验动态化完成：{success_cnt}/{n} 段替换，其余保留既有兜底")
         return
+    _write_storyboard_motion_compare_qa(grid_motion_qa, previs_qa, None)
 
     def _run_batch(indices: list[int], round_label: str, safe_retry: bool = False):
         """跑一批 indices，更新 results。task_id 持久化保证重试时已成功的分镜不会重复烧钱。"""
@@ -6005,9 +6059,10 @@ def step65_grid_multiref_motion_qa(script: list[dict]):
     tg(f"🧪 Grid multi-ref motion QA-only 启动：{n} 分镜")
     motion_prompts = _generate_motion_prompts(script)
     aspect = "9:16" if IS_VERTICAL else "16:9"
-    _generate_previs_page_motion_segments(script, motion_prompts, aspect)
+    previs_qa = _generate_previs_page_motion_segments(script, motion_prompts, aspect)
     grid_motion_qa = _generate_grid_multiref_motion_segments(script, motion_prompts, aspect)
-    _apply_grid_multiref_segments(script, grid_motion_qa)
+    seg_qa = _apply_grid_multiref_segments(script, grid_motion_qa)
+    _write_storyboard_motion_compare_qa(grid_motion_qa, previs_qa, seg_qa)
 
 
 # ── 第七步：拼接视频轨 ────────────────────────────────────────────────────────
