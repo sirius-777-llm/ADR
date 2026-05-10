@@ -3586,7 +3586,7 @@ def _qa_clean_storyboard_panel(path: Path) -> dict:
                         bright += 1
             return bright / total
 
-        def largest_bright_component_ratio(box: tuple[int, int, int, int]) -> float:
+        def bright_component_summary(box: tuple[int, int, int, int]) -> dict:
             x1, y1, x2, y2 = box
             bw = max(1, x2 - x1)
             bh = max(1, y2 - y1)
@@ -3598,17 +3598,28 @@ def _qa_clean_storyboard_panel(path: Path) -> dict:
                         bright[row + xx] = 1
             seen = bytearray(bw * bh)
             largest = 0
+            marker_ratio = 0.0
+            marker_aspect = 0.0
+            marker_fill = 0.0
             for pos, val in enumerate(bright):
                 if not val or seen[pos]:
                     continue
                 stack = [pos]
                 seen[pos] = 1
                 size = 0
+                min_x = bw
+                min_y = bh
+                max_x = 0
+                max_y = 0
                 while stack:
                     cur = stack.pop()
                     size += 1
                     cx = cur % bw
                     cy = cur // bw
+                    min_x = min(min_x, cx)
+                    min_y = min(min_y, cy)
+                    max_x = max(max_x, cx)
+                    max_y = max(max_y, cy)
                     for nx, ny in ((cx - 1, cy), (cx + 1, cy), (cx, cy - 1), (cx, cy + 1)):
                         if nx < 0 or ny < 0 or nx >= bw or ny >= bh:
                             continue
@@ -3617,7 +3628,25 @@ def _qa_clean_storyboard_panel(path: Path) -> dict:
                             seen[npos] = 1
                             stack.append(npos)
                 largest = max(largest, size)
-            return largest / max(1, bw * bh)
+                comp_w = max(1, max_x - min_x + 1)
+                comp_h = max(1, max_y - min_y + 1)
+                area_ratio = size / max(1, bw * bh)
+                aspect = max(comp_w / comp_h, comp_h / comp_w)
+                fill = size / max(1, comp_w * comp_h)
+                # Storyboard motion arrows are usually compact, thin, high-contrast marks.
+                # Natural highlights in cups/windows/skin tend to be broad blobs or dense glare.
+                if 0.0002 <= area_ratio <= 0.008 and aspect >= 2.2 and fill <= 0.5:
+                    if area_ratio > marker_ratio:
+                        marker_ratio = area_ratio
+                        marker_aspect = aspect
+                        marker_fill = fill
+            total = max(1, bw * bh)
+            return {
+                "largest_ratio": largest / total,
+                "marker_ratio": marker_ratio,
+                "marker_aspect": marker_aspect,
+                "marker_fill": marker_fill,
+            }
 
         edge_h = max(8, int(H * 0.025))
         edge_w = max(8, int(W * 0.025))
@@ -3627,16 +3656,21 @@ def _qa_clean_storyboard_panel(path: Path) -> dict:
         qa["right_black_ratio"] = round(dark_ratio((W - edge_w, 0, W, H)), 4)
         corner_box = (0, 0, int(W * 0.14), int(H * 0.16))
         lower_center_box = (int(W * 0.25), int(H * 0.55), int(W * 0.75), H)
+        corner_components = bright_component_summary(corner_box)
+        lower_components = bright_component_summary(lower_center_box)
         qa["top_left_bright_ratio"] = round(bright_ratio(corner_box), 4)
-        qa["top_left_bright_component_ratio"] = round(largest_bright_component_ratio(corner_box), 4)
+        qa["top_left_bright_component_ratio"] = round(corner_components["largest_ratio"], 4)
         qa["lower_center_bright_ratio"] = round(bright_ratio(lower_center_box), 4)
+        qa["lower_center_marker_component_ratio"] = round(lower_components["marker_ratio"], 4)
+        qa["lower_center_marker_aspect"] = round(lower_components["marker_aspect"], 2)
+        qa["lower_center_marker_fill"] = round(lower_components["marker_fill"], 2)
         if min(qa["top_black_ratio"], qa["bottom_black_ratio"]) > 0.42:
             qa["issues"].append("possible_horizontal_letterbox")
         if min(qa["left_black_ratio"], qa["right_black_ratio"]) > 0.42:
             qa["issues"].append("possible_vertical_letterbox")
         if 0.002 <= qa["top_left_bright_component_ratio"] <= 0.09 and qa["top_left_bright_ratio"] > 0.015:
             qa["issues"].append("possible_shot_number_residue")
-        if qa["lower_center_bright_ratio"] > 0.02:
+        if qa["lower_center_bright_ratio"] > 0.015 and qa["lower_center_marker_component_ratio"] > 0.0015:
             qa["issues"].append("possible_arrow_or_motion_marker_residue")
         qa["pass"] = not qa["issues"]
     except Exception as e:
