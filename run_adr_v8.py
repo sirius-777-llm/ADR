@@ -171,9 +171,13 @@ STORYBOARD_GRID_MULTIREF_SEGMENTS = (
     "--use-grid-multiref-segments" in sys.argv
     or os.environ.get("ADR_STORYBOARD_GRID_MULTIREF_SEGMENTS", "").strip().lower() in ("1", "true", "yes", "on")
 )
+PREVIS_PAGE_MOTION = (
+    "--with-previs-page-motion" in sys.argv
+    or os.environ.get("ADR_PREVIS_PAGE_MOTION", "").strip().lower() in ("1", "true", "yes", "on")
+)
 if STORYBOARD_GRID_MULTIREF_SEGMENTS:
     STORYBOARD_GRID_MULTIREF_MOTION = True
-if STORYBOARD_GRID_MULTIREF_MOTION:
+if STORYBOARD_GRID_MULTIREF_MOTION or PREVIS_PAGE_MOTION:
     GPT_IMAGE2_STORYBOARD_GRID = True
 ADSD_LIP_SYNC_EXPERIMENT = (
     "--adsd-lip-sync" in sys.argv
@@ -4909,14 +4913,29 @@ def _motion_one_scene(idx: int, scene: dict, motion_prompt: str, aspect_ratio: s
 
 
 _grid_multiref_tasks_lock = threading.Lock()
+_previs_page_tasks_lock = threading.Lock()
 
 
 def _grid_multiref_tasks_file() -> Path:
     return OUTPUT_DIR / "grid_multiref_motion_tasks.json"
 
 
+def _previs_page_tasks_file() -> Path:
+    return OUTPUT_DIR / "previs_page_motion_tasks.json"
+
+
 def _load_grid_multiref_tasks() -> dict:
     p = _grid_multiref_tasks_file()
+    if not p.exists():
+        return {}
+    try:
+        return json.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def _load_previs_page_tasks() -> dict:
+    p = _previs_page_tasks_file()
     if not p.exists():
         return {}
     try:
@@ -4932,11 +4951,25 @@ def _save_grid_multiref_task(group_key: str, task_id: str) -> None:
         _grid_multiref_tasks_file().write_text(json.dumps(tasks, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
+def _save_previs_page_task(group_key: str, task_id: str) -> None:
+    with _previs_page_tasks_lock:
+        tasks = _load_previs_page_tasks()
+        tasks[group_key] = task_id
+        _previs_page_tasks_file().write_text(json.dumps(tasks, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
 def _remove_grid_multiref_task(group_key: str) -> None:
     with _grid_multiref_tasks_lock:
         tasks = _load_grid_multiref_tasks()
         tasks.pop(group_key, None)
         _grid_multiref_tasks_file().write_text(json.dumps(tasks, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _remove_previs_page_task(group_key: str) -> None:
+    with _previs_page_tasks_lock:
+        tasks = _load_previs_page_tasks()
+        tasks.pop(group_key, None)
+        _previs_page_tasks_file().write_text(json.dumps(tasks, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
 def _poll_video_task_download(task_id: str, out_path: Path, label: str, max_iterations: int = 121) -> tuple[bool, dict]:
@@ -5039,6 +5072,16 @@ def _write_grid_multiref_motion_qa(payload: dict) -> None:
         )
     except Exception as e:
         log(f"grid_multiref_motion_qa.json 写入失败: {e}")
+
+
+def _write_previs_page_motion_qa(payload: dict) -> None:
+    try:
+        (OUTPUT_DIR / "previs_page_motion_qa.json").write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+    except Exception as e:
+        log(f"previs_page_motion_qa.json 写入失败: {e}")
 
 
 def _write_grid_multiref_segment_qa(payload: dict) -> None:
@@ -5235,6 +5278,169 @@ def _apply_grid_multiref_segments(script: list[dict], motion_qa: dict | None) ->
         tg(f"✅ Grid multi-ref 主时间线切片 QA 通过：{success_count}/{len(segment_records)} 段")
     else:
         tg(f"⚠️ Grid multi-ref 主时间线切片 QA 未全通过：{success_count}/{len(segment_records)} 段，失败段保留兜底")
+    return qa
+
+
+def _previs_page_duration(group: list[dict]) -> int:
+    override = os.environ.get("ADR_PREVIS_PAGE_DURATION", "").strip()
+    if override:
+        try:
+            return max(5, min(10, int(round(float(override)))))
+        except Exception:
+            pass
+    return _grid_multiref_duration(group)
+
+
+def _previs_page_group_prompt(group: list[dict], scene_indices: list[int], motion_prompts: list[str], has_character_sheet: bool) -> str:
+    lines = []
+    for local_i, (idx, scene) in enumerate(zip(scene_indices, group), start=1):
+        visual = _short_board_text(scene.get("prompt") or scene.get("shot") or scene.get("text"), 180)
+        motion = _short_board_text(motion_prompts[idx] if idx < len(motion_prompts) else "", 110)
+        lines.append(f"{local_i}. Scene {idx + 1}: {visual} Motion motivation: {motion}")
+    character_sheet_rule = (
+        "Use the second uploaded image as a character/style sheet. Lock character identity, face, clothing, era, and palette to it. "
+        if has_character_sheet else ""
+    )
+    return (
+        "INTENT: Turn the uploaded previs storyboard page into one coherent cinematic documentary sequence. "
+        "STYLE: historically grounded cinematic realism, readable compositions, controlled camera movement, no random jump cuts. "
+        "WORLD: preserve the era, location logic, props, costumes, lighting, and documentary mood shown in the storyboard. "
+        "REFERENCES: Use the first uploaded image as a previs storyboard page, not as a single still frame. "
+        "Do not treat the page as one single image. Treat its panels as sequential shot keyframes in reading order, "
+        "left-to-right then top-to-bottom, and expand them into a continuous short scene with clear continuity. "
+        f"{character_sheet_rule}"
+        "VISUAL APPROACH: Match the storyboard's spatial variety, emotional pacing, screen direction, and action continuity. "
+        "Prioritize clear shot order, motivated camera movement, and continuity across beats. Keep motion calm and intentional. "
+        "The final video must be a fully immersive scene, not a storyboard document. Do not render the page, panel borders, "
+        "grid lines, captions, labels, shot numbers, arrows, UI text, watermarks, logos, subtitles, or any burned-in text. "
+        f"SHOT PLAN: {' '.join(lines)}"
+    )[:2000]
+
+
+def _previs_page_groups(script: list[dict]) -> list[tuple[str, list[int], list[dict]]]:
+    grouped: dict[str, list[tuple[int, dict]]] = {}
+    for i, scene in enumerate(script):
+        grid_path = scene.get("storyboard_grid_source")
+        if not grid_path or not os.path.exists(grid_path):
+            continue
+        grouped.setdefault(str(grid_path), []).append((i, scene))
+    groups = []
+    for grid_path, pairs in grouped.items():
+        pairs.sort(key=lambda p: p[0])
+        groups.append((grid_path, [i for i, _ in pairs], [scene for _, scene in pairs]))
+    groups.sort(key=lambda item: item[1][0] if item[1] else 10**9)
+    return groups
+
+
+def _generate_previs_page_motion_segments(script: list[dict], motion_prompts: list[str], aspect_ratio: str) -> dict | None:
+    """Sidecar QA path: whole storyboard page -> WERYDANCE previs-page video."""
+    if not PREVIS_PAGE_MOTION or ADS_DIALOGUE_MODE:
+        return None
+    groups = _previs_page_groups(script)
+    character_sheet = os.environ.get("ADR_PREVIS_CHARACTER_SHEET", "").strip()
+    has_character_sheet = bool(character_sheet and os.path.exists(character_sheet))
+    qa = {
+        "mode": "storyboard_previs_page_to_werydance",
+        "enabled": True,
+        "interface": "almighty-reference-to-video",
+        "model": "WERYDANCE_2_0",
+        "aspect_ratio": aspect_ratio,
+        "resolution": os.environ.get("ADR_PREVIS_PAGE_RESOLUTION", "720p"),
+        "total_pages": len(groups),
+        "character_sheet": character_sheet if has_character_sheet else None,
+        "records": [],
+        "policy": "sidecar_previs_page_motion_qa_only_not_used_for_final_concat",
+        "manual_visual_checks_required": [
+            "page_is_not_rendered_as_document",
+            "panel_order_is_followed",
+            "no_grid_lines_or_panel_borders",
+            "no_shot_numbers_labels_arrows_or_captions",
+            "continuity_matches_storyboard_pacing",
+        ],
+        "created_at": datetime.now().isoformat(timespec="seconds"),
+    }
+    if not groups:
+        qa.update({"pass": False, "reason": "no_storyboard_grid_pages"})
+        _write_previs_page_motion_qa(qa)
+        return qa
+
+    tg(f"🎞 Previs page motion QA 启动：storyboard page × {len(groups)}")
+    for group_no, (grid_path, scene_indices, group) in enumerate(groups, start=1):
+        group_key = f"{scene_indices[0] + 1:02d}_{scene_indices[-1] + 1:02d}"
+        out_path = OUTPUT_DIR / f"previs_page_{group_key}.mp4"
+        record = {
+            "group": group_no,
+            "scene_start": scene_indices[0] + 1,
+            "scene_end": scene_indices[-1] + 1,
+            "scene_indices": [i + 1 for i in scene_indices],
+            "storyboard_page": grid_path,
+            "pass": False,
+        }
+        qa["records"].append(record)
+        try:
+            existing_tid = _load_previs_page_tasks().get(group_key)
+            if existing_tid:
+                record.update({"task_id": existing_tid, "resumed_task": True})
+                ok, info = _poll_video_task_download(existing_tid, out_path, f"previs page {group_no}")
+                record.update(info)
+                record["pass"] = ok
+                if ok or record.get("reason") == "task_failed":
+                    _remove_previs_page_task(group_key)
+                _write_previs_page_motion_qa(qa)
+                continue
+
+            image_urls = [_upload_to_weryai(grid_path)]
+            if has_character_sheet:
+                image_urls.append(_upload_to_weryai(character_sheet))
+            duration = _previs_page_duration(group)
+            prompt = _previs_page_group_prompt(group, scene_indices, motion_prompts, has_character_sheet)
+            _wait_motion_submit_slot(f"previs page {group_no}")
+            r = req_post("/generation/almighty-reference-to-video", {
+                "model": "WERYDANCE_2_0",
+                "images": image_urls,
+                "prompt": prompt,
+                "duration": duration,
+                "aspect_ratio": aspect_ratio,
+                "resolution": qa["resolution"],
+                "generate_audio": "false",
+                "video_number": 1,
+            }, timeout=30)
+            task_id = r.get("data", {}).get("task_id") or (r.get("data", {}).get("task_ids") or [None])[0]
+            record.update({
+                "image_urls": image_urls,
+                "submit_duration": duration,
+                "task_id": task_id,
+            })
+            if not task_id:
+                record.update({"reason": "submit_without_task_id", "response": r})
+                continue
+            _save_previs_page_task(group_key, task_id)
+            ok, info = _poll_video_task_download(task_id, out_path, f"previs page {group_no}")
+            record.update(info)
+            record["pass"] = ok
+            if ok or record.get("reason") == "task_failed":
+                _remove_previs_page_task(group_key)
+            if ok:
+                tg(f"🎞 Previs page {record['scene_start']}-{record['scene_end']} ✓")
+            else:
+                tg(f"⚠️ Previs page {record['scene_start']}-{record['scene_end']} 失败：{record.get('reason')}")
+        except Exception as e:
+            record.update({"pass": False, "reason": str(e)})
+            tg(f"⚠️ Previs page {record['scene_start']}-{record['scene_end']} 异常：{str(e)[:120]}")
+        _write_previs_page_motion_qa(qa)
+
+    success_count = sum(1 for r in qa["records"] if r.get("pass"))
+    qa.update({
+        "success_count": success_count,
+        "total_groups": len(qa["records"]),
+        "pass": success_count == len(qa["records"]) and success_count > 0,
+        "finalized_at": datetime.now().isoformat(timespec="seconds"),
+    })
+    _write_previs_page_motion_qa(qa)
+    if qa["pass"]:
+        tg(f"✅ Previs page motion QA 完成：{success_count}/{len(qa['records'])} 组通过")
+    else:
+        tg(f"⚠️ Previs page motion QA 未全通过：{success_count}/{len(qa['records'])} 组")
     return qa
 
 
@@ -5743,6 +5949,7 @@ def step65_motion(script: list[dict]):
 
     aspect = "9:16" if IS_VERTICAL else "16:9"
     results: dict[int, bool] = {}
+    _generate_previs_page_motion_segments(script, motion_prompts, aspect)
     grid_motion_qa = _generate_grid_multiref_motion_segments(script, motion_prompts, aspect)
     if STORYBOARD_GRID_MULTIREF_SEGMENTS:
         seg_qa = _apply_grid_multiref_segments(script, grid_motion_qa)
@@ -5798,6 +6005,7 @@ def step65_grid_multiref_motion_qa(script: list[dict]):
     tg(f"🧪 Grid multi-ref motion QA-only 启动：{n} 分镜")
     motion_prompts = _generate_motion_prompts(script)
     aspect = "9:16" if IS_VERTICAL else "16:9"
+    _generate_previs_page_motion_segments(script, motion_prompts, aspect)
     grid_motion_qa = _generate_grid_multiref_motion_segments(script, motion_prompts, aspect)
     _apply_grid_multiref_segments(script, grid_motion_qa)
 
@@ -7972,8 +8180,8 @@ def main():
             t = time.time(); step66_adsd_lip_sync(script);                    timings["ADSD 口型同步"] = time.time() - t
         elif WITH_MOTION:
             t = time.time(); step65_motion(script);                            timings["动态化 (WERYDANCE)"] = time.time() - t
-        elif STORYBOARD_GRID_MULTIREF_MOTION:
-            t = time.time(); step65_grid_multiref_motion_qa(script);            timings["Grid multi-ref motion QA"] = time.time() - t
+        elif STORYBOARD_GRID_MULTIREF_MOTION or PREVIS_PAGE_MOTION:
+            t = time.time(); step65_grid_multiref_motion_qa(script);            timings["Storyboard motion QA"] = time.time() - t
         t = time.time(); raw_path   = step7_concat(script);                   timings["视频拼接"] = time.time() - t
         if NO_VOICE:
             ass_path = ""
