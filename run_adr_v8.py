@@ -167,6 +167,12 @@ STORYBOARD_GRID_MULTIREF_MOTION = (
     "--with-grid-multiref-motion" in sys.argv
     or os.environ.get("ADR_STORYBOARD_GRID_MULTIREF_MOTION", "").strip().lower() in ("1", "true", "yes", "on")
 )
+STORYBOARD_GRID_MULTIREF_SEGMENTS = (
+    "--use-grid-multiref-segments" in sys.argv
+    or os.environ.get("ADR_STORYBOARD_GRID_MULTIREF_SEGMENTS", "").strip().lower() in ("1", "true", "yes", "on")
+)
+if STORYBOARD_GRID_MULTIREF_SEGMENTS:
+    STORYBOARD_GRID_MULTIREF_MOTION = True
 if STORYBOARD_GRID_MULTIREF_MOTION:
     GPT_IMAGE2_STORYBOARD_GRID = True
 ADSD_LIP_SYNC_EXPERIMENT = (
@@ -5035,6 +5041,203 @@ def _write_grid_multiref_motion_qa(payload: dict) -> None:
         log(f"grid_multiref_motion_qa.json 写入失败: {e}")
 
 
+def _write_grid_multiref_segment_qa(payload: dict) -> None:
+    try:
+        (OUTPUT_DIR / "grid_multiref_segment_qa.json").write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+    except Exception as e:
+        log(f"grid_multiref_segment_qa.json 写入失败: {e}")
+
+
+def _scene_segment_duration(scene: dict) -> float:
+    vid_path = scene.get("vid_path")
+    if vid_path and os.path.exists(vid_path):
+        try:
+            dur = ffprobe_duration(vid_path)
+            if dur > 0:
+                return dur
+        except Exception:
+            pass
+    for key in ("vid_duration", "dur"):
+        try:
+            dur = float(scene.get(key) or 0)
+            if dur > 0:
+                return dur
+        except Exception:
+            pass
+    return 1.25
+
+
+def _apply_grid_multiref_segments(script: list[dict], motion_qa: dict | None) -> dict | None:
+    """Experimental mainline: split successful multi-ref chunks back into seg_N.mp4 files."""
+    if not STORYBOARD_GRID_MULTIREF_SEGMENTS or ADS_DIALOGUE_MODE:
+        return None
+    records = (motion_qa or {}).get("records") or []
+    qa = {
+        "mode": "grid_multiref_video_split_to_main_segments",
+        "enabled": True,
+        "policy": "replace_only_successful_group_segments_static_fallback_for_failures",
+        "target_width": VIDEO_W,
+        "target_height": VIDEO_H,
+        "records": [],
+        "created_at": datetime.now().isoformat(timespec="seconds"),
+    }
+    for record in records:
+        if not record.get("pass"):
+            qa["records"].append({
+                "group": record.get("group"),
+                "scene_indices": record.get("scene_indices"),
+                "pass": False,
+                "reason": "motion_group_not_passed",
+            })
+            continue
+        src_path = record.get("path")
+        if not src_path or not os.path.exists(src_path):
+            qa["records"].append({
+                "group": record.get("group"),
+                "scene_indices": record.get("scene_indices"),
+                "pass": False,
+                "reason": "missing_multiref_video",
+                "path": src_path,
+            })
+            continue
+        raw_indices = record.get("scene_indices") or []
+        scene_indices = []
+        for value in raw_indices:
+            try:
+                idx = int(value) - 1
+                if 0 <= idx < len(script):
+                    scene_indices.append(idx)
+            except Exception:
+                pass
+        if not scene_indices:
+            qa["records"].append({
+                "group": record.get("group"),
+                "scene_indices": raw_indices,
+                "pass": False,
+                "reason": "empty_scene_indices",
+                "path": src_path,
+            })
+            continue
+        try:
+            raw_dur = ffprobe_duration(src_path)
+        except Exception as e:
+            qa["records"].append({
+                "group": record.get("group"),
+                "scene_indices": raw_indices,
+                "pass": False,
+                "reason": f"ffprobe_source_failed:{e}",
+                "path": src_path,
+            })
+            continue
+        target_durations = [max(0.2, _scene_segment_duration(script[i])) for i in scene_indices]
+        total_target = sum(target_durations)
+        group_record = {
+            "group": record.get("group"),
+            "source_path": src_path,
+            "source_duration": round(raw_dur, 3),
+            "target_total_duration": round(total_target, 3),
+            "scene_indices": [i + 1 for i in scene_indices],
+            "segments": [],
+            "pass": False,
+        }
+        cursor = 0.0
+        for local_i, idx in enumerate(scene_indices):
+            scene = script[idx]
+            target_dur = target_durations[local_i]
+            source_start = raw_dur * (cursor / total_target) if total_target > 0 else 0.0
+            source_dur = raw_dur * (target_dur / total_target) if total_target > 0 else raw_dur / max(len(scene_indices), 1)
+            source_dur = max(0.05, min(source_dur, max(0.05, raw_dur - source_start)))
+            ratio = target_dur / source_dur if source_dur > 0 else 1.0
+            tmp_path = str(OUTPUT_DIR / f"seg_{idx}.grid_multiref.tmp.mp4")
+            final_path = scene.get("vid_path") or str(OUTPUT_DIR / f"seg_{idx}.mp4")
+            seg_record = {
+                "scene": idx + 1,
+                "target_path": final_path,
+                "target_duration": round(target_dur, 3),
+                "source_start": round(source_start, 3),
+                "source_duration": round(source_dur, 3),
+                "speed_ratio": round(ratio, 4),
+                "pass": False,
+            }
+            try:
+                vf = (
+                    f"trim=start={source_start:.4f}:duration={source_dur:.4f},"
+                    f"setpts=(PTS-STARTPTS)*{ratio:.8f},"
+                    f"scale={VIDEO_W}:{VIDEO_H}:force_original_aspect_ratio=increase,"
+                    f"crop={VIDEO_W}:{VIDEO_H},setsar=1,fps=24,format=yuv420p"
+                )
+                ffmpeg(
+                    "-i", src_path,
+                    "-vf", vf,
+                    "-an",
+                    "-t", f"{target_dur:.4f}",
+                    "-c:v", "libx264",
+                    "-preset", "veryfast",
+                    "-crf", "18",
+                    "-pix_fmt", "yuv420p",
+                    "-movflags", "+faststart",
+                    tmp_path,
+                    timeout=120,
+                )
+                if os.path.exists(tmp_path) and os.path.getsize(tmp_path) > 10000:
+                    os.replace(tmp_path, final_path)
+                out_dur = ffprobe_duration(final_path) if os.path.exists(final_path) else None
+                out_w, out_h = ffprobe_video_size(final_path) if os.path.exists(final_path) else (None, None)
+                delta = abs((out_dur or 0.0) - target_dur) if out_dur is not None else None
+                seg_record.update({
+                    "output_duration": round(out_dur, 3) if out_dur is not None else None,
+                    "duration_delta": round(delta, 3) if delta is not None else None,
+                    "width": out_w,
+                    "height": out_h,
+                    "bytes": os.path.getsize(final_path) if os.path.exists(final_path) else 0,
+                    "pass": (
+                        out_dur is not None
+                        and delta is not None
+                        and delta <= 0.25
+                        and out_w == VIDEO_W
+                        and out_h == VIDEO_H
+                        and os.path.getsize(final_path) > 10000
+                    ),
+                })
+                if seg_record["pass"]:
+                    scene["grid_multiref_segment_mode"] = True
+                    scene["grid_multiref_source"] = src_path
+                else:
+                    seg_record.setdefault("reason", "segment_qa_failed")
+            except Exception as e:
+                seg_record.update({"pass": False, "reason": str(e)})
+            finally:
+                try:
+                    if os.path.exists(tmp_path):
+                        os.remove(tmp_path)
+                except Exception:
+                    pass
+            group_record["segments"].append(seg_record)
+            cursor += target_dur
+        group_record["pass"] = all(s.get("pass") for s in group_record["segments"])
+        qa["records"].append(group_record)
+        _write_grid_multiref_segment_qa(qa)
+
+    segment_records = [s for g in qa["records"] for s in g.get("segments", [])]
+    success_count = sum(1 for s in segment_records if s.get("pass"))
+    qa.update({
+        "total_segments": len(segment_records),
+        "success_count": success_count,
+        "success_rate": round(success_count / max(len(segment_records), 1), 4),
+        "pass": success_count > 0 and success_count == len(segment_records),
+        "finalized_at": datetime.now().isoformat(timespec="seconds"),
+    })
+    _write_grid_multiref_segment_qa(qa)
+    if qa["pass"]:
+        tg(f"✅ Grid multi-ref 主时间线切片 QA 通过：{success_count}/{len(segment_records)} 段")
+    else:
+        tg(f"⚠️ Grid multi-ref 主时间线切片 QA 未全通过：{success_count}/{len(segment_records)} 段，失败段保留兜底")
+    return qa
+
+
 def _generate_grid_multiref_motion_segments(script: list[dict], motion_prompts: list[str], aspect_ratio: str) -> dict | None:
     """Sidecar QA path: clean grid panels -> WERYDANCE multi-reference video chunks.
 
@@ -5540,7 +5743,12 @@ def step65_motion(script: list[dict]):
 
     aspect = "9:16" if IS_VERTICAL else "16:9"
     results: dict[int, bool] = {}
-    _generate_grid_multiref_motion_segments(script, motion_prompts, aspect)
+    grid_motion_qa = _generate_grid_multiref_motion_segments(script, motion_prompts, aspect)
+    if STORYBOARD_GRID_MULTIREF_SEGMENTS:
+        seg_qa = _apply_grid_multiref_segments(script, grid_motion_qa)
+        success_cnt = int((seg_qa or {}).get("success_count") or 0)
+        tg(f"✅ Grid multi-ref 实验动态化完成：{success_cnt}/{n} 段替换，其余保留既有兜底")
+        return
 
     def _run_batch(indices: list[int], round_label: str, safe_retry: bool = False):
         """跑一批 indices，更新 results。task_id 持久化保证重试时已成功的分镜不会重复烧钱。"""
@@ -5590,7 +5798,8 @@ def step65_grid_multiref_motion_qa(script: list[dict]):
     tg(f"🧪 Grid multi-ref motion QA-only 启动：{n} 分镜")
     motion_prompts = _generate_motion_prompts(script)
     aspect = "9:16" if IS_VERTICAL else "16:9"
-    _generate_grid_multiref_motion_segments(script, motion_prompts, aspect)
+    grid_motion_qa = _generate_grid_multiref_motion_segments(script, motion_prompts, aspect)
+    _apply_grid_multiref_segments(script, grid_motion_qa)
 
 
 # ── 第七步：拼接视频轨 ────────────────────────────────────────────────────────
