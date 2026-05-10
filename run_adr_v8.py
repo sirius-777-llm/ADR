@@ -3586,6 +3586,39 @@ def _qa_clean_storyboard_panel(path: Path) -> dict:
                         bright += 1
             return bright / total
 
+        def largest_bright_component_ratio(box: tuple[int, int, int, int]) -> float:
+            x1, y1, x2, y2 = box
+            bw = max(1, x2 - x1)
+            bh = max(1, y2 - y1)
+            bright = bytearray(bw * bh)
+            for yy, y in enumerate(range(y1, y2)):
+                row = yy * bw
+                for xx, x in enumerate(range(x1, x2)):
+                    if pix[x, y] > 238:
+                        bright[row + xx] = 1
+            seen = bytearray(bw * bh)
+            largest = 0
+            for pos, val in enumerate(bright):
+                if not val or seen[pos]:
+                    continue
+                stack = [pos]
+                seen[pos] = 1
+                size = 0
+                while stack:
+                    cur = stack.pop()
+                    size += 1
+                    cx = cur % bw
+                    cy = cur // bw
+                    for nx, ny in ((cx - 1, cy), (cx + 1, cy), (cx, cy - 1), (cx, cy + 1)):
+                        if nx < 0 or ny < 0 or nx >= bw or ny >= bh:
+                            continue
+                        npos = ny * bw + nx
+                        if bright[npos] and not seen[npos]:
+                            seen[npos] = 1
+                            stack.append(npos)
+                largest = max(largest, size)
+            return largest / max(1, bw * bh)
+
         edge_h = max(8, int(H * 0.025))
         edge_w = max(8, int(W * 0.025))
         qa["top_black_ratio"] = round(dark_ratio((0, 0, W, edge_h)), 4)
@@ -3595,12 +3628,13 @@ def _qa_clean_storyboard_panel(path: Path) -> dict:
         corner_box = (0, 0, int(W * 0.14), int(H * 0.16))
         lower_center_box = (int(W * 0.25), int(H * 0.55), int(W * 0.75), H)
         qa["top_left_bright_ratio"] = round(bright_ratio(corner_box), 4)
+        qa["top_left_bright_component_ratio"] = round(largest_bright_component_ratio(corner_box), 4)
         qa["lower_center_bright_ratio"] = round(bright_ratio(lower_center_box), 4)
         if min(qa["top_black_ratio"], qa["bottom_black_ratio"]) > 0.42:
             qa["issues"].append("possible_horizontal_letterbox")
         if min(qa["left_black_ratio"], qa["right_black_ratio"]) > 0.42:
             qa["issues"].append("possible_vertical_letterbox")
-        if qa["top_left_bright_ratio"] > 0.12:
+        if 0.002 <= qa["top_left_bright_component_ratio"] <= 0.09 and qa["top_left_bright_ratio"] > 0.015:
             qa["issues"].append("possible_shot_number_residue")
         if qa["lower_center_bright_ratio"] > 0.003:
             qa["issues"].append("possible_arrow_or_motion_marker_residue")
