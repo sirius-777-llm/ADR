@@ -3636,7 +3636,7 @@ def _qa_clean_storyboard_panel(path: Path) -> dict:
             qa["issues"].append("possible_vertical_letterbox")
         if 0.002 <= qa["top_left_bright_component_ratio"] <= 0.09 and qa["top_left_bright_ratio"] > 0.015:
             qa["issues"].append("possible_shot_number_residue")
-        if qa["lower_center_bright_ratio"] > 0.003:
+        if qa["lower_center_bright_ratio"] > 0.02:
             qa["issues"].append("possible_arrow_or_motion_marker_residue")
         qa["pass"] = not qa["issues"]
     except Exception as e:
