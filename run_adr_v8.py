@@ -163,6 +163,12 @@ GPT_IMAGE2_STORYBOARD_GRID = (
     or "--with-storyboard-grid-4k" in sys.argv
     or os.environ.get("ADR_GPT_IMAGE2_STORYBOARD_GRID", "").strip().lower() in ("1", "true", "yes", "on")
 )
+STORYBOARD_GRID_MULTIREF_MOTION = (
+    "--with-grid-multiref-motion" in sys.argv
+    or os.environ.get("ADR_STORYBOARD_GRID_MULTIREF_MOTION", "").strip().lower() in ("1", "true", "yes", "on")
+)
+if STORYBOARD_GRID_MULTIREF_MOTION:
+    GPT_IMAGE2_STORYBOARD_GRID = True
 ADSD_LIP_SYNC_EXPERIMENT = (
     "--adsd-lip-sync" in sys.argv
     or "--lip-sync" in sys.argv
@@ -4896,6 +4902,264 @@ def _motion_one_scene(idx: int, scene: dict, motion_prompt: str, aspect_ratio: s
         return False
 
 
+_grid_multiref_tasks_lock = threading.Lock()
+
+
+def _grid_multiref_tasks_file() -> Path:
+    return OUTPUT_DIR / "grid_multiref_motion_tasks.json"
+
+
+def _load_grid_multiref_tasks() -> dict:
+    p = _grid_multiref_tasks_file()
+    if not p.exists():
+        return {}
+    try:
+        return json.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def _save_grid_multiref_task(group_key: str, task_id: str) -> None:
+    with _grid_multiref_tasks_lock:
+        tasks = _load_grid_multiref_tasks()
+        tasks[group_key] = task_id
+        _grid_multiref_tasks_file().write_text(json.dumps(tasks, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _remove_grid_multiref_task(group_key: str) -> None:
+    with _grid_multiref_tasks_lock:
+        tasks = _load_grid_multiref_tasks()
+        tasks.pop(group_key, None)
+        _grid_multiref_tasks_file().write_text(json.dumps(tasks, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _poll_video_task_download(task_id: str, out_path: Path, label: str, max_iterations: int = 121) -> tuple[bool, dict]:
+    info = {
+        "task_id": task_id,
+        "path": str(out_path),
+        "pass": False,
+    }
+    for iteration in range(max_iterations):
+        try:
+            s = req_get(f"/generation/{task_id}/status")
+            data = s.get("data", {})
+            st = data.get("task_status", "")
+            if iteration == 0 or iteration % 12 == 0 or st in ("succeed", "failed"):
+                log(f"[{label}] poll #{iteration+1}: {st}")
+            if st == "succeed":
+                vid_url = _extract_video_url(data)
+                if not vid_url:
+                    info.update({"reason": "succeed_without_video_url", "response": data})
+                    return False, info
+                tmp_path = out_path.with_suffix(out_path.suffix + ".tmp")
+                urllib.request.urlretrieve(vid_url, tmp_path)
+                if not tmp_path.exists() or tmp_path.stat().st_size < 10000:
+                    info.update({"reason": "download_file_too_small"})
+                    return False, info
+                os.replace(tmp_path, out_path)
+                w, h = ffprobe_video_size(str(out_path))
+                try:
+                    dur = ffprobe_duration(str(out_path))
+                except Exception:
+                    dur = None
+                info.update({
+                    "pass": True,
+                    "video_url": vid_url,
+                    "bytes": out_path.stat().st_size,
+                    "width": w,
+                    "height": h,
+                    "duration": round(dur, 3) if dur is not None else None,
+                })
+                return True, info
+            if st == "failed":
+                info.update({"reason": "task_failed", "response": data})
+                return False, info
+        except Exception as e:
+            if iteration in (0, 12, 60, 120):
+                log(f"[{label}] poll 异常: {type(e).__name__}: {e}")
+        time.sleep(5)
+    info.update({"reason": "poll_timeout"})
+    return False, info
+
+
+def _grid_multiref_group_size() -> int:
+    try:
+        raw = int(os.environ.get("ADR_STORYBOARD_GRID_MULTIREF_GROUP", "4"))
+    except Exception:
+        raw = 4
+    return max(2, min(4, raw))
+
+
+def _grid_multiref_duration(group: list[dict]) -> int:
+    override = os.environ.get("ADR_STORYBOARD_GRID_MULTIREF_DURATION", "").strip()
+    if override:
+        try:
+            return max(5, min(10, int(round(float(override)))))
+        except Exception:
+            pass
+    total = 0.0
+    for scene in group:
+        try:
+            total += float(scene.get("vid_duration") or scene.get("dur") or 1.25)
+        except Exception:
+            total += 1.25
+    return max(5, min(10, int(round(total))))
+
+
+def _grid_multiref_prompt(group: list[dict], start_idx: int, motion_prompts: list[str]) -> str:
+    lines = []
+    for offset, scene in enumerate(group):
+        idx = start_idx + offset
+        visual = _short_board_text(scene.get("prompt") or scene.get("text"), 180)
+        motion = _short_board_text(motion_prompts[idx] if idx < len(motion_prompts) else "", 120)
+        lines.append(f"{offset + 1}. Scene {idx + 1}: {visual} Camera: {motion}")
+    return (
+        "Use the uploaded clean storyboard reference images as a sequential shot plan. "
+        "Each uploaded image is one shot, in the same order as the images array. "
+        "Create one coherent cinematic documentary video that moves through these shots in order, "
+        "preserving character identity, costume, period setting, lighting, color palette, and scene geography. "
+        "Animate only plausible motion: slow camera push, gentle handheld drift, cloth, paper, rain, crowd, smoke, "
+        "and natural human micro-movements. Do not render the storyboard grid, panel borders, shot numbers, labels, "
+        "captions, subtitles, arrows, director notes, UI text, watermarks, logos, or any burned-in text. "
+        f"Shot plan: {' '.join(lines)}"
+    )[:2000]
+
+
+def _write_grid_multiref_motion_qa(payload: dict) -> None:
+    try:
+        (OUTPUT_DIR / "grid_multiref_motion_qa.json").write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+    except Exception as e:
+        log(f"grid_multiref_motion_qa.json 写入失败: {e}")
+
+
+def _generate_grid_multiref_motion_segments(script: list[dict], motion_prompts: list[str], aspect_ratio: str) -> dict | None:
+    """Sidecar QA path: clean grid panels -> WERYDANCE multi-reference video chunks.
+
+    It intentionally does not replace seg_N.mp4 because one multi-reference video spans
+    multiple narration beats and needs separate timing policy before entering the main cut.
+    """
+    if not STORYBOARD_GRID_MULTIREF_MOTION or ADS_DIALOGUE_MODE:
+        return None
+    refs = [
+        (i, scene)
+        for i, scene in enumerate(script)
+        if scene.get("storyboard_grid_mode") and scene.get("img_path") and os.path.exists(scene.get("img_path"))
+    ]
+    qa = {
+        "mode": "storyboard_grid_clean_refs_to_werydance_multiref",
+        "enabled": True,
+        "interface": "almighty-reference-to-video",
+        "model": "WERYDANCE_2_0",
+        "aspect_ratio": aspect_ratio,
+        "resolution": os.environ.get("ADR_STORYBOARD_GRID_MULTIREF_RESOLUTION", "720p"),
+        "group_size": _grid_multiref_group_size(),
+        "total_refs": len(refs),
+        "records": [],
+        "policy": "sidecar_motion_qa_only_not_used_for_final_concat",
+        "manual_visual_checks_required": [
+            "shot_order_matches_reference_order",
+            "no_shot_numbers_or_arrows",
+            "no_grid_or_panel_borders",
+            "no_captions_or_subtitles",
+            "character_and_setting_consistency",
+        ],
+        "created_at": datetime.now().isoformat(timespec="seconds"),
+    }
+    if len(refs) < 2:
+        qa.update({"pass": False, "reason": "not_enough_grid_refs"})
+        _write_grid_multiref_motion_qa(qa)
+        return qa
+
+    tg(f"🧪 Grid multi-ref motion QA 启动：clean refs {len(refs)} 张，每组 {qa['group_size']} 张")
+    group_size = qa["group_size"]
+    for group_no, start in enumerate(range(0, len(refs), group_size), start=1):
+        group_pairs = refs[start:start + group_size]
+        if len(group_pairs) < 2:
+            continue
+        scene_indices = [i for i, _ in group_pairs]
+        group = [scene for _, scene in group_pairs]
+        record = {
+            "group": group_no,
+            "scene_start": scene_indices[0] + 1,
+            "scene_end": scene_indices[-1] + 1,
+            "scene_indices": [i + 1 for i in scene_indices],
+            "image_paths": [scene.get("img_path") for scene in group],
+            "pass": False,
+        }
+        qa["records"].append(record)
+        group_key = f"{scene_indices[0] + 1:02d}_{scene_indices[-1] + 1:02d}"
+        try:
+            existing_tid = _load_grid_multiref_tasks().get(group_key)
+            out_path = OUTPUT_DIR / f"grid_multiref_{group_key}.mp4"
+            if existing_tid:
+                record.update({"task_id": existing_tid, "resumed_task": True})
+                ok, info = _poll_video_task_download(existing_tid, out_path, f"grid multi-ref {group_no}")
+                record.update(info)
+                record["pass"] = ok
+                if ok or record.get("reason") == "task_failed":
+                    _remove_grid_multiref_task(group_key)
+                if ok:
+                    tg(f"🧪 Grid multi-ref {record['scene_start']}-{record['scene_end']} ✓ (resumed)")
+                else:
+                    tg(f"⚠️ Grid multi-ref {record['scene_start']}-{record['scene_end']} 未完成：{record.get('reason')}")
+                _write_grid_multiref_motion_qa(qa)
+                continue
+            image_urls = [_upload_to_weryai(scene["img_path"]) for scene in group]
+            duration = _grid_multiref_duration(group)
+            prompt = _grid_multiref_prompt(group, scene_indices[0], motion_prompts)
+            _wait_motion_submit_slot(f"grid multi-ref {group_no}")
+            r = req_post("/generation/almighty-reference-to-video", {
+                "model": "WERYDANCE_2_0",
+                "images": image_urls,
+                "prompt": prompt,
+                "duration": duration,
+                "aspect_ratio": aspect_ratio,
+                "resolution": qa["resolution"],
+                "generate_audio": "false",
+                "video_number": 1,
+            }, timeout=30)
+            task_id = r.get("data", {}).get("task_id") or (r.get("data", {}).get("task_ids") or [None])[0]
+            record.update({
+                "image_urls": image_urls,
+                "submit_duration": duration,
+                "task_id": task_id,
+            })
+            if not task_id:
+                record.update({"reason": "submit_without_task_id", "response": r})
+                continue
+            _save_grid_multiref_task(group_key, task_id)
+            ok, info = _poll_video_task_download(task_id, out_path, f"grid multi-ref {group_no}")
+            record.update(info)
+            record["pass"] = ok
+            if ok or record.get("reason") == "task_failed":
+                _remove_grid_multiref_task(group_key)
+            if ok:
+                tg(f"🧪 Grid multi-ref {record['scene_start']}-{record['scene_end']} ✓")
+            else:
+                tg(f"⚠️ Grid multi-ref {record['scene_start']}-{record['scene_end']} 失败：{record.get('reason')}")
+        except Exception as e:
+            record.update({"pass": False, "reason": str(e)})
+            tg(f"⚠️ Grid multi-ref {record['scene_start']}-{record['scene_end']} 异常：{str(e)[:120]}")
+        _write_grid_multiref_motion_qa(qa)
+
+    success_count = sum(1 for r in qa["records"] if r.get("pass"))
+    qa.update({
+        "success_count": success_count,
+        "total_groups": len(qa["records"]),
+        "pass": success_count == len(qa["records"]) and success_count > 0,
+        "finalized_at": datetime.now().isoformat(timespec="seconds"),
+    })
+    _write_grid_multiref_motion_qa(qa)
+    if qa["pass"]:
+        tg(f"✅ Grid multi-ref motion QA 完成：{success_count}/{len(qa['records'])} 组通过")
+    else:
+        tg(f"⚠️ Grid multi-ref motion QA 未全通过：{success_count}/{len(qa['records'])} 组")
+    return qa
+
+
 def _lip_sync_slot_duration(script: list[dict], idx: int) -> float:
     scene = script[idx]
     if idx < len(script) - 1:
@@ -5276,6 +5540,7 @@ def step65_motion(script: list[dict]):
 
     aspect = "9:16" if IS_VERTICAL else "16:9"
     results: dict[int, bool] = {}
+    _generate_grid_multiref_motion_segments(script, motion_prompts, aspect)
 
     def _run_batch(indices: list[int], round_label: str, safe_retry: bool = False):
         """跑一批 indices，更新 results。task_id 持久化保证重试时已成功的分镜不会重复烧钱。"""
@@ -5317,6 +5582,15 @@ def step65_motion(script: list[dict]):
         if speaker_qa and not speaker_qa.get("pass"):
             tg(f"⚠️ {ADSD_MODE_NAME} 说话人镜头同步 QA 未通过：failed={speaker_qa.get('failed_count')}")
     tg(f"✅ 动态化完成：{success_cnt}/{n} 成功 · {n - success_cnt} 保留静态兜底（含重试后仍失败）")
+
+
+def step65_grid_multiref_motion_qa(script: list[dict]):
+    """Run only the 4K storyboard-grid multi-reference motion QA sidecar."""
+    n = len(script)
+    tg(f"🧪 Grid multi-ref motion QA-only 启动：{n} 分镜")
+    motion_prompts = _generate_motion_prompts(script)
+    aspect = "9:16" if IS_VERTICAL else "16:9"
+    _generate_grid_multiref_motion_segments(script, motion_prompts, aspect)
 
 
 # ── 第七步：拼接视频轨 ────────────────────────────────────────────────────────
@@ -7489,6 +7763,8 @@ def main():
             t = time.time(); step66_adsd_lip_sync(script);                    timings["ADSD 口型同步"] = time.time() - t
         elif WITH_MOTION:
             t = time.time(); step65_motion(script);                            timings["动态化 (WERYDANCE)"] = time.time() - t
+        elif STORYBOARD_GRID_MULTIREF_MOTION:
+            t = time.time(); step65_grid_multiref_motion_qa(script);            timings["Grid multi-ref motion QA"] = time.time() - t
         t = time.time(); raw_path   = step7_concat(script);                   timings["视频拼接"] = time.time() - t
         if NO_VOICE:
             ass_path = ""
