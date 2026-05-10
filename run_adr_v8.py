@@ -5319,19 +5319,22 @@ def _write_storyboard_motion_compare_qa(
     clean_refs_qa: dict | None = None,
     previs_page_qa: dict | None = None,
     segment_qa: dict | None = None,
+    trailer_qa: dict | None = None,
 ) -> dict:
     clean = _motion_compare_record("clean_refs_multiref", clean_refs_qa)
     previs = _motion_compare_record("previs_page", previs_page_qa)
     segment = _motion_compare_record("grid_multiref_segments", segment_qa, artifact_key="target_path")
+    trailer = _motion_compare_record("storyboard_trailer", trailer_qa)
     payload = {
         "mode": "storyboard_motion_compare",
-        "recommendation": "clean_refs_multiref_segments" if segment.get("pass") else "clean_refs_multiref_sidecar" if clean.get("pass") else "previs_page_sidecar" if previs.get("pass") else "static_or_text_motion_fallback",
+        "recommendation": "clean_refs_multiref_segments" if segment.get("pass") else "storyboard_trailer_sidecar" if trailer.get("pass") else "clean_refs_multiref_sidecar" if clean.get("pass") else "previs_page_sidecar" if previs.get("pass") else "static_or_text_motion_fallback",
         "default_policy": "do_not_enable_by_default_until_three_topic_smokes_pass",
-        "records": [clean, previs, segment],
+        "records": [clean, previs, segment, trailer],
         "notes": [
             "clean_refs_multiref is the current safer production experiment because panel borders and storyboard text are cropped before motion.",
             "previs_page is a sidecar comparison path for whole-page storyboard understanding; do not route into final timeline yet.",
             "grid_multiref_segments is allowed only behind --use-grid-multiref-segments; excessive stretch is rejected and failed groups fall back to per-shot motion.",
+            "storyboard_trailer is a short sidecar trailer path from a production storyboard page; never stretch it into the longform timeline.",
         ],
         "created_at": datetime.now().isoformat(timespec="seconds"),
     }
@@ -6311,20 +6314,20 @@ def step65_motion(script: list[dict]):
 
     aspect = "9:16" if IS_VERTICAL else "16:9"
     results: dict[int, bool] = {}
-    _generate_storyboard_trailer_motion(script, motion_prompts, aspect)
+    trailer_qa = _generate_storyboard_trailer_motion(script, motion_prompts, aspect)
     previs_qa = _generate_previs_page_motion_segments(script, motion_prompts, aspect)
     grid_motion_qa = _generate_grid_multiref_motion_segments(script, motion_prompts, aspect)
     seg_qa = None
     if STORYBOARD_GRID_MULTIREF_SEGMENTS:
         seg_qa = _apply_grid_multiref_segments(script, grid_motion_qa)
-        _write_storyboard_motion_compare_qa(grid_motion_qa, previs_qa, seg_qa)
+        _write_storyboard_motion_compare_qa(grid_motion_qa, previs_qa, seg_qa, trailer_qa)
         success_cnt = int((seg_qa or {}).get("success_count") or 0)
         if (seg_qa or {}).get("pass"):
             tg(f"✅ Grid multi-ref 实验动态化完成：{success_cnt}/{n} 段替换，主时间线 QA 通过")
             return
         tg(f"⚠️ Grid multi-ref 切片未达主线标准：{success_cnt}/{n} 段可用，继续逐镜动态化补齐")
     else:
-        _write_storyboard_motion_compare_qa(grid_motion_qa, previs_qa, None)
+        _write_storyboard_motion_compare_qa(grid_motion_qa, previs_qa, None, trailer_qa)
 
     def _run_batch(indices: list[int], round_label: str, safe_retry: bool = False):
         """跑一批 indices，更新 results。task_id 持久化保证重试时已成功的分镜不会重复烧钱。"""
@@ -6378,11 +6381,11 @@ def step65_grid_multiref_motion_qa(script: list[dict]):
     tg(f"🧪 Grid multi-ref motion QA-only 启动：{n} 分镜")
     motion_prompts = _generate_motion_prompts(script)
     aspect = "9:16" if IS_VERTICAL else "16:9"
-    _generate_storyboard_trailer_motion(script, motion_prompts, aspect)
+    trailer_qa = _generate_storyboard_trailer_motion(script, motion_prompts, aspect)
     previs_qa = _generate_previs_page_motion_segments(script, motion_prompts, aspect)
     grid_motion_qa = _generate_grid_multiref_motion_segments(script, motion_prompts, aspect)
     seg_qa = _apply_grid_multiref_segments(script, grid_motion_qa)
-    _write_storyboard_motion_compare_qa(grid_motion_qa, previs_qa, seg_qa)
+    _write_storyboard_motion_compare_qa(grid_motion_qa, previs_qa, seg_qa, trailer_qa)
 
 
 # ── 第七步：拼接视频轨 ────────────────────────────────────────────────────────
