@@ -207,6 +207,14 @@ ADSD_RICH_MOTION_PROMPT = (
     "--adsd-rich-motion" in sys.argv
     or os.environ.get("ADR_ADSD_RICH_MOTION", "").strip().lower() in ("1", "true", "yes", "on")
 )
+ADSD_ALMIGHTY_AUDIO_DUB_EXPERIMENT = (
+    ADS_DIALOGUE_MODE
+    and (
+        "--adsd-almighty-audio-dub" in sys.argv
+        or "--almighty-audio-dub" in sys.argv
+        or os.environ.get("ADR_ADSD_ALMIGHTY_AUDIO_DUB", "").strip().lower() in ("1", "true", "yes", "on")
+    )
+)
 ADSD_ONSITE_POV_MODE = (
     "--pov" in sys.argv
     or "--onsite-pov" in sys.argv
@@ -6893,6 +6901,41 @@ def _adsd_lip_sync_prompt(scene: dict, safe_retry: bool = False) -> str:
     )[:2000]
 
 
+def _adsd_almighty_audio_dub_prompt(scene: dict, safe_retry: bool = False) -> str:
+    """Experimental: let Almighty Reference generate spoken audio from prompt text using uploaded audio as voice reference."""
+    speaker = scene.get("speaker") or "speaker"
+    dialogue = re.sub(r"\s+", " ", str(scene.get("text") or "")).strip()
+    dialogue = dialogue[:220]
+    role = f"active onsite character internally identified as {speaker}"
+    pov = (
+        " First-person onsite observer POV, camera close enough to see face and mouth."
+        if ADSD_ONSITE_POV_MODE else ""
+    )
+    if safe_retry:
+        return (
+            "Create a realistic Chinese spoken documentary scene. "
+            "Use uploaded image references only for speaker identity, costume, era, lighting, and composition. "
+            "Use uploaded audio only as voice timbre and speaking-style reference, then generate new synchronized speech. "
+            f"{_adsd_gender_lock_phrase(scene.get('voice_gender'))} "
+            f"The {role} speaks exactly this Chinese line: 「{dialogue}」. "
+            f"Natural lip sync, stable face, subtle head motion.{pov} "
+            "No subtitles, no captions, no written dialogue, no speaker labels, no logos, no watermark."
+        )[:1000]
+    shot = scene.get("shot", "")
+    return (
+        "Create a historically grounded Chinese spoken documentary scene with generated audio. "
+        "Use the uploaded audio as a voice/timbre reference only: preserve the same gender, tone color, age impression, "
+        "pace, emotional delivery, and speaking style. Do not use it as background music. "
+        "Generate clear Mandarin speech and synchronize the mouth movement to the generated speech. "
+        "Use uploaded image references only to lock identity, costume, era, location, lighting, and composition; "
+        "do not render reference sheets or storyboard pages. "
+        f"{_adsd_gender_lock_phrase(scene.get('voice_gender'))} "
+        f"The {role} speaks exactly this Chinese dialogue and nothing else: 「{dialogue}」. "
+        f"Scene action: {shot}. Visible mouth, stable face, natural jaw motion, realistic human timing.{pov} "
+        "Absolutely no subtitles, captions, written dialogue, speaker labels, logos, watermarks, or on-screen text."
+    )[:1000]
+
+
 def _postprocess_lip_sync_segment(src_video: str, scene: dict, target_dur: float) -> bool:
     """Normalize Werydance silent lip video to ADR segment size and exact timeline duration."""
     vid_path = scene["vid_path"]
@@ -6914,6 +6957,36 @@ def _postprocess_lip_sync_segment(src_video: str, scene: dict, target_dur: float
         vid_path,
         timeout=180,
     )
+    return os.path.exists(vid_path) and os.path.getsize(vid_path) > 10000
+
+
+def _postprocess_audio_dub_segment(src_video: str, scene: dict, target_dur: float) -> bool:
+    """Normalize Almighty audio-dub video while preserving generated segment audio for QA sidecars."""
+    vid_path = scene["vid_path"]
+    src_dur = ffprobe_duration(src_video)
+    pad = max(0.0, target_dur - src_dur)
+    vf = (
+        f"scale={VIDEO_W}:{VIDEO_H}:force_original_aspect_ratio=increase,"
+        f"crop={VIDEO_W}:{VIDEO_H},setsar=1"
+    )
+    if pad > 0.04:
+        vf += f",tpad=stop_mode=clone:stop_duration={pad:.3f}"
+    vf += f",trim=duration={target_dur:.3f},setpts=PTS-STARTPTS"
+    af = f"apad=pad_dur={pad:.3f},atrim=duration={target_dur:.3f},asetpts=PTS-STARTPTS"
+    try:
+        ffmpeg(
+            "-i", src_video,
+            "-vf", vf,
+            "-af", af,
+            "-c:v", "libx264", "-crf", "20", "-preset", "medium",
+            "-c:a", "aac", "-b:a", "128k",
+            "-pix_fmt", "yuv420p",
+            vid_path,
+            timeout=180,
+        )
+    except Exception as e:
+        log(f"audio-dub postprocess 保留音频失败，回退静音视频处理: {e}")
+        return _postprocess_lip_sync_segment(src_video, scene, target_dur)
     return os.path.exists(vid_path) and os.path.getsize(vid_path) > 10000
 
 
@@ -7042,22 +7115,24 @@ def _lip_sync_poll_download_and_process(idx: int, task_id: str, scene: dict, tar
                 raw_path = str(OUTPUT_DIR / f"lip_sync_raw_{idx}.mp4")
                 urllib.request.urlretrieve(vid_url, raw_path)
                 raw_dur = ffprobe_duration(raw_path)
-                ok = _postprocess_lip_sync_segment(raw_path, scene, target_dur)
+                audio_dub = bool(scene.get("_almighty_audio_dub_attempt"))
+                ok = _postprocess_audio_dub_segment(raw_path, scene, target_dur) if audio_dub else _postprocess_lip_sync_segment(raw_path, scene, target_dur)
                 final_dur = ffprobe_duration(scene["vid_path"]) if ok else None
                 source_audio = scene.get("dialogue_audio_mp3") or scene.get("dialogue_audio")
                 audio_dur = ffprobe_duration(source_audio) if source_audio and os.path.exists(source_audio) else None
                 info.update({
                     "pass": ok,
-                    "candidate": "almighty_reference_image_audio",
+                    "candidate": "almighty_reference_audio_dub" if audio_dub else "almighty_reference_image_audio",
                     "raw_video_path": raw_path,
                     "raw_video_duration": raw_dur,
                     "final_segment_path": scene["vid_path"],
                     "final_segment_duration": final_dur,
                     "source_audio_duration": audio_dur,
-                    "video_has_audio": False,
+                    "video_has_audio": audio_dub,
                     "duration_delta": abs((final_dur or 0) - target_dur) if final_dur is not None else None,
                     "clip_duration_match_pass": final_dur is not None and abs(final_dur - target_dur) <= 0.25,
-                    "needs_master_audio_mux": True,
+                    "needs_master_audio_mux": not audio_dub,
+                    "generated_audio_from_prompt_dialogue": audio_dub,
                 })
                 _remove_lip_sync_task(idx)
                 return ok, info
@@ -7098,15 +7173,23 @@ def _lip_sync_one_scene(idx: int, scene: dict, target_dur: float, aspect_ratio: 
         if sheet_url:
             ref_images = [sheet_url, image_url]
         api_dur = int(round(max(5, min(15, float(scene.get("dur") or target_dur)))))
-        variants = [
-            ("primary", "WERYDANCE_2_0", _adsd_lip_sync_prompt(scene, safe_retry=False)),
-            ("safe_prompt", "WERYDANCE_2_0", _adsd_lip_sync_prompt(scene, safe_retry=True)),
-            ("fast_safe_prompt", "WERYDANCE_2_0_FAST", _adsd_lip_sync_prompt(scene, safe_retry=True)),
-        ]
+        if ADSD_ALMIGHTY_AUDIO_DUB_EXPERIMENT:
+            variants = [
+                ("audio_dub_primary", "WERYDANCE_2_0", _adsd_almighty_audio_dub_prompt(scene, safe_retry=False), "true"),
+                ("audio_dub_safe", "WERYDANCE_2_0_FAST", _adsd_almighty_audio_dub_prompt(scene, safe_retry=True), "true"),
+                ("silent_lips_fallback", "WERYDANCE_2_0", _adsd_lip_sync_prompt(scene, safe_retry=True), "false"),
+            ]
+        else:
+            variants = [
+                ("primary", "WERYDANCE_2_0", _adsd_lip_sync_prompt(scene, safe_retry=False), "false"),
+                ("safe_prompt", "WERYDANCE_2_0", _adsd_lip_sync_prompt(scene, safe_retry=True), "false"),
+                ("fast_safe_prompt", "WERYDANCE_2_0_FAST", _adsd_lip_sync_prompt(scene, safe_retry=True), "false"),
+            ]
         attempts: list[dict] = []
-        for variant_name, model, prompt in variants:
+        for variant_name, model, prompt, generate_audio in variants:
             r = None
             task_id = None
+            scene["_almighty_audio_dub_attempt"] = generate_audio == "true"
             for submit_attempt in range(3):
                 try:
                     _wait_motion_submit_slot(f"lip-sync {idx+1}")
@@ -7118,7 +7201,7 @@ def _lip_sync_one_scene(idx: int, scene: dict, target_dur: float, aspect_ratio: 
                         "duration": api_dur,
                         "aspect_ratio": aspect_ratio,
                         "resolution": "720p",
-                        "generate_audio": "false",
+                        "generate_audio": generate_audio,
                         "video_number": 1,
                     }, timeout=30)
                     task_id = r.get("data", {}).get("task_id") or (r.get("data", {}).get("task_ids") or [None])[0]
@@ -7141,6 +7224,8 @@ def _lip_sync_one_scene(idx: int, scene: dict, target_dur: float, aspect_ratio: 
                 "variant": variant_name,
                 "submit_model": model,
                 "submit_duration": api_dur,
+                "generate_audio": generate_audio,
+                "audio_dub_experiment": ADSD_ALMIGHTY_AUDIO_DUB_EXPERIMENT,
                 "image_url": image_url,
                 "character_sheet_url": sheet_url,
                 "reference_image_count": len(ref_images),
@@ -7167,6 +7252,7 @@ def _lip_sync_one_scene(idx: int, scene: dict, target_dur: float, aspect_ratio: 
             "character_sheet_url": sheet_url,
             "reference_image_count": len(ref_images),
             "audio_url": audio_url,
+            "audio_dub_experiment": ADSD_ALMIGHTY_AUDIO_DUB_EXPERIMENT,
         })
         if ADSD_LIPS_CHANGE_REPAIR:
             repair_ok, repair_info = _lips_change_repair_segment(idx, scene, target_dur)
@@ -7212,6 +7298,8 @@ def step66_adsd_lip_sync(script: list[dict]):
                 tg(f"⚠️ Turn {idx+1}/{n} 口型同步失败，保留原静态/motion片段")
     records.sort(key=lambda x: int(x.get("turn", 0)))
     success_cnt = sum(1 for v in results.values() if v)
+    generated_audio_cnt = sum(1 for r in records if r.get("pass") and r.get("video_has_audio") and r.get("generated_audio_from_prompt_dialogue"))
+    embedded_audio_ready = generated_audio_cnt == n and generated_audio_cnt > 0
     sheet_path = OUTPUT_DIR / "character_sheet.png"
     qa = {
         "mode": ADSD_MODE_NAME,
@@ -7221,6 +7309,9 @@ def step66_adsd_lip_sync(script: list[dict]):
         "character_sheet_reference_exists": sheet_path.exists() and sheet_path.stat().st_size > 10000,
         "lips_change_repair_enabled": ADSD_LIPS_CHANGE_REPAIR,
         "lips_change_all_enabled": ADSD_LIPS_CHANGE_ALL,
+        "almighty_audio_dub_experiment": ADSD_ALMIGHTY_AUDIO_DUB_EXPERIMENT,
+        "generated_audio_segment_count": generated_audio_cnt,
+        "embedded_dialogue_audio_ready": embedded_audio_ready,
         "lips_change_requested_turns": sorted(_load_lips_change_requested_turns()),
         "onsite_pov_mode": ADSD_ONSITE_POV_MODE,
         "total": n,
@@ -7228,7 +7319,7 @@ def step66_adsd_lip_sync(script: list[dict]):
         "success_rate": round(success_cnt / max(n, 1), 4),
         "pass": success_cnt >= max(1, math.ceil(n * 0.8)),
         "policy": "failed_turns_keep_existing_segments",
-        "master_audio_mux_required": True,
+        "master_audio_mux_required": not embedded_audio_ready,
         "final_audio_offset_required": 0.0,
         "manual_visual_checks_required": ["mouth_visible", "active_speaker_correct", "no_face_drift", "mouth_motion_matches_syllable_timing"],
         "records": records,
@@ -7943,10 +8034,28 @@ def step9_render(raw_path: str, voice_path: str, bgm_path: str | None, ass_path:
         tg(f"🎵 step9 BGM 正常传入: {bgm_path}")
     if NO_VOICE and not bgm_path:
         raise RuntimeError("ADR/ADS BGM-only 模式要求必须有 BGM；BGM 生成失败，阻断静音成片交付")
+    use_embedded_dialogue_audio = False
+    if ADS_DIALOGUE_MODE and ADSD_ALMIGHTY_AUDIO_DUB_EXPERIMENT:
+        try:
+            lip_qa = _read_output_json("lip_sync_qa.json")
+            records = lip_qa.get("records") or []
+            generated_count = sum(1 for r in records if r.get("pass") and r.get("video_has_audio") and r.get("generated_audio_from_prompt_dialogue"))
+            probe = subprocess.check_output([
+                "ffprobe", "-v", "error", "-select_streams", "a",
+                "-show_entries", "stream=codec_type", "-of", "json", raw_path,
+            ], stderr=subprocess.DEVNULL)
+            has_raw_audio = bool(json.loads(probe.decode()).get("streams"))
+            expected_count = int(lip_qa.get("total") or len(records) or 0)
+            use_embedded_dialogue_audio = has_raw_audio and generated_count == expected_count and generated_count > 0
+        except Exception as e:
+            log(f"Almighty audio-dub embedded audio 检测失败，继续使用主音轨: {e}")
     render_audio_offset = 0.0 if (ADS_DIALOGUE_MODE and ADSD_LIP_SYNC_EXPERIMENT) else AUDIO_DELAY
     if NO_VOICE:
         sync_note = "BGM-only 模式：无旁白 TTS、无字幕，静音轨仅用于时间轴占位"
         audio_note = "BGM-only ✓"
+    elif use_embedded_dialogue_audio:
+        sync_note = "Almighty audio-dub 模式：使用视频段内生成对白音频，不叠加 TTS 主音轨"
+        audio_note = "WERYDANCE 段内对白 ✓" + (" BGM ✓" if bgm_path else "")
     else:
         sync_note = "口型同步模式：音频不延迟" if render_audio_offset == 0 else "画面 → +{:.1f}s 字幕 → +{:.1f}s 配音".format(SUB_DELAY, render_audio_offset)
         audio_note = "主音轨 ✓" + (" BGM ✓" if bgm_path else "")
@@ -8004,6 +8113,22 @@ def step9_render(raw_path: str, voice_path: str, bgm_path: str | None, ass_path:
                 "-shortest",
                 final_path,
             )
+        elif use_embedded_dialogue_audio:
+            ffmpeg(
+                "-i", raw_path,
+                "-i", bgm_path,
+                "-filter_complex",
+                "[0:a]apad=pad_dur=1.5,volume=1.2[va];[1:a]volume=0.45[ba];[va][ba]amix=inputs=2:duration=first[aout]",
+                "-map", "0:v",
+                "-map", "[aout]",
+                "-vf", vf_with_subtitles,
+                "-c:v", "libx264", "-crf", "20", "-preset", "medium",
+                "-c:a", "aac", "-b:a", "128k",
+                "-aspect", ASPECT_RATIO,
+                "-movflags", "+faststart",
+                "-shortest",
+                final_path,
+            )
         else:
             ffmpeg(
                 "-i", raw_path,
@@ -8022,20 +8147,35 @@ def step9_render(raw_path: str, voice_path: str, bgm_path: str | None, ass_path:
                 final_path,
             )
     else:
-        ffmpeg(
-            "-i", raw_path,
-            "-itsoffset", offset, "-i", voice_path,
-            "-filter_complex", "[1:a]apad=pad_dur=1.5[aout]",
-            "-map", "0:v",
-            "-map", "[aout]",
-            "-vf", vf_with_subtitles,
-            "-c:v", "libx264", "-crf", "20", "-preset", "medium",
-            "-c:a", "aac", "-b:a", "128k",
-            "-aspect", ASPECT_RATIO,
-            "-movflags", "+faststart",
-            "-shortest",
-            final_path,
-        )
+        if use_embedded_dialogue_audio:
+            ffmpeg(
+                "-i", raw_path,
+                "-filter_complex", "[0:a]apad=pad_dur=1.5[aout]",
+                "-map", "0:v",
+                "-map", "[aout]",
+                "-vf", vf_with_subtitles,
+                "-c:v", "libx264", "-crf", "20", "-preset", "medium",
+                "-c:a", "aac", "-b:a", "128k",
+                "-aspect", ASPECT_RATIO,
+                "-movflags", "+faststart",
+                "-shortest",
+                final_path,
+            )
+        else:
+            ffmpeg(
+                "-i", raw_path,
+                "-itsoffset", offset, "-i", voice_path,
+                "-filter_complex", "[1:a]apad=pad_dur=1.5[aout]",
+                "-map", "0:v",
+                "-map", "[aout]",
+                "-vf", vf_with_subtitles,
+                "-c:v", "libx264", "-crf", "20", "-preset", "medium",
+                "-c:a", "aac", "-b:a", "128k",
+                "-aspect", ASPECT_RATIO,
+                "-movflags", "+faststart",
+                "-shortest",
+                final_path,
+            )
 
     size_mb = os.path.getsize(final_path) / (1024 * 1024)
     dur     = ffprobe_duration(final_path)
