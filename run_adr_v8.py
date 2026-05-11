@@ -180,9 +180,14 @@ STORYBOARD_TRAILER_MODE = (
     or "--with-storyboard-trailer" in sys.argv
     or os.environ.get("ADR_STORYBOARD_TRAILER_MODE", "").strip().lower() in ("1", "true", "yes", "on")
 )
+CHARACTER_TRAILER_MODE = (
+    "--character-trailer-mode" in sys.argv
+    or "--with-character-trailer" in sys.argv
+    or os.environ.get("ADR_CHARACTER_TRAILER_MODE", "").strip().lower() in ("1", "true", "yes", "on")
+)
 if STORYBOARD_GRID_MULTIREF_SEGMENTS:
     STORYBOARD_GRID_MULTIREF_MOTION = True
-if STORYBOARD_GRID_MULTIREF_MOTION or PREVIS_PAGE_MOTION or STORYBOARD_TRAILER_MODE:
+if STORYBOARD_GRID_MULTIREF_MOTION or PREVIS_PAGE_MOTION or STORYBOARD_TRAILER_MODE or CHARACTER_TRAILER_MODE:
     GPT_IMAGE2_STORYBOARD_GRID = True
 ADSD_LIP_SYNC_EXPERIMENT = (
     "--adsd-lip-sync" in sys.argv
@@ -3596,6 +3601,120 @@ def _write_production_storyboard_page_qa(payload: dict) -> None:
         log(f"production_storyboard_page_qa.json 写入失败: {e}")
 
 
+def _character_sheet_prompt(script: list[dict], topic: str, aspect: str) -> str:
+    beats = []
+    for i, scene in enumerate(script[:12], start=1):
+        visual = re.sub(r"\s+", " ", str(scene.get("prompt") or scene.get("text") or "")).strip()
+        beats.append(f"{i:02d}. {visual[:280]}")
+    return f"""Create one single {aspect} cinematic character and creature model sheet for an AI animation trailer.
+Topic: {topic}
+
+Purpose:
+- This sheet will be reused as a visual identity reference for every video shot.
+- It must lock the recurring hero/subject identity, costume, face, palette, props, and any creature/vehicle/companion design.
+- It should look like a professional animation production character sheet, not a poster and not a storyboard.
+
+Layout requirements:
+- Main hero/subject: front view, 3/4 view, side view, back view.
+- Face/expression row: neutral, wonder, determination, action intensity, calm ending.
+- Costume/prop callouts: key fabrics, accessories, tools, silhouette, scale.
+- Companion/creature/vehicle/object design if implied by the story; include full body, head closeup, material/texture closeups, scale relation to hero.
+- Palette chips and lighting notes.
+- Small text labels are acceptable on the sheet, but keep the characters and objects large, clean, and reusable as references.
+- Maintain one coherent visual style and avoid random alternate designs.
+
+Story context:
+{chr(10).join(beats)}"""
+
+
+def _write_character_sheet_qa(payload: dict) -> None:
+    try:
+        (OUTPUT_DIR / "character_sheet_qa.json").write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+    except Exception as e:
+        log(f"character_sheet_qa.json 写入失败: {e}")
+
+
+def generate_character_sheet_gpt_image2(script: list[dict], topic: str) -> dict | None:
+    """Sidecar: GPT Image 2 model sheet for identity-locked character trailer shots."""
+    if ADS_DIALOGUE_MODE or not CHARACTER_TRAILER_MODE:
+        return None
+    external = os.environ.get("ADR_CHARACTER_SHEET", "").strip()
+    qa = {
+        "mode": "gpt_image2_character_sheet",
+        "enabled": True,
+        "model": "GPT_IMAGE_2",
+        "path": str(OUTPUT_DIR / "character_sheet.png"),
+        "pass": False,
+        "policy": "identity_reference_for_character_trailer_shots_not_clean_panel_crop",
+        "manual_visual_checks_required": [
+            "recurring_character_identity_is_clear",
+            "costume_palette_and_props_are_reusable",
+            "creature_or_companion_design_is_consistent_if_present",
+            "sheet_is_used_as_reference_not_rendered_in_final_video",
+        ],
+        "created_at": datetime.now().isoformat(timespec="seconds"),
+    }
+    if external:
+        qa["external_path"] = external
+        if os.path.exists(external) and os.path.getsize(external) > 10000:
+            target = OUTPUT_DIR / "character_sheet.png"
+            try:
+                from shutil import copyfile
+                copyfile(external, target)
+                qa.update({"path": str(target), "bytes": target.stat().st_size, "pass": True, "source": "external"})
+            except Exception as e:
+                qa.update({"reason": f"external_copy_failed:{e}"})
+        else:
+            qa.update({"reason": "external_character_sheet_missing"})
+        _write_character_sheet_qa(qa)
+        return qa
+    aspect = os.environ.get("ADR_CHARACTER_SHEET_ASPECT", "").strip() or _storyboard_grid_aspect()
+    qa["aspect_ratio"] = aspect
+    try:
+        prompt = _character_sheet_prompt(script, topic, aspect)
+        if len(prompt) > 18000:
+            prompt = prompt[:18000]
+            qa.setdefault("warnings", []).append("prompt_truncated")
+        _wait_image_submit_slot("GPT Image 2 character sheet")
+        r = req_post("/generation/text-to-image", {
+            "model": "GPT_IMAGE_2",
+            "prompt": prompt,
+            "aspect_ratio": aspect,
+            "image_number": 1,
+            "quality": "high",
+        }, timeout=45)
+        task_id = (r.get("data", {}).get("task_ids") or [r.get("data", {}).get("task_id") or None])[0]
+        qa["task_id"] = task_id
+        if not task_id:
+            qa.update({"reason": "submit_without_task_id", "response": r})
+            return qa
+        data = poll_storyboard_task(task_id, "GPT Image 2 character sheet", float(os.environ.get("ADR_CHARACTER_SHEET_POLL_MAX", "300")))
+        urls = _extract_img_urls(data)
+        if not urls:
+            qa["reason"] = "succeed_without_image_url"
+            return qa
+        out_path = OUTPUT_DIR / "character_sheet.png"
+        urllib.request.urlretrieve(urls[0], out_path)
+        qa.update({
+            "path": str(out_path),
+            "bytes": out_path.stat().st_size if out_path.exists() else 0,
+            "pass": out_path.exists() and out_path.stat().st_size > 100000,
+        })
+        if qa["pass"]:
+            tg("🧬 GPT Image 2 character sheet 已生成（用于逐镜身份锁定 trailer）")
+        else:
+            qa["reason"] = "output_too_small_or_missing"
+    except Exception as e:
+        qa.update({"pass": False, "reason": str(e)})
+        tg(f"⚠️ character sheet 生成失败：{str(e)[:160]}")
+    finally:
+        _write_character_sheet_qa(qa)
+    return qa
+
+
 def generate_production_storyboard_page_gpt_image2(script: list[dict], topic: str) -> dict | None:
     """Sidecar: GPT Image 2 director-facing production board for trailer/previs."""
     if ADS_DIALOGUE_MODE or not STORYBOARD_TRAILER_MODE:
@@ -4216,6 +4335,7 @@ def step6_parallel(script: list[dict], topic: str, pregenerated_bgm_path: str | 
 
         completed = {}  # idx -> True
         approval_sent = set()  # 已推过审批的 idx，避免兜底重发
+        generate_character_sheet_gpt_image2(script, topic)
         generate_production_storyboard_page_gpt_image2(script, topic)
         storyboard_used = generate_storyboard_grid_gpt_image2(script, topic) or generate_storyboard_images_gpt_image2(script, topic)
         if storyboard_used:
@@ -5283,6 +5403,16 @@ def _write_storyboard_trailer_qa(payload: dict) -> None:
         log(f"storyboard_trailer_qa.json 写入失败: {e}")
 
 
+def _write_character_trailer_qa(payload: dict) -> None:
+    try:
+        (OUTPUT_DIR / "character_trailer_qa.json").write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+    except Exception as e:
+        log(f"character_trailer_qa.json 写入失败: {e}")
+
+
 def _write_grid_multiref_segment_qa(payload: dict) -> None:
     try:
         (OUTPUT_DIR / "grid_multiref_segment_qa.json").write_text(
@@ -5320,21 +5450,24 @@ def _write_storyboard_motion_compare_qa(
     previs_page_qa: dict | None = None,
     segment_qa: dict | None = None,
     trailer_qa: dict | None = None,
+    character_trailer_qa: dict | None = None,
 ) -> dict:
     clean = _motion_compare_record("clean_refs_multiref", clean_refs_qa)
     previs = _motion_compare_record("previs_page", previs_page_qa)
     segment = _motion_compare_record("grid_multiref_segments", segment_qa, artifact_key="target_path")
     trailer = _motion_compare_record("storyboard_trailer", trailer_qa)
+    character_trailer = _motion_compare_record("character_trailer", character_trailer_qa)
     payload = {
         "mode": "storyboard_motion_compare",
-        "recommendation": "clean_refs_multiref_segments" if segment.get("pass") else "storyboard_trailer_sidecar" if trailer.get("pass") else "clean_refs_multiref_sidecar" if clean.get("pass") else "previs_page_sidecar" if previs.get("pass") else "static_or_text_motion_fallback",
+        "recommendation": "clean_refs_multiref_segments" if segment.get("pass") else "character_trailer_sidecar" if character_trailer.get("pass") else "storyboard_trailer_sidecar" if trailer.get("pass") else "clean_refs_multiref_sidecar" if clean.get("pass") else "previs_page_sidecar" if previs.get("pass") else "static_or_text_motion_fallback",
         "default_policy": "do_not_enable_by_default_until_three_topic_smokes_pass",
-        "records": [clean, previs, segment, trailer],
+        "records": [clean, previs, segment, trailer, character_trailer],
         "notes": [
             "clean_refs_multiref is the current safer production experiment because panel borders and storyboard text are cropped before motion.",
             "previs_page is a sidecar comparison path for whole-page storyboard understanding; do not route into final timeline yet.",
             "grid_multiref_segments is allowed only behind --use-grid-multiref-segments; excessive stretch is rejected and failed groups fall back to per-shot motion.",
             "storyboard_trailer is a short sidecar trailer path from a production storyboard page; never stretch it into the longform timeline.",
+            "character_trailer uses one character sheet plus clean per-shot references, then concatenates short generated shots; it is the safer path for 45s identity-locked trailers.",
         ],
         "created_at": datetime.now().isoformat(timespec="seconds"),
     }
@@ -5623,6 +5756,190 @@ def _storyboard_trailer_prompt(script: list[dict], motion_prompts: list[str], ha
         "continuous style, consistent characters, and no freeze-frame stretching. Keep pacing brisk and trailer-like. "
         f"SHOT ORDER: {' '.join(lines)}"
     )[:2000]
+
+
+def _character_trailer_max_shots() -> int:
+    try:
+        raw = int(os.environ.get("ADR_CHARACTER_TRAILER_MAX_SHOTS", "9"))
+    except Exception:
+        raw = 9
+    return max(1, min(12, raw))
+
+
+def _character_trailer_shot_duration(scene: dict) -> int:
+    override = os.environ.get("ADR_CHARACTER_TRAILER_SHOT_DURATION", "").strip()
+    if override:
+        try:
+            return max(5, min(10, int(round(float(override)))))
+        except Exception:
+            pass
+    try:
+        raw = float(scene.get("vid_duration") or scene.get("dur") or 5)
+    except Exception:
+        raw = 5
+    return max(5, min(10, int(round(raw))))
+
+
+def _character_trailer_prompt(scene: dict, idx: int, motion_prompt: str) -> str:
+    visual = _short_board_text(scene.get("prompt") or scene.get("shot") or scene.get("text"), 420)
+    beat = _short_board_text(scene.get("text"), 180)
+    motion = _short_board_text(motion_prompt, 180)
+    return (
+        "Create one cinematic trailer shot using the uploaded references. "
+        "Image 1 is the character/creature model sheet and must lock identity, face, costume, palette, scale, "
+        "materials, and companion/creature design. Image 2 is the clean shot keyframe and must lock composition, "
+        "location, lighting, and action. Do not render either reference sheet/page as paper or a document. "
+        "No text, no labels, no borders, no UI, no watermark, no subtitles. "
+        f"Shot {idx + 1}: {visual}. Story beat: {beat}. Camera/action: {motion}. "
+        "Keep motion smooth, physically plausible, emotionally clear, and continuous with the shared character design."
+    )[:2000]
+
+
+def _concat_character_trailer_segments(records: list[dict]) -> tuple[bool, dict]:
+    passed = [r for r in records if r.get("pass") and r.get("path") and os.path.exists(r.get("path"))]
+    info = {"segment_count": len(passed), "path": str(OUTPUT_DIR / "character_trailer.mp4"), "pass": False}
+    if not passed:
+        info["reason"] = "no_passed_segments"
+        return False, info
+    concat_path = OUTPUT_DIR / "character_trailer_concat.txt"
+    try:
+        with open(concat_path, "w", encoding="utf-8") as f:
+            for record in passed:
+                f.write(f"file '{record['path']}'\n")
+        out_path = OUTPUT_DIR / "character_trailer.mp4"
+        ffmpeg(
+            "-f", "concat", "-safe", "0", "-i", str(concat_path),
+            "-c", "copy",
+            str(out_path),
+            timeout=180,
+        )
+        if not out_path.exists() or out_path.stat().st_size < 10000:
+            info["reason"] = "concat_output_missing_or_small"
+            return False, info
+        w, h = ffprobe_video_size(str(out_path))
+        dur = ffprobe_duration(str(out_path))
+        info.update({
+            "path": str(out_path),
+            "bytes": out_path.stat().st_size,
+            "width": w,
+            "height": h,
+            "duration": round(dur, 3),
+            "pass": w == VIDEO_W and h == VIDEO_H and dur >= 4.5,
+        })
+        if not info["pass"]:
+            info["reason"] = "concat_video_qa_failed"
+        return info["pass"], info
+    except Exception as e:
+        info["reason"] = str(e)
+        return False, info
+
+
+def _generate_character_trailer_motion(script: list[dict], motion_prompts: list[str], aspect_ratio: str) -> dict | None:
+    """Sidecar: one character sheet + clean shot refs -> multi-shot identity-locked trailer."""
+    if not CHARACTER_TRAILER_MODE or ADS_DIALOGUE_MODE:
+        return None
+    sheet_path = OUTPUT_DIR / "character_sheet.png"
+    max_shots = _character_trailer_max_shots()
+    refs = [
+        (i, scene)
+        for i, scene in enumerate(script[:max_shots])
+        if scene.get("img_path") and os.path.exists(scene.get("img_path"))
+    ]
+    qa = {
+        "mode": "character_sheet_plus_clean_refs_to_trailer",
+        "enabled": True,
+        "interface": "almighty-reference-to-video",
+        "model": "WERYDANCE_2_0",
+        "aspect_ratio": aspect_ratio,
+        "resolution": os.environ.get("ADR_CHARACTER_TRAILER_RESOLUTION", "720p"),
+        "character_sheet": str(sheet_path),
+        "max_shots": max_shots,
+        "records": [],
+        "policy": "per_shot_identity_locked_segments_concat_no_stretch",
+        "manual_visual_checks_required": [
+            "character_identity_consistent_across_shots",
+            "creature_or_companion_design_consistent_if_present",
+            "no_character_sheet_or_storyboard_page_rendered_as_document",
+            "no_text_labels_borders_or_watermarks",
+            "motion_is_smooth_no_freeze_frame_stretching",
+            "shot_order_matches_script",
+        ],
+        "created_at": datetime.now().isoformat(timespec="seconds"),
+    }
+    if not sheet_path.exists() or sheet_path.stat().st_size < 100000:
+        qa.update({"pass": False, "reason": "missing_character_sheet"})
+        _write_character_trailer_qa(qa)
+        return qa
+    if not refs:
+        qa.update({"pass": False, "reason": "missing_clean_shot_refs"})
+        _write_character_trailer_qa(qa)
+        return qa
+    try:
+        sheet_url = _upload_to_weryai(str(sheet_path))
+        qa["character_sheet_url"] = sheet_url
+    except Exception as e:
+        qa.update({"pass": False, "reason": f"character_sheet_upload_failed:{e}"})
+        _write_character_trailer_qa(qa)
+        return qa
+
+    tg(f"🧬 Character trailer 启动：character sheet + clean refs × {len(refs)} 镜")
+    for local_no, (idx, scene) in enumerate(refs, start=1):
+        out_path = OUTPUT_DIR / f"character_trailer_seg_{idx:02d}.mp4"
+        record = {
+            "scene": idx + 1,
+            "shot": local_no,
+            "image_path": scene.get("img_path"),
+            "path": str(out_path),
+            "duration_requested": _character_trailer_shot_duration(scene),
+            "pass": False,
+        }
+        qa["records"].append(record)
+        try:
+            shot_url = _upload_to_weryai(scene["img_path"])
+            prompt = _character_trailer_prompt(scene, idx, motion_prompts[idx] if idx < len(motion_prompts) else "")
+            _wait_motion_submit_slot(f"character trailer shot {idx+1}")
+            r = req_post("/generation/almighty-reference-to-video", {
+                "model": "WERYDANCE_2_0",
+                "images": [sheet_url, shot_url],
+                "prompt": prompt,
+                "duration": record["duration_requested"],
+                "aspect_ratio": aspect_ratio,
+                "resolution": qa["resolution"],
+                "generate_audio": "false",
+                "video_number": 1,
+            }, timeout=30)
+            task_id = r.get("data", {}).get("task_id") or (r.get("data", {}).get("task_ids") or [None])[0]
+            record.update({"image_urls": [sheet_url, shot_url], "task_id": task_id})
+            if not task_id:
+                record.update({"reason": "submit_without_task_id", "response": r})
+                _write_character_trailer_qa(qa)
+                continue
+            ok, info = _poll_video_task_download(task_id, out_path, f"character trailer shot {idx+1}")
+            record.update(info)
+            record["pass"] = bool(ok and record.get("width") == VIDEO_W and record.get("height") == VIDEO_H)
+            if not record["pass"]:
+                record.setdefault("reason", "shot_video_qa_failed")
+            _write_character_trailer_qa(qa)
+        except Exception as e:
+            record.update({"pass": False, "reason": str(e)})
+            _write_character_trailer_qa(qa)
+
+    success_count = sum(1 for r in qa["records"] if r.get("pass"))
+    concat_ok, concat_info = _concat_character_trailer_segments(qa["records"])
+    qa.update({
+        "success_count": success_count,
+        "total_groups": len(qa["records"]),
+        "concat": concat_info,
+        "path": concat_info.get("path"),
+        "pass": bool(concat_ok and success_count == len(qa["records"]) and success_count > 0),
+        "finalized_at": datetime.now().isoformat(timespec="seconds"),
+    })
+    _write_character_trailer_qa(qa)
+    if qa["pass"]:
+        tg(f"✅ Character trailer 完成：{success_count}/{len(qa['records'])} 镜，{qa.get('path')}")
+    else:
+        tg(f"⚠️ Character trailer 未全通过：{success_count}/{len(qa['records'])} 镜")
+    return qa
 
 
 def _generate_storyboard_trailer_motion(script: list[dict], motion_prompts: list[str], aspect_ratio: str) -> dict | None:
@@ -6314,20 +6631,21 @@ def step65_motion(script: list[dict]):
 
     aspect = "9:16" if IS_VERTICAL else "16:9"
     results: dict[int, bool] = {}
+    character_trailer_qa = _generate_character_trailer_motion(script, motion_prompts, aspect)
     trailer_qa = _generate_storyboard_trailer_motion(script, motion_prompts, aspect)
     previs_qa = _generate_previs_page_motion_segments(script, motion_prompts, aspect)
     grid_motion_qa = _generate_grid_multiref_motion_segments(script, motion_prompts, aspect)
     seg_qa = None
     if STORYBOARD_GRID_MULTIREF_SEGMENTS:
         seg_qa = _apply_grid_multiref_segments(script, grid_motion_qa)
-        _write_storyboard_motion_compare_qa(grid_motion_qa, previs_qa, seg_qa, trailer_qa)
+        _write_storyboard_motion_compare_qa(grid_motion_qa, previs_qa, seg_qa, trailer_qa, character_trailer_qa)
         success_cnt = int((seg_qa or {}).get("success_count") or 0)
         if (seg_qa or {}).get("pass"):
             tg(f"✅ Grid multi-ref 实验动态化完成：{success_cnt}/{n} 段替换，主时间线 QA 通过")
             return
         tg(f"⚠️ Grid multi-ref 切片未达主线标准：{success_cnt}/{n} 段可用，继续逐镜动态化补齐")
     else:
-        _write_storyboard_motion_compare_qa(grid_motion_qa, previs_qa, None, trailer_qa)
+        _write_storyboard_motion_compare_qa(grid_motion_qa, previs_qa, None, trailer_qa, character_trailer_qa)
 
     def _run_batch(indices: list[int], round_label: str, safe_retry: bool = False):
         """跑一批 indices，更新 results。task_id 持久化保证重试时已成功的分镜不会重复烧钱。"""
@@ -6381,11 +6699,12 @@ def step65_grid_multiref_motion_qa(script: list[dict]):
     tg(f"🧪 Grid multi-ref motion QA-only 启动：{n} 分镜")
     motion_prompts = _generate_motion_prompts(script)
     aspect = "9:16" if IS_VERTICAL else "16:9"
+    character_trailer_qa = _generate_character_trailer_motion(script, motion_prompts, aspect)
     trailer_qa = _generate_storyboard_trailer_motion(script, motion_prompts, aspect)
     previs_qa = _generate_previs_page_motion_segments(script, motion_prompts, aspect)
     grid_motion_qa = _generate_grid_multiref_motion_segments(script, motion_prompts, aspect)
     seg_qa = _apply_grid_multiref_segments(script, grid_motion_qa)
-    _write_storyboard_motion_compare_qa(grid_motion_qa, previs_qa, seg_qa, trailer_qa)
+    _write_storyboard_motion_compare_qa(grid_motion_qa, previs_qa, seg_qa, trailer_qa, character_trailer_qa)
 
 
 # ── 第七步：拼接视频轨 ────────────────────────────────────────────────────────
@@ -8558,7 +8877,7 @@ def main():
             t = time.time(); step66_adsd_lip_sync(script);                    timings["ADSD 口型同步"] = time.time() - t
         elif WITH_MOTION:
             t = time.time(); step65_motion(script);                            timings["动态化 (WERYDANCE)"] = time.time() - t
-        elif STORYBOARD_GRID_MULTIREF_MOTION or PREVIS_PAGE_MOTION or STORYBOARD_TRAILER_MODE:
+        elif STORYBOARD_GRID_MULTIREF_MOTION or PREVIS_PAGE_MOTION or STORYBOARD_TRAILER_MODE or CHARACTER_TRAILER_MODE:
             t = time.time(); step65_grid_multiref_motion_qa(script);            timings["Storyboard motion QA"] = time.time() - t
         t = time.time(); raw_path   = step7_concat(script);                   timings["视频拼接"] = time.time() - t
         if NO_VOICE:
