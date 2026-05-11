@@ -270,6 +270,12 @@ ADSD_FEMALE_VOICE_POOL = [
     {"voice_id": 79, "voice_name": "Kind-hearted Antie"},
     {"voice_id": 80, "voice_name": "Arrogant Miss"},
 ]
+ADSD_MALE_VOICE_IDS = {int(v["voice_id"]) for v in ADSD_MALE_VOICE_POOL}
+ADSD_FEMALE_VOICE_IDS = {int(v["voice_id"]) for v in ADSD_FEMALE_VOICE_POOL}
+ADSD_VOICE_GENDER_BY_ID = {
+    **{vid: "male" for vid in ADSD_MALE_VOICE_IDS},
+    **{vid: "female" for vid in ADSD_FEMALE_VOICE_IDS},
+}
 
 # 同一 ADR 进程内角色名 → voice 持久映射，确保同一角色跨 turn 用同一声音
 _ADSD_SPEAKER_VOICE_CACHE: dict[str, dict] = {}
@@ -1051,6 +1057,50 @@ def _voice_for_speaker(speaker: str, gender: str | None = None) -> dict:
     return voice
 
 
+def _adsd_gender_from_voice(voice: dict | None) -> str:
+    try:
+        vid = int((voice or {}).get("voice_id"))
+    except Exception:
+        return ""
+    return ADSD_VOICE_GENDER_BY_ID.get(vid, "")
+
+
+def _adsd_infer_gender_from_speaker(speaker: str) -> str:
+    s = str(speaker or "")
+    if any(k in s for k in ("女", "王后", "王妃", "夫人", "小姐", "女士", "母", "娘", "姐", "嫂", "婆", "妇")):
+        return "female"
+    if any(k in s for k in ("男", "国王", "王", "皇帝", "侍从", "记者", "市民", "士兵", "官", "臣", "父", "兄", "叔", "伯", "爷", "僧")):
+        return "male"
+    return ""
+
+
+def _adsd_gender_lock_phrase(gender: str | None) -> str:
+    g = (gender or "").strip().lower()
+    if g == "female":
+        return (
+            "VOICE-VISUAL GENDER LOCK: the active speaker's TTS voice is FEMALE, so render the active speaker as an adult woman/female-presenting person. "
+            "No beard, no male jawline, no masculine body silhouette, no male-presenting face."
+        )
+    if g == "male":
+        return (
+            "VOICE-VISUAL GENDER LOCK: the active speaker's TTS voice is MALE, so render the active speaker as an adult man/male-presenting person. "
+            "No female face, no feminine body silhouette, no makeup, no dress-coded female styling."
+        )
+    return "VOICE-VISUAL GENDER LOCK: keep the active speaker's apparent gender consistent with the assigned TTS voice."
+
+
+def _adsd_visual_subject_has_gender_conflict(visual_subject: str, voice_gender: str | None) -> bool:
+    text = str(visual_subject or "").lower()
+    g = (voice_gender or "").strip().lower()
+    female_words = ("woman", "female", "girl", "lady", "queen", "mother", "actress", "wife", "auntie")
+    male_words = ("man", "male", "boy", "gentleman", "king", "father", "actor", "husband", "uncle")
+    if g == "male":
+        return any(w in text for w in female_words) and not any(w in text for w in male_words)
+    if g == "female":
+        return any(w in text for w in male_words) and not any(w in text for w in female_words)
+    return False
+
+
 def _adsd_default_roles(topic: str) -> tuple[str, str]:
     roles = _adsd_role_candidates(topic)
     return roles[0], roles[1] if len(roles) > 1 else roles[0]
@@ -1128,10 +1178,13 @@ def _parse_adsd_override_turns(raw_lines: list[str], topic: str) -> list[dict]:
             speaker = known[i % len(known)] if known else fallback_role
         if not text:
             raise RuntimeError(f"ADSD 注入脚本第 {i+1} 行为空")
-        voice = _voice_for_speaker(speaker)
+        inferred_gender = _adsd_infer_gender_from_speaker(speaker)
+        voice = _voice_for_speaker(speaker, inferred_gender or None)
+        voice_gender = inferred_gender or _adsd_gender_from_voice(voice) or "male"
         turns.append({
             "dialogue_turn": i + 1,
             "speaker": speaker,
+            "voice_gender": voice_gender,
             "speaker_id": voice["voice_id"],
             "speaker_name": voice["voice_name"],
             "text": text,
@@ -1330,10 +1383,12 @@ def _adsd_visual_contract(speaker: str, lip_sync: bool | None = None, gender: st
     if lip_sync is None:
         lip_sync = ADSD_LIP_SYNC_EXPERIMENT
     vs = (visual_subject or "").strip()
+    gender_lock = _adsd_gender_lock_phrase(gender)
     if vs and len(vs.split()) >= 4:
         # LLM 主路径：直接用 visual_subject 锁定外形
         anchor = (
             f"Active speaker is {vs}, internally identified as '{speaker}' for voice continuity only; do not render this name as text. "
+            f"{gender_lock} "
             f"APPEARANCE LOCK: render this exact subject consistently across every scene; "
             f"the same speaker name must always have the same appearance/species/form. "
             "Show as the clear speaking subject inside the period scene, face/head readable in three-quarter view, "
@@ -1353,6 +1408,7 @@ def _adsd_visual_contract(speaker: str, lip_sync: bool | None = None, gender: st
             gender_negative = "consistent gender across all scenes"
         anchor = (
             f"Active speaker is {gender_phrase}, internally identified as '{speaker}' for voice continuity only; do not render this name as text. "
+            f"{gender_lock} "
             f"GENDER LOCK (fallback): render as {g.upper() if g in ('male', 'female') else 'CONSISTENT GENDER'} across every scene; "
             f"the same speaker name must always have the same gender. {gender_negative}. "
             "Show this person as the clear speaking subject inside the period scene, face readable in three-quarter view, "
@@ -1964,7 +2020,14 @@ THUMBNAIL_ANCHOR: 封面视觉锚，用 4~6 个短语描述：主体、主色（
         subject = visuals[i].get("prompt", "")
         if dialogue_meta:
             _dlg_gender = (dialogue_meta.get("voice_gender") or dialogue_meta.get("gender") or "").strip().lower()
+            if _dlg_gender not in ("male", "female"):
+                _voice_gender = _adsd_gender_from_voice({"voice_id": dialogue_meta.get("speaker_id")})
+                _dlg_gender = _voice_gender or _adsd_infer_gender_from_speaker(dialogue_meta.get("speaker", "")) or "male"
             _dlg_visual = (dialogue_meta.get("visual_subject") or "").strip()
+            if _adsd_visual_subject_has_gender_conflict(_dlg_visual, _dlg_gender):
+                log(f"ADSD visual_subject 与音色性别冲突，忽略 visual_subject：{dialogue_meta.get('speaker')} {_dlg_gender} / {_dlg_visual}")
+                _dlg_visual = ""
+                dialogue_meta["visual_subject"] = ""
             visual_contract = _adsd_visual_contract(
                 dialogue_meta.get("speaker", ""),
                 gender=_dlg_gender,
@@ -2696,6 +2759,59 @@ def _write_adsd_speaker_focus_qa(script: list[dict], motion_results: dict[int, b
         return payload
     except Exception as e:
         log(f"ADSD speaker_focus_qa 写入失败: {e}")
+        return None
+
+
+def _write_adsd_gender_voice_qa(script: list[dict]) -> dict | None:
+    """Gate ADSD visual gender against the assigned TTS voice gender."""
+    if not ADS_DIALOGUE_MODE:
+        return None
+    try:
+        scenes = []
+        failures = []
+        for i, scene in enumerate(script):
+            voice = {"voice_id": scene.get("speaker_id")}
+            voice_gender = str(scene.get("voice_gender") or "").strip().lower()
+            if voice_gender not in ("male", "female"):
+                voice_gender = _adsd_gender_from_voice(voice) or _adsd_infer_gender_from_speaker(scene.get("speaker", ""))
+            voice_id_gender = _adsd_gender_from_voice(voice)
+            prompt = str(scene.get("prompt") or "")
+            visual_subject = str(scene.get("visual_subject") or "")
+            conflict = _adsd_visual_subject_has_gender_conflict(visual_subject, voice_gender)
+            prompt_lock = "VOICE-VISUAL GENDER LOCK" in prompt
+            voice_match = bool(voice_gender) and (not voice_id_gender or voice_gender == voice_id_gender)
+            rec = {
+                "turn": i + 1,
+                "speaker": scene.get("speaker"),
+                "voice_gender": voice_gender,
+                "voice_id": scene.get("speaker_id"),
+                "voice_name": scene.get("speaker_name"),
+                "voice_id_gender": voice_id_gender,
+                "visual_subject": visual_subject,
+                "prompt_has_voice_visual_gender_lock": prompt_lock,
+                "visual_subject_gender_conflict": conflict,
+                "pass": voice_match and prompt_lock and not conflict,
+            }
+            scenes.append(rec)
+            if not rec["pass"]:
+                failures.append(rec)
+        payload = {
+            "mode": ADSD_MODE_NAME,
+            "policy": "voice_gender_must_match_visible_speaker_gender",
+            "total": len(script),
+            "failed_count": len(failures),
+            "pass": len(failures) == 0,
+            "scenes": scenes,
+            "created_at": datetime.now().isoformat(timespec="seconds"),
+        }
+        (OUTPUT_DIR / "gender_voice_qa.json").write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        if payload["pass"]:
+            tg(f"✅ 声画性别 QA：{len(script)} 个 turn 均有 voice-visual gender lock")
+        else:
+            tg(f"⚠️ 声画性别 QA：{len(failures)} 个 turn 失败，已记录 gender_voice_qa.json")
+        return payload
+    except Exception as e:
+        log(f"ADSD gender_voice_qa 写入失败: {e}")
         return None
 
 
@@ -4699,6 +4815,7 @@ def step6_parallel(script: list[dict], topic: str, pregenerated_bgm_path: str | 
         generate_gpt_image2_direct_annotated_storyboards(script, topic)
         if script:
             _write_cultural_visual_qa(script, script[0].get("topic_meta", {}))
+            _write_adsd_gender_voice_qa(script)
 
         # ── 审批流程 ────────────────────────────────────────────────────
         if SKIP_APPROVAL:
@@ -6678,6 +6795,7 @@ def _adsd_lip_sync_prompt(scene: dict, safe_retry: bool = False) -> str:
         return (
             "Neutral period dialogue scene. "
             "If a character sheet reference is provided, use it only to preserve the active speaker identity; do not render the sheet itself. "
+            f"{_adsd_gender_lock_phrase(scene.get('voice_gender'))} "
             f"Active speaker is the {role}; any other onsite characters listen silently. "
             "The active speaker follows the provided Chinese audio reference with natural mouth movement. "
             f"Visible mouth, stable face, subtle head motion, realistic lighting.{pov} "
@@ -6688,6 +6806,7 @@ def _adsd_lip_sync_prompt(scene: dict, safe_retry: bool = False) -> str:
     return (
         "Historically grounded period dialogue scene. "
         "If a character sheet reference is provided, use it only to preserve the active speaker identity; do not render the sheet itself. "
+        f"{_adsd_gender_lock_phrase(scene.get('voice_gender'))} "
         f"Active speaker is the {role}; any other people only listen or react. Do not display the speaker name. "
         "Use the uploaded Chinese audio reference as the only dialogue source. "
         "Do not render, write, subtitle, caption, or overlay the spoken words anywhere in the frame. "
@@ -7528,6 +7647,7 @@ def _write_adsd_delivery_qa(final_path: str) -> dict | None:
     required_files = [
         ("subtitle_qa.json", "subtitle labels"),
         ("speaker_focus_qa.json", "speaker focus"),
+        ("gender_voice_qa.json", "voice visual gender"),
     ]
     if ADSD_LIP_SYNC_EXPERIMENT:
         required_files.append(("lip_sync_qa.json", "lip sync"))
@@ -7602,6 +7722,7 @@ def _write_adsd_delivery_qa(final_path: str) -> dict | None:
         "checks": {
             "subtitle_qa": _qa_file_pass("subtitle_qa.json"),
             "speaker_focus_qa": _qa_file_pass("speaker_focus_qa.json"),
+            "gender_voice_qa": _qa_file_pass("gender_voice_qa.json"),
             "lip_sync_qa": _qa_file_pass("lip_sync_qa.json"),
             "asr_qa": asr_passed,
             "audio_video_delta": audio_video_delta,
