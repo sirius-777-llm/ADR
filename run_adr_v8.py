@@ -221,6 +221,17 @@ ADSD_ALMIGHTY_AUDIO_DUB_EXPERIMENT = (
 )
 ADSD_DEFAULT_MALE_VOICE_ASSET = os.environ.get("ADR_ADSD_DEFAULT_MALE_VOICE_ASSET", "external_luo_xiang_xyma_001")
 ADSD_DEFAULT_FEMALE_VOICE_ASSET = os.environ.get("ADR_ADSD_DEFAULT_FEMALE_VOICE_ASSET", "external_by2_e7gn_001")
+DEFAULT_MALE_VOICE_ASSET = os.environ.get("ADR_DEFAULT_MALE_VOICE_ASSET", ADSD_DEFAULT_MALE_VOICE_ASSET)
+DEFAULT_FEMALE_VOICE_ASSET = os.environ.get("ADR_DEFAULT_FEMALE_VOICE_ASSET", ADSD_DEFAULT_FEMALE_VOICE_ASSET)
+DEFAULT_VOICE_ASSET = os.environ.get("ADR_DEFAULT_VOICE_ASSET", "").strip()
+VOICE_ASSET_AUDIO_DUB_EXPERIMENT = (
+    not ADS_DIALOGUE_MODE
+    and not NO_VOICE
+    and "--no-voice-asset-audio-dub" not in sys.argv
+    and "--no-almighty-audio-dub" not in sys.argv
+    and os.environ.get("ADR_VOICE_ASSET_AUDIO_DUB", "1").strip().lower() not in ("0", "false", "no", "off")
+)
+VOICE_ASSET_AUDIO_DUB_RESOLUTION = os.environ.get("ADR_VOICE_ASSET_AUDIO_DUB_RESOLUTION", "720p").strip() or "720p"
 ADSD_ONSITE_POV_MODE = (
     "--pov" in sys.argv
     or "--onsite-pov" in sys.argv
@@ -5183,6 +5194,11 @@ def _finalize_motion_qa(total: int, success_count: int) -> None:
         reference_success = sum(1 for r in records if r.get("path") == "image-to-video" and r.get("pass"))
         annotated_success = sum(1 for r in records if r.get("reference_mode") == "annotated_storyboard" and r.get("pass"))
         text_success = sum(1 for r in records if r.get("path") == "text-to-video" and r.get("pass"))
+        generated_audio_success = sum(
+            1 for r in records
+            if r.get("pass") and r.get("video_has_audio") and r.get("generated_audio_from_prompt_dialogue")
+        )
+        embedded_voice_audio_ready = generated_audio_success == total and generated_audio_success > 0
         payload.update({
             "total": total,
             "success_count": success_count,
@@ -5190,9 +5206,18 @@ def _finalize_motion_qa(total: int, success_count: int) -> None:
             "reference_success_count": reference_success,
             "annotated_reference_success_count": annotated_success,
             "text_fallback_success_count": text_success,
+            "generated_audio_segment_count": generated_audio_success,
+            "embedded_voice_audio_ready": embedded_voice_audio_ready,
+            "voice_asset_audio_dub_experiment": VOICE_ASSET_AUDIO_DUB_EXPERIMENT,
+            "default_voice_assets": {
+                "male": DEFAULT_MALE_VOICE_ASSET,
+                "female": DEFAULT_FEMALE_VOICE_ASSET,
+                "default": DEFAULT_VOICE_ASSET or None,
+            },
             "static_fallback_count": max(0, total - success_count),
             "pass": success_count >= max(1, math.ceil(total * 0.7)),
-            "policy": "clean_keyframe_image_to_video_first_text_to_video_static_last",
+            "policy": "voice_asset_audio_dub_first_clean_keyframe_image_to_video_text_to_video_static_last",
+            "master_audio_mux_required": not embedded_voice_audio_ready,
             "finalized_at": datetime.now().isoformat(timespec="seconds"),
         })
         p.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -5292,6 +5317,17 @@ def _motion_output_qa(path: str, target_dur: float | None = None) -> dict:
         qa["issues"].append("decode_probe_failed")
     qa["pass"] = not qa["issues"]
     return qa
+
+
+def _has_audio_stream(path: str) -> bool:
+    try:
+        probe = subprocess.check_output([
+            "ffprobe", "-v", "error", "-select_streams", "a",
+            "-show_entries", "stream=codec_type", "-of", "json", path,
+        ], stderr=subprocess.DEVNULL)
+        return bool(json.loads(probe.decode()).get("streams"))
+    except Exception:
+        return False
 
 
 def _normalize_motion_video(src_path: str, dst_path: str, target_dur: float) -> dict:
@@ -5612,6 +5648,192 @@ def _motion_reference_prompt(scene: dict, motion_prompt: str, safe_retry: bool =
     return (prefix + base + suffix)[:2000]
 
 
+def _motion_audio_dub_prompt(scene: dict, motion_prompt: str, safe_retry: bool = False) -> str:
+    narration = re.sub(r"\s+", " ", str(scene.get("text") or "")).strip()[:260]
+    visual = _motion_reference_prompt(scene, motion_prompt, safe_retry=safe_retry, annotated=False)
+    if safe_retry:
+        return (
+            "Create a realistic Chinese documentary video from the uploaded image. "
+            "Use the uploaded audio only as a voice timbre and speaking-style reference, then generate new Mandarin narration. "
+            f"Speak exactly this Chinese line and nothing else: 「{narration}」. "
+            "The narration may be off-screen unless a clear speaker is visible. No subtitles, captions, written words, logos, or watermarks."
+        )[:1000]
+    return (
+        "Create a cinematic Chinese documentary shot with generated voice audio. "
+        "Use the uploaded image as the strict visual reference for era, character identity, costume, composition, lighting, and geography. "
+        "Use the uploaded audio only as a lawful voice/timbre reference: preserve tone color, gender impression, pace, and delivery style; do not use it as music. "
+        f"Generate clear Mandarin narration speaking exactly this line and nothing else: 「{narration}」. "
+        "If no speaker face is visible, treat the voice as off-screen narration; if a speaker is visible, keep mouth motion natural and understated. "
+        f"Camera/action instruction: {visual}. "
+        "Absolutely no subtitles, captions, written dialogue, on-screen labels, logos, watermarks, or storyboard pages."
+    )[:2000]
+
+
+def _motion_audio_dub_poll_and_download(idx: int, task_id: str, scene: dict, target_dur: float) -> tuple[bool, dict]:
+    info = {
+        "turn": idx + 1,
+        "task_id": task_id,
+        "source_audio": scene.get("_motion_reference_audio"),
+        "source_audio_role": scene.get("_motion_reference_audio_role") or "voice_asset_reference",
+        "voice_asset_reference": scene.get("_motion_voice_asset_reference"),
+        "target_duration": round(target_dur, 3),
+        "pass": False,
+    }
+    err_counts = {}
+    for iteration in range(121):
+        try:
+            s = req_get(f"/generation/{task_id}/status")
+        except Exception as e:
+            key = type(e).__name__ + ":" + str(e)[:80]
+            err_counts[key] = err_counts.get(key, 0) + 1
+            if err_counts[key] in (1, 10, 50, 100):
+                log(f"[motion-audio-dub {idx}] req_get 异常 第 {err_counts[key]} 次: {key}")
+            time.sleep(5)
+            continue
+        data = s.get("data", {})
+        st = data.get("task_status", "")
+        if iteration == 0 or iteration % 12 == 0 or st in ("succeed", "failed"):
+            log(f"[motion-audio-dub {idx}] poll #{iteration+1}: {st}")
+        if st == "succeed":
+            vid_url = _extract_video_url(data)
+            if not vid_url:
+                info.update({"reason": "succeed_without_video_url", "response": data})
+                return False, info
+            raw_path = str(OUTPUT_DIR / f"motion_audio_dub_raw_{idx}.mp4")
+            try:
+                urllib.request.urlretrieve(vid_url, raw_path)
+            except Exception as e:
+                info.update({"reason": f"download_failed: {e}"})
+                return False, info
+            if not os.path.exists(raw_path) or os.path.getsize(raw_path) < 10000:
+                info.update({"reason": "download_file_too_small"})
+                return False, info
+            ok = _postprocess_audio_dub_segment(raw_path, scene, target_dur)
+            output_qa = _motion_output_qa(scene["vid_path"], target_dur) if ok else None
+            has_audio = _has_audio_stream(scene["vid_path"]) if ok else False
+            info.update({
+                "pass": bool(ok and has_audio),
+                "candidate": "almighty_reference_voice_asset_audio_dub",
+                "raw_path": raw_path,
+                "video_has_audio": has_audio,
+                "generated_audio_from_prompt_dialogue": has_audio,
+                "needs_master_audio_mux": not has_audio,
+                "output_qa": output_qa,
+            })
+            if ok and has_audio:
+                _remove_motion_task(idx)
+                return True, info
+            info.setdefault("reason", "postprocess_missing_generated_audio")
+            return False, info
+        if st == "failed":
+            _remove_motion_task(idx)
+            info.update({"reason": "task_failed", "response": s})
+            return False, info
+        time.sleep(5)
+    info.update({"reason": "poll_timeout_reusable"})
+    return False, info
+
+
+def _try_motion_audio_dub_video(idx: int, scene: dict, motion_prompt: str, aspect_ratio: str, dur: int, target_dur: float | None = None, safe_retry: bool = False) -> tuple[bool, bool]:
+    if ADS_DIALOGUE_MODE or not VOICE_ASSET_AUDIO_DUB_EXPERIMENT or safe_retry:
+        return False, False
+    img_path = scene.get("img_path")
+    if not img_path or not os.path.exists(img_path):
+        return False, False
+    voice_asset_ref = _select_voice_asset_reference(scene, mode="motion")
+    if not voice_asset_ref:
+        _append_motion_qa({
+            "turn": idx + 1,
+            "path": "almighty-reference-audio-dub",
+            "pass": False,
+            "fallback_to_reference_motion": True,
+            "reason": "missing_voice_asset_reference",
+        })
+        return False, False
+    source_audio = voice_asset_ref.get("path")
+    if not source_audio or not os.path.exists(source_audio):
+        return False, False
+    scene["_motion_reference_audio"] = source_audio
+    scene["_motion_reference_audio_role"] = "voice_asset_reference"
+    scene["_motion_voice_asset_reference"] = voice_asset_ref
+    try:
+        image_url = _upload_to_weryai(img_path)
+        audio_url = _upload_to_weryai(source_audio)
+    except Exception as e:
+        log(f"[motion-audio-dub {idx}] reference 上传失败，回退 motion: {e}")
+        _append_motion_qa({
+            "turn": idx + 1,
+            "path": "almighty-reference-audio-dub",
+            "pass": False,
+            "fallback_to_reference_motion": True,
+            "reason": f"upload_failed: {e}",
+            "voice_asset_reference": voice_asset_ref,
+        })
+        return False, False
+
+    prompt = _motion_audio_dub_prompt(scene, motion_prompt, safe_retry=safe_retry)
+    task_id = None
+    response = None
+    for submit_attempt in range(3):
+        try:
+            _wait_motion_submit_slot(f"motion audio-dub {idx+1}")
+            response = req_post("/generation/almighty-reference-to-video", {
+                "model": "WERYDANCE_2_0",
+                "images": [image_url],
+                "audios": [audio_url],
+                "prompt": prompt,
+                "duration": dur,
+                "aspect_ratio": aspect_ratio,
+                "resolution": VOICE_ASSET_AUDIO_DUB_RESOLUTION,
+                "generate_audio": "true",
+                "video_number": 1,
+            }, timeout=30)
+            task_id = response.get("data", {}).get("task_id") or (response.get("data", {}).get("task_ids") or [None])[0]
+            if task_id:
+                break
+        except Exception as e:
+            if submit_attempt < 2:
+                wait_s = 5 * (submit_attempt + 1)
+                log(f"[motion-audio-dub {idx}] submit 失败（第 {submit_attempt+1}/3 次）：{e}，{wait_s}s 后重试")
+                time.sleep(wait_s)
+                continue
+            response = {"exception": str(e)}
+    if not task_id:
+        _append_motion_qa({
+            "turn": idx + 1,
+            "path": "almighty-reference-audio-dub",
+            "pass": False,
+            "fallback_to_reference_motion": True,
+            "reason": "submit_without_task_id",
+            "response": response,
+            "voice_asset_reference": voice_asset_ref,
+        })
+        return False, False
+
+    _save_motion_task(idx, task_id)
+    ok, info = _motion_audio_dub_poll_and_download(idx, task_id, scene, float(target_dur or dur))
+    timed_out_or_reusable = str(idx) in _load_motion_tasks()
+    info.update({
+        "path": "almighty-reference-audio-dub",
+        "model": "WERYDANCE_2_0",
+        "submit_duration": dur,
+        "target_duration": round(float(target_dur or dur), 3),
+        "aspect_ratio": aspect_ratio,
+        "resolution": VOICE_ASSET_AUDIO_DUB_RESOLUTION,
+        "image_path": img_path,
+        "audio_url": audio_url,
+        "image_url": image_url,
+        "fallback_to_reference_motion": not ok and not timed_out_or_reusable,
+        "timed_out_or_reusable": timed_out_or_reusable,
+        "voice_asset_reference": voice_asset_ref,
+        "voice_reference_policy": "use owned, licensed, consented, or otherwise lawful voice references; avoid undisclosed real-person impersonation",
+    })
+    _append_motion_qa(info)
+    if not ok and timed_out_or_reusable:
+        return True, False
+    return ok, ok
+
+
 def _try_motion_reference_video(idx: int, scene: dict, motion_prompt: str, aspect_ratio: str, dur: int, target_dur: float | None = None, safe_retry: bool = False) -> tuple[bool, bool]:
     """Try storyboard image-to-video first.
 
@@ -5753,6 +5975,15 @@ def _motion_one_scene(idx: int, scene: dict, motion_prompt: str, aspect_ratio: s
             log(f"[motion {idx}] 查历史任务失败: {e}，走新提交")
 
     try:
+        handled_audio_dub, audio_dub_ok = _try_motion_audio_dub_video(
+            idx, scene, motion_prompt, aspect_ratio, dur, target_dur=target_dur, safe_retry=safe_retry
+        )
+        if audio_dub_ok:
+            return True
+        if handled_audio_dub:
+            log(f"[motion {idx}] voice-asset audio-dub 已提交但未完成/未通过，保留现有静态片段，不重复烧其他 motion")
+            return False
+
         handled_reference, reference_ok = _try_motion_reference_video(
             idx, scene, motion_prompt, aspect_ratio, dur, target_dur=target_dur, safe_retry=safe_retry
         )
@@ -7124,11 +7355,29 @@ def _load_voice_assets() -> dict:
     return data
 
 
-def _select_voice_asset_reference(scene: dict) -> dict | None:
-    if not ADSD_ALMIGHTY_AUDIO_DUB_EXPERIMENT:
+def _select_voice_asset_reference(scene: dict, *, mode: str = "adsd") -> dict | None:
+    if mode == "adsd":
+        if not ADSD_ALMIGHTY_AUDIO_DUB_EXPERIMENT:
+            return None
+        male_asset = ADSD_DEFAULT_MALE_VOICE_ASSET
+        female_asset = ADSD_DEFAULT_FEMALE_VOICE_ASSET
+        default_asset = ""
+    else:
+        if not VOICE_ASSET_AUDIO_DUB_EXPERIMENT:
+            return None
+        male_asset = DEFAULT_MALE_VOICE_ASSET
+        female_asset = DEFAULT_FEMALE_VOICE_ASSET
+        default_asset = DEFAULT_VOICE_ASSET
+    explicit_asset = str(scene.get("voice_asset_id") or scene.get("voice_id") or "").strip()
+    if explicit_asset:
+        asset_id = explicit_asset
+    elif default_asset:
+        asset_id = default_asset
+    else:
+        gender = str(scene.get("voice_gender") or "").strip().lower()
+        asset_id = female_asset if gender == "female" else male_asset
+    if not asset_id:
         return None
-    gender = str(scene.get("voice_gender") or "").strip().lower()
-    asset_id = ADSD_DEFAULT_FEMALE_VOICE_ASSET if gender == "female" else ADSD_DEFAULT_MALE_VOICE_ASSET
     data = _load_voice_assets()
     asset = next((a for a in data.get("assets", []) if a.get("voice_id") == asset_id), None)
     if not asset:
@@ -7523,9 +7772,29 @@ def step65_grid_multiref_motion_qa(script: list[dict]):
 # ── 第七步：拼接视频轨 ────────────────────────────────────────────────────────
 def step7_concat(script: list[dict]) -> str:
     concat_txt = OUTPUT_DIR / "concat.txt"
+    segment_paths = [str(s["vid_path"]) for s in script]
+    audio_flags = [_has_audio_stream(p) for p in segment_paths]
+    if any(audio_flags) and not all(audio_flags):
+        log("视频片段音轨混合：部分片段含段内语音，拼接前剥离为静音视频，最终回退主音轨")
+        stripped_paths: list[str] = []
+        for i, src in enumerate(segment_paths):
+            if not audio_flags[i]:
+                stripped_paths.append(src)
+                continue
+            dst = str(OUTPUT_DIR / f"seg_{i}_concat_noaudio.mp4")
+            ffmpeg(
+                "-i", src,
+                "-map", "0:v",
+                "-c:v", "copy",
+                "-an",
+                dst,
+                timeout=120,
+            )
+            stripped_paths.append(dst)
+        segment_paths = stripped_paths
     with open(concat_txt, "w") as f:
-        for s in script:
-            f.write(f"file '{s['vid_path']}'\n")
+        for path in segment_paths:
+            f.write(f"file '{path}'\n")
 
     raw_path = str(OUTPUT_DIR / "raw_concat.mp4")
     ffmpeg(
@@ -8129,27 +8398,38 @@ def step9_render(raw_path: str, voice_path: str, bgm_path: str | None, ass_path:
     if NO_VOICE and not bgm_path:
         raise RuntimeError("ADR/ADS BGM-only 模式要求必须有 BGM；BGM 生成失败，阻断静音成片交付")
     use_embedded_dialogue_audio = False
+    embedded_audio_mode = ""
     if ADS_DIALOGUE_MODE and ADSD_ALMIGHTY_AUDIO_DUB_EXPERIMENT:
         try:
             lip_qa = _read_output_json("lip_sync_qa.json")
             records = lip_qa.get("records") or []
             generated_count = sum(1 for r in records if r.get("pass") and r.get("video_has_audio") and r.get("generated_audio_from_prompt_dialogue"))
-            probe = subprocess.check_output([
-                "ffprobe", "-v", "error", "-select_streams", "a",
-                "-show_entries", "stream=codec_type", "-of", "json", raw_path,
-            ], stderr=subprocess.DEVNULL)
-            has_raw_audio = bool(json.loads(probe.decode()).get("streams"))
+            has_raw_audio = _has_audio_stream(raw_path)
             expected_count = int(lip_qa.get("total") or len(records) or 0)
             use_embedded_dialogue_audio = has_raw_audio and generated_count == expected_count and generated_count > 0
+            if use_embedded_dialogue_audio:
+                embedded_audio_mode = "adsd_almighty_audio_dub"
         except Exception as e:
             log(f"Almighty audio-dub embedded audio 检测失败，继续使用主音轨: {e}")
+    elif WITH_MOTION and VOICE_ASSET_AUDIO_DUB_EXPERIMENT:
+        try:
+            motion_qa = _read_output_json("motion_qa.json")
+            records = motion_qa.get("records") or []
+            generated_count = sum(1 for r in records if r.get("pass") and r.get("video_has_audio") and r.get("generated_audio_from_prompt_dialogue"))
+            expected_count = int(motion_qa.get("total") or len({int(r.get("turn", 0)) for r in records if r.get("turn")}) or len(records) or 0)
+            has_raw_audio = _has_audio_stream(raw_path)
+            use_embedded_dialogue_audio = has_raw_audio and generated_count == expected_count and generated_count > 0
+            if use_embedded_dialogue_audio:
+                embedded_audio_mode = "motion_voice_asset_audio_dub"
+        except Exception as e:
+            log(f"motion voice-asset audio-dub embedded audio 检测失败，继续使用主音轨: {e}")
     render_audio_offset = 0.0 if (ADS_DIALOGUE_MODE and ADSD_LIP_SYNC_EXPERIMENT) else AUDIO_DELAY
     if NO_VOICE:
         sync_note = "BGM-only 模式：无旁白 TTS、无字幕，静音轨仅用于时间轴占位"
         audio_note = "BGM-only ✓"
     elif use_embedded_dialogue_audio:
-        sync_note = "Almighty audio-dub 模式：使用视频段内生成对白音频，不叠加 TTS 主音轨"
-        audio_note = "WERYDANCE 段内对白 ✓" + (" BGM ✓" if bgm_path else "")
+        sync_note = f"{embedded_audio_mode or 'audio-dub'} 模式：使用视频段内生成语音，不叠加 TTS 主音轨"
+        audio_note = "WERYDANCE 段内语音 ✓" + (" BGM ✓" if bgm_path else "")
     else:
         sync_note = "口型同步模式：音频不延迟" if render_audio_offset == 0 else "画面 → +{:.1f}s 字幕 → +{:.1f}s 配音".format(SUB_DELAY, render_audio_offset)
         audio_note = "主音轨 ✓" + (" BGM ✓" if bgm_path else "")
@@ -8158,28 +8438,31 @@ def step9_render(raw_path: str, voice_path: str, bgm_path: str | None, ass_path:
 
     # ★ 音画同步修正：WERYDANCE 每段固定 5s × N，但配音总时长 ≠ 5N（往往更长）
     # 若配音比视频长 > 1s，整体用 setpts 拉伸视频到配音时长，避免 -shortest 截断尾部内容
-    try:
-        voice_dur_chk = ffprobe_duration(voice_path)
-        video_dur_chk = ffprobe_duration(raw_path)
-        # 目标视频时长 = 配音时长 + AUDIO_DELAY 偏移 + 0.3s 收尾缓冲（保证配音完整不被 -shortest 截）
-        target_video_dur = voice_dur_chk + render_audio_offset + 0.3
-        if abs(target_video_dur - video_dur_chk) > 1.0:
-            # 双向同步：视频长→压缩，视频短→拉伸
-            ratio = target_video_dur / video_dur_chk
-            direction = "拉伸" if ratio > 1 else "压缩"
-            log(f"音画同步修正：video {video_dur_chk:.2f}s → 目标 {target_video_dur:.2f}s（配音 {voice_dur_chk:.2f}s + offset {render_audio_offset:.1f}s + 缓冲 0.3s）setpts ×{ratio:.3f} · {direction}")
-            tg(f"🔧 音画同步修正：视频 {video_dur_chk:.1f}s → {direction}到 {target_video_dur:.1f}s")
-            synced_raw = str(OUTPUT_DIR / "raw_concat_synced.mp4")
-            ffmpeg(
-                "-i", raw_path,
-                "-filter:v", f"setpts={ratio:.4f}*PTS",
-                "-an",
-                "-c:v", "libx264", "-crf", "20", "-preset", "medium",
-                synced_raw,
-            )
-            raw_path = synced_raw
-    except Exception as e:
-        log(f"音画同步修正失败（使用原视频）：{e}")
+    if use_embedded_dialogue_audio:
+        log("音画同步修正跳过：当前使用 WERYDANCE 段内生成语音，不按 TTS 主音轨拉伸视频")
+    else:
+        try:
+            voice_dur_chk = ffprobe_duration(voice_path)
+            video_dur_chk = ffprobe_duration(raw_path)
+            # 目标视频时长 = 配音时长 + AUDIO_DELAY 偏移 + 0.3s 收尾缓冲（保证配音完整不被 -shortest 截）
+            target_video_dur = voice_dur_chk + render_audio_offset + 0.3
+            if abs(target_video_dur - video_dur_chk) > 1.0:
+                # 双向同步：视频长→压缩，视频短→拉伸
+                ratio = target_video_dur / video_dur_chk
+                direction = "拉伸" if ratio > 1 else "压缩"
+                log(f"音画同步修正：video {video_dur_chk:.2f}s → 目标 {target_video_dur:.2f}s（配音 {voice_dur_chk:.2f}s + offset {render_audio_offset:.1f}s + 缓冲 0.3s）setpts ×{ratio:.3f} · {direction}")
+                tg(f"🔧 音画同步修正：视频 {video_dur_chk:.1f}s → {direction}到 {target_video_dur:.1f}s")
+                synced_raw = str(OUTPUT_DIR / "raw_concat_synced.mp4")
+                ffmpeg(
+                    "-i", raw_path,
+                    "-filter:v", f"setpts={ratio:.4f}*PTS",
+                    "-an",
+                    "-c:v", "libx264", "-crf", "20", "-preset", "medium",
+                    synced_raw,
+                )
+                raw_path = synced_raw
+        except Exception as e:
+            log(f"音画同步修正失败（使用原视频）：{e}")
 
     fmt_tag = ADSD_MODE_NAME if ADS_DIALOGUE_MODE else ("VDAR" if IS_VERTICAL else "HDAR")
     final_path = str(OUTPUT_DIR / f"ADR_V8_{fmt_tag}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.mp4")
