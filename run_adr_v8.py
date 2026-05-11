@@ -149,9 +149,8 @@ STORYBOARD_REFERENCE_MOTION = (
     and os.environ.get("ADR_STORYBOARD_REFERENCE_MOTION", "1").strip().lower() not in ("0", "false", "no", "off")
 )
 STORYBOARD_ANNOTATED_MOTION = (
-    "--clean-reference-motion" not in sys.argv
-    and "--no-annotated-motion" not in sys.argv
-    and os.environ.get("ADR_STORYBOARD_ANNOTATED_MOTION", "1").strip().lower() not in ("0", "false", "no", "off")
+    "--with-annotated-motion" in sys.argv
+    or os.environ.get("ADR_STORYBOARD_ANNOTATED_MOTION", "").strip().lower() in ("1", "true", "yes", "on")
 )
 GPT_IMAGE2_DIRECT_ANNOTATED_STORYBOARD = (
     "--with-direct-annotated-storyboard" in sys.argv
@@ -3920,7 +3919,7 @@ def _storyboard_grid_prompt(batch_script: list[dict], start: int, total: int, to
     for local_i, scene in enumerate(batch_script, start=start + 1):
         prompt = re.sub(r"\s+", " ", str(scene.get("prompt") or scene.get("text") or "")).strip()
         text = re.sub(r"\s+", " ", str(scene.get("text") or "")).strip()
-        lines.append(f"{local_i:02d}. Visual: {prompt[:520]}\n    Beat: {text[:120]}")
+        lines.append(f"{local_i:02d}. Visual: {prompt[:380]}\n    Beat: {text[:90]}")
     count = len(batch_script)
     culture_guard = _topic_culture_guard(batch_script[0].get("topic_meta", {}) if batch_script else {})
     return f"""Create one single {aspect} cinematic storyboard grid for a documentary sequence.
@@ -3939,6 +3938,16 @@ Panel rules:
 
 Shot beats:
 {chr(10).join(lines)}"""
+
+
+def _storyboard_grid_prompt_limit() -> int:
+    return max(4000, int(os.environ.get("ADR_GPT_IMAGE2_STORYBOARD_GRID_PROMPT_LIMIT", "9500")))
+
+
+def _is_prompt_limit_response(response: object) -> bool:
+    text = json.dumps(response, ensure_ascii=False) if not isinstance(response, str) else response
+    text_l = text.lower()
+    return "prompt length exceeds" in text_l or "exceeds the limit" in text_l or "10000 characters" in text_l
 
 
 def _production_storyboard_prompt(script: list[dict], topic: str, aspect: str) -> str:
@@ -4391,6 +4400,7 @@ def generate_storyboard_grid_gpt_image2(script: list[dict], topic: str) -> bool:
         return False
     aspect = _storyboard_grid_aspect()
     batch_size = max(1, min(16, int(os.environ.get("ADR_GPT_IMAGE2_STORYBOARD_GRID_BATCH", "16"))))
+    prompt_limit = _storyboard_grid_prompt_limit()
     poll_max = float(os.environ.get("ADR_GPT_IMAGE2_STORYBOARD_GRID_POLL_MAX", "300"))
     qa = {
         "mode": "gpt_image2_storyboard_grid_4k",
@@ -4399,63 +4409,115 @@ def generate_storyboard_grid_gpt_image2(script: list[dict], topic: str) -> bool:
         "model": "GPT_IMAGE_2",
         "aspect_ratio": aspect,
         "batch_size": batch_size,
+        "prompt_limit": prompt_limit,
         "requested_count": n,
         "rendered_count": 0,
         "batches": [],
         "issues": [],
-        "policy": "4k_grid_generate_then_crop_clean_panels_for_motion_refs",
+        "policy": "adaptive_multi_4k_grid_generate_then_crop_clean_panels_for_motion_refs",
         "created_at": datetime.now().isoformat(timespec="seconds"),
     }
     try:
-        for batch_idx, start in enumerate(range(0, n, batch_size), start=1):
-            end = min(n, start + batch_size)
-            batch_script = script[start:end]
-            cols, rows = _storyboard_grid_cols_rows(len(batch_script))
-            prompt = _storyboard_grid_prompt(batch_script, start, n, topic, cols, rows, aspect)
-            if len(prompt) > 18000:
-                prompt = prompt[:18000]
-                qa.setdefault("warnings", []).append(f"batch_{batch_idx}_prompt_truncated")
-            r = submit_text_to_image({
-                "model": "GPT_IMAGE_2",
-                "prompt": prompt,
-                "aspect_ratio": aspect,
-                "image_number": 1,
-                "quality": "high",
-            }, f"GPT Image 2 storyboard grid {batch_idx}", timeout=45)
-            task_id = (r.get("data", {}).get("task_ids") or [r.get("data", {}).get("task_id") or None])[0]
-            batch_qa = {
-                "batch": batch_idx,
-                "scene_start": start + 1,
-                "scene_end": end,
-                "grid": f"{cols}x{rows}",
-                "task_id": task_id,
-                "pass": False,
-            }
-            qa["batches"].append(batch_qa)
-            if not task_id:
-                batch_qa["reason"] = f"submit_without_task_id: {json.dumps(r, ensure_ascii=False)[:200]}"
-                qa["issues"].append(f"batch_{batch_idx}_submit_without_task_id")
-                raise RuntimeError(batch_qa["reason"])
-            data = poll_storyboard_task(task_id, f"GPT Image 2 storyboard grid {batch_idx}", poll_max)
-            urls = _extract_img_urls(data)
-            if not urls:
-                batch_qa["reason"] = "succeed_without_image_url"
-                qa["issues"].append(f"batch_{batch_idx}_without_image_url")
-                raise RuntimeError(batch_qa["reason"])
-            grid_path = OUTPUT_DIR / f"storyboard_grid_{batch_idx:02d}.png"
-            urllib.request.urlretrieve(urls[0], grid_path)
-            batch_qa["grid_path"] = str(grid_path)
-            batch_qa["grid_bytes"] = grid_path.stat().st_size if grid_path.exists() else 0
-            _crop_storyboard_grid_panels(grid_path, batch_script, start, cols, rows, batch_qa)
-            rendered = sum(1 for r in batch_qa.get("panel_records", []) if r.get("pass"))
-            qa["rendered_count"] += rendered
-            batch_qa["pass"] = rendered == len(batch_script)
-            if not batch_qa["pass"]:
-                qa["issues"].append(f"batch_{batch_idx}_crop_incomplete")
-                raise RuntimeError(f"storyboard grid batch {batch_idx} crop incomplete")
+        start = 0
+        batch_idx = 0
+        while start < n:
+            current_size = min(batch_size, n - start)
+            submitted_current_start = False
+            while current_size >= 1:
+                end = min(n, start + current_size)
+                batch_script = script[start:end]
+                cols, rows = _storyboard_grid_cols_rows(len(batch_script))
+                prompt = _storyboard_grid_prompt(batch_script, start, n, topic, cols, rows, aspect)
+                if len(prompt) > prompt_limit and current_size > 1:
+                    next_size = max(1, current_size // 2)
+                    qa.setdefault("adaptive_splits", []).append({
+                        "scene_start": start + 1,
+                        "scene_end": end,
+                        "from_size": current_size,
+                        "to_size": next_size,
+                        "reason": f"prompt_too_long:{len(prompt)}>{prompt_limit}",
+                    })
+                    current_size = next_size
+                    continue
+                if len(prompt) > 10000:
+                    prompt = prompt[:10000]
+                    qa.setdefault("warnings", []).append(f"scene_{start+1}_{end}_prompt_hard_truncated")
+                batch_idx += 1
+                batch_qa = {
+                    "batch": batch_idx,
+                    "scene_start": start + 1,
+                    "scene_end": end,
+                    "grid": f"{cols}x{rows}",
+                    "panel_count": len(batch_script),
+                    "prompt_chars": len(prompt),
+                    "task_id": None,
+                    "pass": False,
+                }
+                qa["batches"].append(batch_qa)
+                r = submit_text_to_image({
+                    "model": "GPT_IMAGE_2",
+                    "prompt": prompt,
+                    "aspect_ratio": aspect,
+                    "image_number": 1,
+                    "quality": "high",
+                }, f"GPT Image 2 storyboard grid {batch_idx}", timeout=45)
+                task_id = (r.get("data", {}).get("task_ids") or [r.get("data", {}).get("task_id") or None])[0]
+                batch_qa["task_id"] = task_id
+                if not task_id:
+                    batch_qa["reason"] = f"submit_without_task_id: {json.dumps(r, ensure_ascii=False)[:200]}"
+                    if current_size > 1 and _is_prompt_limit_response(r):
+                        next_size = max(1, current_size // 2)
+                        batch_qa["retry_with_smaller_grid"] = next_size
+                        qa.setdefault("adaptive_splits", []).append({
+                            "scene_start": start + 1,
+                            "scene_end": end,
+                            "from_size": current_size,
+                            "to_size": next_size,
+                            "reason": "api_prompt_limit",
+                        })
+                        current_size = next_size
+                        continue
+                    qa["issues"].append(f"batch_{batch_idx}_submit_without_task_id")
+                    raise RuntimeError(batch_qa["reason"])
+                data = poll_storyboard_task(task_id, f"GPT Image 2 storyboard grid {batch_idx}", poll_max)
+                urls = _extract_img_urls(data)
+                if not urls:
+                    batch_qa["reason"] = "succeed_without_image_url"
+                    qa["issues"].append(f"batch_{batch_idx}_without_image_url")
+                    raise RuntimeError(batch_qa["reason"])
+                grid_path = OUTPUT_DIR / f"storyboard_grid_{batch_idx:02d}.png"
+                urllib.request.urlretrieve(urls[0], grid_path)
+                batch_qa["grid_path"] = str(grid_path)
+                batch_qa["grid_bytes"] = grid_path.stat().st_size if grid_path.exists() else 0
+                _crop_storyboard_grid_panels(grid_path, batch_script, start, cols, rows, batch_qa)
+                rendered = sum(1 for r in batch_qa.get("panel_records", []) if r.get("pass"))
+                batch_qa["rendered_count"] = rendered
+                batch_qa["pass"] = rendered == len(batch_script)
+                if not batch_qa["pass"]:
+                    batch_qa["reason"] = "crop_incomplete"
+                    if current_size > 1:
+                        next_size = max(1, current_size // 2)
+                        batch_qa["retry_with_smaller_grid"] = next_size
+                        qa.setdefault("adaptive_splits", []).append({
+                            "scene_start": start + 1,
+                            "scene_end": end,
+                            "from_size": current_size,
+                            "to_size": next_size,
+                            "reason": "crop_incomplete",
+                        })
+                        current_size = next_size
+                        continue
+                    qa["issues"].append(f"batch_{batch_idx}_crop_incomplete")
+                    raise RuntimeError(f"storyboard grid batch {batch_idx} crop incomplete")
+                qa["rendered_count"] += rendered
+                start = end
+                submitted_current_start = True
+                break
+            if not submitted_current_start:
+                raise RuntimeError(f"storyboard grid failed at scene {start + 1}")
         qa["used"] = True
         qa["pass"] = qa["rendered_count"] == n
-        tg(f"🧩 GPT Image 2 4K storyboard grid 成功：{qa['rendered_count']}/{n} 格已裁成 clean refs")
+        tg(f"🧩 GPT Image 2 4K storyboard multi-grid 成功：{qa['rendered_count']}/{n} 格已裁成 clean refs（{batch_idx} 张 grid）")
         return qa["pass"]
     except Exception as e:
         qa["pass"] = False
@@ -5105,7 +5167,7 @@ def _finalize_motion_qa(total: int, success_count: int) -> None:
             "text_fallback_success_count": text_success,
             "static_fallback_count": max(0, total - success_count),
             "pass": success_count >= max(1, math.ceil(total * 0.7)),
-            "policy": "annotated_storyboard_image_to_video_first_clean_keyframe_fallback_text_to_video_static_last",
+            "policy": "clean_keyframe_image_to_video_first_text_to_video_static_last",
             "finalized_at": datetime.now().isoformat(timespec="seconds"),
         })
         p.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -5402,7 +5464,7 @@ def _draw_storyboard_arrow(draw, frame_box: tuple[int, int, int, int]) -> None:
 
 
 def _build_annotated_storyboard_reference(scene: dict, idx: int, motion_prompt: str, dur: int) -> str:
-    """Create a director-board image for WERYDANCE while keeping the clean keyframe untouched."""
+    """Create an experimental director board; production motion uses clean keyframes by default."""
     if not STORYBOARD_ANNOTATED_MOTION or ADS_DIALOGUE_MODE:
         return scene.get("img_path", "")
     img_path = scene.get("img_path")
@@ -5546,6 +5608,9 @@ def _try_motion_reference_video(idx: int, scene: dict, motion_prompt: str, aspec
 
     reference_path = _build_annotated_storyboard_reference(scene, idx, motion_prompt, dur)
     reference_mode = "annotated_storyboard" if reference_path and reference_path != img_path else "clean_keyframe"
+    if reference_mode == "annotated_storyboard" and not STORYBOARD_ANNOTATED_MOTION:
+        reference_path = img_path
+        reference_mode = "clean_keyframe"
     full_prompt = _motion_reference_prompt(
         scene,
         motion_prompt,
@@ -7170,9 +7235,9 @@ def step65_motion(script: list[dict]):
     n = len(script)
     reporter_tag = " · ADS拟现场记者" if ADS_REPORTER_MODE else ""
     if STORYBOARD_REFERENCE_MOTION and STORYBOARD_ANNOTATED_MOTION and not ADS_DIALOGUE_MODE:
-        mode_tag = "annotated storyboard 图生视频优先"
+        mode_tag = "实验 annotated storyboard 图生视频"
     elif STORYBOARD_REFERENCE_MOTION and not ADS_DIALOGUE_MODE:
-        mode_tag = "故事板图生视频优先"
+        mode_tag = "clean keyframe 图生视频优先"
     else:
         mode_tag = "文本生视频"
     tg(f"🎬 动态化启动{reporter_tag}：WERYDANCE_2_0 × {n} 分镜并发生成运动视频（{mode_tag}）...")
