@@ -232,6 +232,13 @@ VOICE_ASSET_AUDIO_DUB_EXPERIMENT = (
     and os.environ.get("ADR_VOICE_ASSET_AUDIO_DUB", "1").strip().lower() not in ("0", "false", "no", "off")
 )
 VOICE_ASSET_AUDIO_DUB_RESOLUTION = os.environ.get("ADR_VOICE_ASSET_AUDIO_DUB_RESOLUTION", "720p").strip() or "720p"
+WERYDANCE_CAPTIONS = (
+    not NO_VOICE
+    and "--with-ass-subtitles" not in sys.argv
+    and "--no-werydance-captions" not in sys.argv
+    and os.environ.get("ADR_WERYDANCE_CAPTIONS", "1").strip().lower() not in ("0", "false", "no", "off")
+)
+WERYDANCE_CAPTION_MAX_CHARS = int(os.environ.get("ADR_WERYDANCE_CAPTION_MAX_CHARS", "24"))
 ADSD_ONSITE_POV_MODE = (
     "--pov" in sys.argv
     or "--onsite-pov" in sys.argv
@@ -5198,6 +5205,10 @@ def _finalize_motion_qa(total: int, success_count: int) -> None:
             1 for r in records
             if r.get("pass") and r.get("video_has_audio") and r.get("generated_audio_from_prompt_dialogue")
         )
+        werydance_caption_success = sum(
+            1 for r in records
+            if r.get("pass") and r.get("werydance_captions_requested") and not r.get("ass_fallback_required")
+        )
         embedded_voice_audio_ready = generated_audio_success == total and generated_audio_success > 0
         payload.update({
             "total": total,
@@ -5208,6 +5219,9 @@ def _finalize_motion_qa(total: int, success_count: int) -> None:
             "text_fallback_success_count": text_success,
             "generated_audio_segment_count": generated_audio_success,
             "embedded_voice_audio_ready": embedded_voice_audio_ready,
+            "werydance_captions_enabled": WERYDANCE_CAPTIONS,
+            "werydance_caption_segment_count": werydance_caption_success,
+            "ass_caption_fallback_count": max(0, total - werydance_caption_success) if WERYDANCE_CAPTIONS else total,
             "voice_asset_audio_dub_experiment": VOICE_ASSET_AUDIO_DUB_EXPERIMENT,
             "default_voice_assets": {
                 "male": DEFAULT_MALE_VOICE_ASSET,
@@ -5624,6 +5638,59 @@ def _build_annotated_storyboard_reference(scene: dict, idx: int, motion_prompt: 
         return img_path
 
 
+def _plain_caption_text(scene: dict) -> str:
+    text = re.sub(r"\s+", "", str(scene.get("text") or "")).strip()
+    speaker = str(scene.get("speaker") or "").strip()
+    if speaker:
+        text = re.sub(rf"^{re.escape(speaker)}[：:]", "", text).strip()
+    return text
+
+
+def _werydance_caption_request(scene: dict) -> dict:
+    text = _plain_caption_text(scene)
+    info = {
+        "enabled": WERYDANCE_CAPTIONS,
+        "requested": False,
+        "text": text,
+        "max_chars": WERYDANCE_CAPTION_MAX_CHARS,
+        "ass_fallback_required": True,
+        "reason": "",
+    }
+    if not WERYDANCE_CAPTIONS:
+        info["reason"] = "disabled"
+        return info
+    if not text:
+        info["reason"] = "empty_text"
+        return info
+    if len(text) > WERYDANCE_CAPTION_MAX_CHARS:
+        info["reason"] = f"text_too_long:{len(text)}>{WERYDANCE_CAPTION_MAX_CHARS}"
+        return info
+    info.update({
+        "requested": True,
+        "ass_fallback_required": False,
+        "reason": "eligible_short_caption",
+    })
+    return info
+
+
+def _werydance_caption_instruction(scene: dict) -> str:
+    info = _werydance_caption_request(scene)
+    if not info.get("requested"):
+        return " No subtitles, no captions, no text overlay, no written dialogue."
+    caption = str(info.get("text") or "")
+    return (
+        " Add one bottom-centered Chinese subtitle exactly: "
+        f"「{caption}」. Keep it readable for the full shot, white text with a subtle dark shadow, "
+        "inside the title-safe lower area. Do not add any other text, labels, watermarks, or logos."
+    )
+
+
+def _werydance_negative_prompt(scene: dict) -> str:
+    if _werydance_caption_request(scene).get("requested"):
+        return "watermark, logo, extra text, misspelled text, garbled characters, duplicate captions"
+    return "no subtitles, no text overlay, no watermark, no captions, no burned-in text, no logo"
+
+
 def _motion_reference_prompt(scene: dict, motion_prompt: str, safe_retry: bool = False, annotated: bool = False) -> str:
     base = _build_motion_video_prompt(scene, motion_prompt, safe_retry=safe_retry)
     if annotated:
@@ -5641,32 +5708,34 @@ def _motion_reference_prompt(scene: dict, motion_prompt: str, safe_retry: bool =
             "costume, era, composition, lighting, and scene geography. Animate only plausible motion "
             "within that frame; do not redesign the shot. "
         )
-    suffix = (
-        " No subtitles, no captions, no text overlay, no watermark, no logo, no storyboard annotations. "
-        "Preserve faces, clothing, props, color palette, and historical setting from the reference image."
+    suffix = _werydance_caption_instruction(scene) + (
+        " No storyboard annotations. Preserve faces, clothing, props, color palette, and historical setting from the reference image."
     )
-    return (prefix + base + suffix)[:2000]
+    return (prefix + base[: max(0, 2000 - len(prefix) - len(suffix))] + suffix)[:2000]
 
 
 def _motion_audio_dub_prompt(scene: dict, motion_prompt: str, safe_retry: bool = False) -> str:
     narration = re.sub(r"\s+", " ", str(scene.get("text") or "")).strip()[:260]
-    visual = _motion_reference_prompt(scene, motion_prompt, safe_retry=safe_retry, annotated=False)
+    visual = _build_motion_video_prompt(scene, motion_prompt, safe_retry=safe_retry)
+    caption_instruction = _werydance_caption_instruction(scene)
     if safe_retry:
-        return (
+        prompt = (
             "Create a realistic Chinese documentary video from the uploaded image. "
             "Use the uploaded audio only as a voice timbre and speaking-style reference, then generate new Mandarin narration. "
             f"Speak exactly this Chinese line and nothing else: 「{narration}」. "
-            "The narration may be off-screen unless a clear speaker is visible. No subtitles, captions, written words, logos, or watermarks."
-        )[:1000]
-    return (
+            "The narration may be off-screen unless a clear speaker is visible. "
+        )
+        return (prompt[: max(0, 1000 - len(caption_instruction) - 24)] + caption_instruction + " No logos or watermarks.")[:1000]
+    prompt = (
         "Create a cinematic Chinese documentary shot with generated voice audio. "
         "Use the uploaded image as the strict visual reference for era, character identity, costume, composition, lighting, and geography. "
         "Use the uploaded audio only as a lawful voice/timbre reference: preserve tone color, gender impression, pace, and delivery style; do not use it as music. "
         f"Generate clear Mandarin narration speaking exactly this line and nothing else: 「{narration}」. "
         "If no speaker face is visible, treat the voice as off-screen narration; if a speaker is visible, keep mouth motion natural and understated. "
         f"Camera/action instruction: {visual}. "
-        "Absolutely no subtitles, captions, written dialogue, on-screen labels, logos, watermarks, or storyboard pages."
-    )[:2000]
+    )
+    tail = caption_instruction + " No on-screen labels, logos, watermarks, or storyboard pages."
+    return (prompt[: max(0, 2000 - len(tail))] + tail)[:2000]
 
 
 def _motion_audio_dub_poll_and_download(idx: int, task_id: str, scene: dict, target_dur: float) -> tuple[bool, dict]:
@@ -5772,6 +5841,7 @@ def _try_motion_audio_dub_video(idx: int, scene: dict, motion_prompt: str, aspec
         return False, False
 
     prompt = _motion_audio_dub_prompt(scene, motion_prompt, safe_retry=safe_retry)
+    caption_info = _werydance_caption_request(scene)
     task_id = None
     response = None
     for submit_attempt in range(3):
@@ -5782,6 +5852,7 @@ def _try_motion_audio_dub_video(idx: int, scene: dict, motion_prompt: str, aspec
                 "images": [image_url],
                 "audios": [audio_url],
                 "prompt": prompt,
+                "negative_prompt": _werydance_negative_prompt(scene),
                 "duration": dur,
                 "aspect_ratio": aspect_ratio,
                 "resolution": VOICE_ASSET_AUDIO_DUB_RESOLUTION,
@@ -5826,6 +5897,11 @@ def _try_motion_audio_dub_video(idx: int, scene: dict, motion_prompt: str, aspec
         "fallback_to_reference_motion": not ok and not timed_out_or_reusable,
         "timed_out_or_reusable": timed_out_or_reusable,
         "voice_asset_reference": voice_asset_ref,
+        "werydance_captions_enabled": WERYDANCE_CAPTIONS,
+        "werydance_captions_requested": caption_info.get("requested"),
+        "werydance_caption_text": caption_info.get("text") if caption_info.get("requested") else None,
+        "ass_fallback_required": caption_info.get("ass_fallback_required"),
+        "caption_reason": caption_info.get("reason"),
         "voice_reference_policy": "use owned, licensed, consented, or otherwise lawful voice references; avoid undisclosed real-person impersonation",
     })
     _append_motion_qa(info)
@@ -5864,6 +5940,7 @@ def _try_motion_reference_video(idx: int, scene: dict, motion_prompt: str, aspec
         safe_retry=safe_retry,
         annotated=(reference_mode == "annotated_storyboard"),
     )
+    caption_info = _werydance_caption_request(scene)
     try:
         image_url = _upload_to_weryai(reference_path or img_path)
     except Exception as e:
@@ -5887,7 +5964,7 @@ def _try_motion_reference_video(idx: int, scene: dict, motion_prompt: str, aspec
                 "model": "WERYDANCE_2_0",
                 "image": image_url,
                 "prompt": full_prompt,
-                "negative_prompt": "no subtitles, no text overlay, no watermark, no captions, no burned-in text, no logo",
+                "negative_prompt": _werydance_negative_prompt(scene),
                 "duration": dur,
                 "aspect_ratio": aspect_ratio,
                 "resolution": "1080p",
@@ -5936,6 +6013,11 @@ def _try_motion_reference_video(idx: int, scene: dict, motion_prompt: str, aspec
         "submit_duration": dur,
         "target_duration": round(float(target_dur), 3) if target_dur is not None else None,
         "aspect_ratio": aspect_ratio,
+        "werydance_captions_enabled": WERYDANCE_CAPTIONS,
+        "werydance_captions_requested": caption_info.get("requested"),
+        "werydance_caption_text": caption_info.get("text") if caption_info.get("requested") else None,
+        "ass_fallback_required": caption_info.get("ass_fallback_required"),
+        "caption_reason": caption_info.get("reason"),
         "output_qa": output_qa,
     })
     if not ok and timed_out_or_reusable:
@@ -5996,6 +6078,9 @@ def _motion_one_scene(idx: int, scene: dict, motion_prompt: str, aspect_ratio: s
         # 兜底：直接 text-to-video（Seedance 2.0），绕过"照片晃动"，走真正摄影机运动
         # ADSD 使用降噪 prompt，避免把上游静帧 prompt 的风格词带入 WERYDANCE 触发版权拦截。
         full_prompt = _build_motion_video_prompt(scene, motion_prompt, safe_retry=safe_retry)
+        caption_info = _werydance_caption_request(scene)
+        caption_instruction = _werydance_caption_instruction(scene)
+        full_prompt = (full_prompt[: max(0, 2000 - len(caption_instruction))] + caption_instruction)[:2000]
         if ADS_DIALOGUE_MODE and not ADSD_RICH_MOTION_PROMPT and not safe_retry:
             log(f"[motion {idx}] ADSD 使用默认安全 prompt")
         if safe_retry:
@@ -6010,7 +6095,7 @@ def _motion_one_scene(idx: int, scene: dict, motion_prompt: str, aspect_ratio: s
             r = req_post("/generation/text-to-video", {
                 "model": "WERYDANCE_2_0",
                 "prompt": full_prompt,
-                "negative_prompt": "no subtitles, no text overlay, no watermark, no captions, no burned-in text, no logo",
+                "negative_prompt": _werydance_negative_prompt(scene),
                 "duration": dur,
                 "aspect_ratio": aspect_ratio,
                 "resolution": "1080p",
@@ -6051,6 +6136,11 @@ def _motion_one_scene(idx: int, scene: dict, motion_prompt: str, aspect_ratio: s
             "target_duration": round(target_dur, 3),
             "aspect_ratio": aspect_ratio,
             "fallback_path": True,
+            "werydance_captions_enabled": WERYDANCE_CAPTIONS,
+            "werydance_captions_requested": caption_info.get("requested"),
+            "werydance_caption_text": caption_info.get("text") if caption_info.get("requested") else None,
+            "ass_fallback_required": caption_info.get("ass_fallback_required"),
+            "caption_reason": caption_info.get("reason"),
             "output_qa": output_qa,
         })
         return ok
@@ -7120,8 +7210,8 @@ def _adsd_lip_sync_prompt(scene: dict, safe_retry: bool = False) -> str:
             f"Active speaker is the {role}; any other onsite characters listen silently. "
             "The active speaker follows the provided Chinese audio reference with natural mouth movement. "
             f"Visible mouth, stable face, subtle head motion, realistic lighting.{pov} "
-            "Keep the scene immersive for its topic era. Absolutely no subtitles, no captions, no text overlay, "
-            "no written dialogue, no speaker name labels, no logos, no watermark, no branded style references."
+            f"Keep the scene immersive for its topic era.{_werydance_caption_instruction(scene)} "
+            "No speaker name labels, no logos, no watermark, no branded style references."
         )
     shot = scene.get("shot", "")
     return (
@@ -7130,11 +7220,10 @@ def _adsd_lip_sync_prompt(scene: dict, safe_retry: bool = False) -> str:
         f"{_adsd_gender_lock_phrase(scene.get('voice_gender'))} "
         f"Active speaker is the {role}; any other people only listen or react. Do not display the speaker name. "
         "Use the uploaded Chinese audio reference as the only dialogue source. "
-        "Do not render, write, subtitle, caption, or overlay the spoken words anywhere in the frame. "
         f"Mouth movement must synchronize with the audio reference; keep the mouth visible with natural jaw movement.{pov} "
         f"Scene action: {shot}. "
         "Keep the same face and period clothing, keep framing immersive for its topic era. "
-        "Absolutely no subtitles, no captions, no text overlay, no written dialogue, no logo, no watermark."
+        f"{_werydance_caption_instruction(scene)} No speaker labels, logos, or watermarks."
     )[:2000]
 
 
@@ -7156,7 +7245,7 @@ def _adsd_almighty_audio_dub_prompt(scene: dict, safe_retry: bool = False) -> st
             f"{_adsd_gender_lock_phrase(scene.get('voice_gender'))} "
             f"The {role} speaks exactly this Chinese line: 「{dialogue}」. "
             f"Natural lip sync, stable face, subtle head motion.{pov} "
-            "No subtitles, no captions, no written dialogue, no speaker labels, no logos, no watermark."
+            f"{_werydance_caption_instruction(scene)} No speaker labels, logos, or watermarks."
         )[:1000]
     shot = scene.get("shot", "")
     return (
@@ -7169,7 +7258,7 @@ def _adsd_almighty_audio_dub_prompt(scene: dict, safe_retry: bool = False) -> st
         f"{_adsd_gender_lock_phrase(scene.get('voice_gender'))} "
         f"The {role} speaks exactly this Chinese dialogue and nothing else: 「{dialogue}」. "
         f"Scene action: {shot}. Visible mouth, stable face, natural jaw motion, realistic human timing.{pov} "
-        "Absolutely no subtitles, captions, written dialogue, speaker labels, logos, watermarks, or on-screen text."
+        f"{_werydance_caption_instruction(scene)} No speaker labels, logos, or watermarks."
     )[:1000]
 
 
@@ -7409,6 +7498,7 @@ def _select_voice_asset_reference(scene: dict, *, mode: str = "adsd") -> dict | 
 
 
 def _lip_sync_poll_download_and_process(idx: int, task_id: str, scene: dict, target_dur: float) -> tuple[bool, dict]:
+    caption_info = _werydance_caption_request(scene)
     info = {
         "turn": idx + 1,
         "speaker": scene.get("speaker"),
@@ -7416,6 +7506,11 @@ def _lip_sync_poll_download_and_process(idx: int, task_id: str, scene: dict, tar
         "source_audio": scene.get("_almighty_reference_audio") or scene.get("dialogue_audio_mp3") or scene.get("dialogue_audio"),
         "source_audio_role": scene.get("_almighty_reference_audio_role") or "turn_dialogue_audio",
         "voice_asset_reference": scene.get("_almighty_voice_asset_reference"),
+        "werydance_captions_enabled": WERYDANCE_CAPTIONS,
+        "werydance_captions_requested": caption_info.get("requested"),
+        "werydance_caption_text": caption_info.get("text") if caption_info.get("requested") else None,
+        "ass_fallback_required": caption_info.get("ass_fallback_required"),
+        "caption_reason": caption_info.get("reason"),
         "target_duration": round(target_dur, 3),
     }
     for iteration in range(181):
@@ -7472,6 +7567,7 @@ def _lip_sync_one_scene(idx: int, scene: dict, target_dur: float, aspect_ratio: 
         return idx, False, {"turn": idx + 1, "pass": False, "reason": "missing_turn_audio"}
     voice_asset_ref = _select_voice_asset_reference(scene)
     source_audio = voice_asset_ref["path"] if voice_asset_ref else turn_audio
+    caption_info = _werydance_caption_request(scene)
     scene["_almighty_reference_audio"] = source_audio
     scene["_almighty_reference_audio_role"] = "voice_asset_timbre_reference" if voice_asset_ref else "turn_dialogue_audio"
     scene["_almighty_voice_asset_reference"] = voice_asset_ref
@@ -7521,6 +7617,7 @@ def _lip_sync_one_scene(idx: int, scene: dict, target_dur: float, aspect_ratio: 
                         "images": ref_images,
                         "audios": [audio_url],
                         "prompt": prompt,
+                        "negative_prompt": _werydance_negative_prompt(scene),
                         "duration": api_dur,
                         "aspect_ratio": aspect_ratio,
                         "resolution": "720p",
@@ -7556,6 +7653,11 @@ def _lip_sync_one_scene(idx: int, scene: dict, target_dur: float, aspect_ratio: 
                 "reference_audio_role": scene.get("_almighty_reference_audio_role"),
                 "voice_asset_reference": voice_asset_ref,
                 "turn_dialogue_audio": turn_audio,
+                "werydance_captions_enabled": WERYDANCE_CAPTIONS,
+                "werydance_captions_requested": caption_info.get("requested"),
+                "werydance_caption_text": caption_info.get("text") if caption_info.get("requested") else None,
+                "ass_fallback_required": caption_info.get("ass_fallback_required"),
+                "caption_reason": caption_info.get("reason"),
             })
             if ok and (repair_all or repair_requested):
                 repair_ok, repair_info = _lips_change_repair_segment(idx, scene, target_dur)
@@ -7582,6 +7684,11 @@ def _lip_sync_one_scene(idx: int, scene: dict, target_dur: float, aspect_ratio: 
             "reference_audio_role": scene.get("_almighty_reference_audio_role"),
             "voice_asset_reference": voice_asset_ref,
             "turn_dialogue_audio": turn_audio,
+            "werydance_captions_enabled": WERYDANCE_CAPTIONS,
+            "werydance_captions_requested": caption_info.get("requested"),
+            "werydance_caption_text": caption_info.get("text") if caption_info.get("requested") else None,
+            "ass_fallback_required": caption_info.get("ass_fallback_required"),
+            "caption_reason": caption_info.get("reason"),
         })
         if ADSD_LIPS_CHANGE_REPAIR:
             repair_ok, repair_info = _lips_change_repair_segment(idx, scene, target_dur)
@@ -7630,6 +7737,7 @@ def step66_adsd_lip_sync(script: list[dict]):
     success_cnt = sum(1 for v in results.values() if v)
     generated_audio_cnt = sum(1 for r in records if r.get("pass") and r.get("video_has_audio") and r.get("generated_audio_from_prompt_dialogue"))
     embedded_audio_ready = generated_audio_cnt == n and generated_audio_cnt > 0
+    werydance_caption_cnt = sum(1 for r in records if r.get("pass") and r.get("werydance_captions_requested") and not r.get("ass_fallback_required"))
     sheet_path = OUTPUT_DIR / "character_sheet.png"
     qa = {
         "mode": ADSD_MODE_NAME,
@@ -7646,6 +7754,9 @@ def step66_adsd_lip_sync(script: list[dict]):
         },
         "generated_audio_segment_count": generated_audio_cnt,
         "embedded_dialogue_audio_ready": embedded_audio_ready,
+        "werydance_captions_enabled": WERYDANCE_CAPTIONS,
+        "werydance_caption_segment_count": werydance_caption_cnt,
+        "ass_caption_fallback_count": max(0, n - werydance_caption_cnt) if WERYDANCE_CAPTIONS else n,
         "lips_change_requested_turns": sorted(_load_lips_change_requested_turns()),
         "onsite_pov_mode": ADSD_ONSITE_POV_MODE,
         "total": n,
@@ -7811,7 +7922,37 @@ def step7_concat(script: list[dict]) -> str:
 
 
 # ── 第八步：生成 ASS 字幕 ────────────────────────────────────────────────────
+def _werydance_caption_covered_turns() -> set[int]:
+    covered: set[int] = set()
+    for qa_name in ("motion_qa.json", "lip_sync_qa.json"):
+        p = OUTPUT_DIR / qa_name
+        if not p.exists():
+            continue
+        try:
+            data = json.loads(p.read_text(encoding="utf-8"))
+            records = data.get("records") if isinstance(data, dict) else []
+        except Exception:
+            records = []
+        for record in records or []:
+            try:
+                turn = int(record.get("turn") or 0)
+            except Exception:
+                turn = 0
+            if (
+                turn > 0
+                and record.get("pass")
+                and record.get("werydance_captions_requested")
+                and not record.get("ass_fallback_required")
+            ):
+                covered.add(turn)
+    return covered
+
+
 def step8_subtitles(script: list[dict]) -> str:
+    werydance_caption_turns = _werydance_caption_covered_turns() if WERYDANCE_CAPTIONS else set()
+    ass_fallback_turns: list[int] = []
+    werydance_captioned_turns: list[int] = []
+
     def ass_time(sec: float) -> str:
         h  = int(sec // 3600)
         m  = int((sec % 3600) // 60)
@@ -8062,6 +8203,11 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         FADE_TAG = r"{\fad(150,100)}"
 
         for idx, s in enumerate(script):
+            turn = idx + 1
+            if turn in werydance_caption_turns:
+                werydance_captioned_turns.append(turn)
+                continue
+            ass_fallback_turns.append(turn)
             t_start, t_end = s['sub_start'], s['sub_end']
             if llm_result and idx < len(llm_result):
                 segments = [_clean_display(line) for line in llm_result[idx]]
@@ -8105,6 +8251,32 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
                     )
                 cursor = seg_end + SUB_GAP
 
+    caption_qa = {
+        "enabled": WERYDANCE_CAPTIONS,
+        "policy": "werydance_caption_first_ass_per_turn_fallback",
+        "total": len(script),
+        "werydance_captioned_turns": werydance_captioned_turns,
+        "ass_fallback_turns": ass_fallback_turns,
+        "werydance_caption_count": len(werydance_captioned_turns),
+        "ass_fallback_count": len(ass_fallback_turns),
+        "ass_has_dialogue": len(ass_fallback_turns) > 0,
+        "manual_visual_checks_required": [
+            "werydance_caption_text_exact",
+            "no_garbled_or_extra_text",
+            "caption_not_occluding_subject",
+            "ass_fallback_turns_have_no_duplicate_werydance_caption",
+        ],
+        "pass": True,
+        "created_at": datetime.now().isoformat(timespec="seconds"),
+    }
+    try:
+        (OUTPUT_DIR / "werydance_caption_qa.json").write_text(
+            json.dumps(caption_qa, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+    except Exception as e:
+        log(f"werydance_caption_qa 写入失败: {e}")
+
     if ADS_DIALOGUE_MODE:
         try:
             ass_text = ass_path.read_text(encoding="utf-8", errors="replace")
@@ -8129,7 +8301,13 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         except Exception as e:
             log(f"ADSD subtitle_qa 写入失败: {e}")
 
-    tg(f"✅ ASS 字幕文件已生成，共 {len(script)} 行对白")
+    if WERYDANCE_CAPTIONS:
+        tg(
+            f"✅ 字幕策略完成：WeryDance {len(werydance_captioned_turns)}/{len(script)} 镜，"
+            f"ASS 兜底 {len(ass_fallback_turns)}/{len(script)} 镜"
+        )
+    else:
+        tg(f"✅ ASS 字幕文件已生成，共 {len(script)} 行对白")
     return str(ass_path)
 
 
@@ -8149,6 +8327,16 @@ def _qa_file_pass(name: str) -> bool | None:
     if isinstance(data, dict) and "pass" in data:
         return bool(data.get("pass"))
     return None
+
+
+def _ass_has_dialogue(ass_path: str | None) -> bool:
+    if not ass_path:
+        return False
+    try:
+        text = Path(ass_path).read_text(encoding="utf-8", errors="replace")
+        return any(line.startswith("Dialogue:") for line in text.splitlines())
+    except Exception:
+        return False
 
 
 def _write_adsd_delivery_qa(final_path: str) -> dict | None:
@@ -8433,7 +8621,17 @@ def step9_render(raw_path: str, voice_path: str, bgm_path: str | None, ass_path:
     else:
         sync_note = "口型同步模式：音频不延迟" if render_audio_offset == 0 else "画面 → +{:.1f}s 字幕 → +{:.1f}s 配音".format(SUB_DELAY, render_audio_offset)
         audio_note = "主音轨 ✓" + (" BGM ✓" if bgm_path else "")
-    subtitle_note = "无字幕 ✓" if NO_VOICE else "字幕烧录 ✓"
+    ass_dialogue_ready = _ass_has_dialogue(ass_path)
+    caption_qa = _read_output_json("werydance_caption_qa.json") if WERYDANCE_CAPTIONS else None
+    if NO_VOICE:
+        subtitle_note = "无字幕 ✓"
+    elif isinstance(caption_qa, dict) and caption_qa.get("werydance_caption_count", 0) > 0:
+        subtitle_note = (
+            f"WeryDance 字幕 {caption_qa.get('werydance_caption_count')}/{caption_qa.get('total')} "
+            f"+ ASS兜底 {caption_qa.get('ass_fallback_count')}/{caption_qa.get('total')} ✓"
+        )
+    else:
+        subtitle_note = "字幕烧录 ✓"
     tg(f"🎬 最终合成中... 视频轨 ✓ {audio_note} {subtitle_note}\n{sync_note}")
 
     # ★ 音画同步修正：WERYDANCE 每段固定 5s × N，但配音总时长 ≠ 5N（往往更长）
@@ -8468,7 +8666,7 @@ def step9_render(raw_path: str, voice_path: str, bgm_path: str | None, ass_path:
     final_path = str(OUTPUT_DIR / f"ADR_V8_{fmt_tag}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.mp4")
     ass_escaped = ass_path.replace("\\", "/").replace(":", "\\:") if ass_path else ""
     vf_base = f"scale={VIDEO_W}:{VIDEO_H},setsar=1,setdar={ASPECT_RATIO},tpad=stop_mode=clone:stop_duration=1.5"
-    vf_with_subtitles = f"{vf_base},ass={ass_escaped}" if ass_path else vf_base
+    vf_with_subtitles = f"{vf_base},ass={ass_escaped}" if ass_dialogue_ready else vf_base
 
     # -itsoffset AUDIO_DELAY 延迟音频，画面先出
     # 非 BGM-only 字幕已在 step8 中加了 SUB_DELAY 偏移，在画面和配音之间
