@@ -219,6 +219,8 @@ ADSD_ALMIGHTY_AUDIO_DUB_EXPERIMENT = (
         )
     )
 )
+ADSD_DEFAULT_MALE_VOICE_ASSET = os.environ.get("ADR_ADSD_DEFAULT_MALE_VOICE_ASSET", "external_luo_xiang_xyma_001")
+ADSD_DEFAULT_FEMALE_VOICE_ASSET = os.environ.get("ADR_ADSD_DEFAULT_FEMALE_VOICE_ASSET", "external_by2_e7gn_001")
 ADSD_ONSITE_POV_MODE = (
     "--pov" in sys.argv
     or "--onsite-pov" in sys.argv
@@ -7096,12 +7098,75 @@ def _load_lips_change_requested_turns() -> set[int]:
     return set()
 
 
+def _voice_assets_file() -> Path:
+    return Path(__file__).resolve().parent / "voice_assets" / "voice_assets.json"
+
+
+_VOICE_ASSETS_CACHE: dict | None = None
+
+
+def _load_voice_assets() -> dict:
+    global _VOICE_ASSETS_CACHE
+    if _VOICE_ASSETS_CACHE is not None:
+        return _VOICE_ASSETS_CACHE
+    p = _voice_assets_file()
+    if not p.exists():
+        _VOICE_ASSETS_CACHE = {"assets": []}
+        return _VOICE_ASSETS_CACHE
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            data = {"assets": []}
+    except Exception as e:
+        log(f"voice_assets.json 读取失败: {e}")
+        data = {"assets": []}
+    _VOICE_ASSETS_CACHE = data
+    return data
+
+
+def _select_voice_asset_reference(scene: dict) -> dict | None:
+    if not ADSD_ALMIGHTY_AUDIO_DUB_EXPERIMENT:
+        return None
+    gender = str(scene.get("voice_gender") or "").strip().lower()
+    asset_id = ADSD_DEFAULT_FEMALE_VOICE_ASSET if gender == "female" else ADSD_DEFAULT_MALE_VOICE_ASSET
+    data = _load_voice_assets()
+    asset = next((a for a in data.get("assets", []) if a.get("voice_id") == asset_id), None)
+    if not asset:
+        log(f"[voice-asset] 默认音色 {asset_id} 不存在，回退 turn TTS")
+        return None
+    refs = asset.get("reference_audios") or []
+    if not refs:
+        log(f"[voice-asset] 默认音色 {asset_id} 无 reference audio，回退 turn TTS")
+        return None
+    refs = sorted(refs, key=lambda r: float(r.get("clean_score") or 0), reverse=True)
+    root = Path(__file__).resolve().parent
+    for ref in refs:
+        path = root / str(ref.get("path", ""))
+        if path.exists() and path.stat().st_size > 10000:
+            return {
+                "asset_id": asset_id,
+                "display_name": asset.get("display_name"),
+                "identified_person": asset.get("identified_person"),
+                "license_status": asset.get("license_status"),
+                "allowed_use": asset.get("allowed_use", []),
+                "forbidden_use": asset.get("forbidden_use", []),
+                "quality_flags": asset.get("quality_flags", []),
+                "path": str(path),
+                "sha256": ref.get("sha256"),
+                "duration": ref.get("duration"),
+            }
+    log(f"[voice-asset] 默认音色 {asset_id} reference 文件缺失，回退 turn TTS")
+    return None
+
+
 def _lip_sync_poll_download_and_process(idx: int, task_id: str, scene: dict, target_dur: float) -> tuple[bool, dict]:
     info = {
         "turn": idx + 1,
         "speaker": scene.get("speaker"),
         "task_id": task_id,
-        "source_audio": scene.get("dialogue_audio_mp3") or scene.get("dialogue_audio"),
+        "source_audio": scene.get("_almighty_reference_audio") or scene.get("dialogue_audio_mp3") or scene.get("dialogue_audio"),
+        "source_audio_role": scene.get("_almighty_reference_audio_role") or "turn_dialogue_audio",
+        "voice_asset_reference": scene.get("_almighty_voice_asset_reference"),
         "target_duration": round(target_dur, 3),
     }
     for iteration in range(181):
@@ -7122,7 +7187,7 @@ def _lip_sync_poll_download_and_process(idx: int, task_id: str, scene: dict, tar
                 audio_dub = bool(scene.get("_almighty_audio_dub_attempt"))
                 ok = _postprocess_audio_dub_segment(raw_path, scene, target_dur) if audio_dub else _postprocess_lip_sync_segment(raw_path, scene, target_dur)
                 final_dur = ffprobe_duration(scene["vid_path"]) if ok else None
-                source_audio = scene.get("dialogue_audio_mp3") or scene.get("dialogue_audio")
+                source_audio = scene.get("_almighty_reference_audio") or scene.get("dialogue_audio_mp3") or scene.get("dialogue_audio")
                 audio_dur = ffprobe_duration(source_audio) if source_audio and os.path.exists(source_audio) else None
                 info.update({
                     "pass": ok,
@@ -7153,9 +7218,14 @@ def _lip_sync_poll_download_and_process(idx: int, task_id: str, scene: dict, tar
 
 
 def _lip_sync_one_scene(idx: int, scene: dict, target_dur: float, aspect_ratio: str) -> tuple[int, bool, dict]:
-    source_audio = scene.get("dialogue_audio_mp3") or scene.get("dialogue_audio")
-    if not source_audio or not os.path.exists(source_audio):
+    turn_audio = scene.get("dialogue_audio_mp3") or scene.get("dialogue_audio")
+    if not turn_audio or not os.path.exists(turn_audio):
         return idx, False, {"turn": idx + 1, "pass": False, "reason": "missing_turn_audio"}
+    voice_asset_ref = _select_voice_asset_reference(scene)
+    source_audio = voice_asset_ref["path"] if voice_asset_ref else turn_audio
+    scene["_almighty_reference_audio"] = source_audio
+    scene["_almighty_reference_audio_role"] = "voice_asset_timbre_reference" if voice_asset_ref else "turn_dialogue_audio"
+    scene["_almighty_voice_asset_reference"] = voice_asset_ref
     manual_repair_turns = _load_lips_change_requested_turns()
     repair_requested = ADSD_LIPS_CHANGE_REPAIR and ((idx + 1) in manual_repair_turns)
     repair_all = ADSD_LIPS_CHANGE_REPAIR and ADSD_LIPS_CHANGE_ALL
@@ -7234,6 +7304,9 @@ def _lip_sync_one_scene(idx: int, scene: dict, target_dur: float, aspect_ratio: 
                 "character_sheet_url": sheet_url,
                 "reference_image_count": len(ref_images),
                 "audio_url": audio_url,
+                "reference_audio_role": scene.get("_almighty_reference_audio_role"),
+                "voice_asset_reference": voice_asset_ref,
+                "turn_dialogue_audio": turn_audio,
             })
             if ok and (repair_all or repair_requested):
                 repair_ok, repair_info = _lips_change_repair_segment(idx, scene, target_dur)
@@ -7257,6 +7330,9 @@ def _lip_sync_one_scene(idx: int, scene: dict, target_dur: float, aspect_ratio: 
             "reference_image_count": len(ref_images),
             "audio_url": audio_url,
             "audio_dub_experiment": ADSD_ALMIGHTY_AUDIO_DUB_EXPERIMENT,
+            "reference_audio_role": scene.get("_almighty_reference_audio_role"),
+            "voice_asset_reference": voice_asset_ref,
+            "turn_dialogue_audio": turn_audio,
         })
         if ADSD_LIPS_CHANGE_REPAIR:
             repair_ok, repair_info = _lips_change_repair_segment(idx, scene, target_dur)
@@ -7315,6 +7391,10 @@ def step66_adsd_lip_sync(script: list[dict]):
         "lips_change_repair_enabled": ADSD_LIPS_CHANGE_REPAIR,
         "lips_change_all_enabled": ADSD_LIPS_CHANGE_ALL,
         "almighty_audio_dub_experiment": ADSD_ALMIGHTY_AUDIO_DUB_EXPERIMENT,
+        "default_voice_assets": {
+            "male": ADSD_DEFAULT_MALE_VOICE_ASSET,
+            "female": ADSD_DEFAULT_FEMALE_VOICE_ASSET,
+        },
         "generated_audio_segment_count": generated_audio_cnt,
         "embedded_dialogue_audio_ready": embedded_audio_ready,
         "lips_change_requested_turns": sorted(_load_lips_change_requested_turns()),
