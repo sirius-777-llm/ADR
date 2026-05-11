@@ -159,9 +159,16 @@ GPT_IMAGE2_DIRECT_ANNOTATED_STORYBOARD = (
     or os.environ.get("ADR_GPT_IMAGE2_DIRECT_ANNOTATED_STORYBOARD", "").strip().lower() in ("1", "true", "yes", "on")
 )
 GPT_IMAGE2_STORYBOARD_GRID = (
-    "--with-storyboard-grid" in sys.argv
+    "--no-storyboard" not in sys.argv
+    and "--no-storyboard-grid" not in sys.argv
+    and os.environ.get("ADR_DEFAULT_STORYBOARD_GRID", "1").strip().lower() not in ("0", "false", "no", "off")
+    or "--with-storyboard-grid" in sys.argv
     or "--with-storyboard-grid-4k" in sys.argv
     or os.environ.get("ADR_GPT_IMAGE2_STORYBOARD_GRID", "").strip().lower() in ("1", "true", "yes", "on")
+)
+ADSD_STORYBOARD_GRID = (
+    ADS_DIALOGUE_MODE
+    and os.environ.get("ADR_ADSD_STORYBOARD_GRID", "1").strip().lower() not in ("0", "false", "no", "off")
 )
 STORYBOARD_GRID_MULTIREF_MOTION = (
     "--with-grid-multiref-motion" in sys.argv
@@ -187,7 +194,7 @@ CHARACTER_TRAILER_MODE = (
 )
 if STORYBOARD_GRID_MULTIREF_SEGMENTS:
     STORYBOARD_GRID_MULTIREF_MOTION = True
-if STORYBOARD_GRID_MULTIREF_MOTION or PREVIS_PAGE_MOTION or STORYBOARD_TRAILER_MODE or CHARACTER_TRAILER_MODE:
+if STORYBOARD_GRID_MULTIREF_MOTION or PREVIS_PAGE_MOTION or STORYBOARD_TRAILER_MODE or CHARACTER_TRAILER_MODE or ADSD_STORYBOARD_GRID:
     GPT_IMAGE2_STORYBOARD_GRID = True
 ADSD_LIP_SYNC_EXPERIMENT = (
     "--adsd-lip-sync" in sys.argv
@@ -479,6 +486,47 @@ def _is_rate_limited_error(exc: Exception) -> bool:
     )
 
 
+def _is_rate_limited_response(resp: dict) -> bool:
+    if not isinstance(resp, dict):
+        return False
+    text = json.dumps(resp, ensure_ascii=False).lower()
+    return (
+        resp.get("status") == 1001
+        or "request rate limit exceeded" in text
+        or "rate limit" in text
+        or "请求频率" in text
+    )
+
+
+def submit_text_to_image(payload: dict, label: str, timeout: int = 45, max_attempts: int | None = None) -> dict:
+    attempts = max_attempts or max(1, int(os.environ.get("ADR_IMAGE_SUBMIT_RETRIES", "5")))
+    base_backoff = max(1.0, float(os.environ.get("ADR_IMAGE_RATE_LIMIT_BACKOFF", str(IMAGE_RATE_LIMIT_BACKOFF))))
+    last_resp: dict | None = None
+    last_err: Exception | None = None
+    for attempt in range(attempts):
+        if attempt > 0:
+            wait_s = min(180.0, base_backoff * attempt)
+            log(f"{label} text-to-image submit 重试 {attempt+1}/{attempts}，等待 {wait_s:.1f}s")
+            time.sleep(wait_s)
+        try:
+            _wait_image_submit_slot(f"{label} submit")
+            resp = req_post("/generation/text-to-image", payload, timeout=timeout)
+            last_resp = resp
+            if _is_rate_limited_response(resp):
+                log(f"{label} text-to-image submit 限频: {json.dumps(resp, ensure_ascii=False)[:180]}")
+                continue
+            return resp
+        except Exception as e:
+            last_err = e
+            if _is_rate_limited_error(e):
+                log(f"{label} text-to-image submit 限频异常: {type(e).__name__}: {str(e)[:160]}")
+                continue
+            raise
+    if last_resp is not None:
+        raise RuntimeError(f"{label} text-to-image submit retries exhausted: {json.dumps(last_resp, ensure_ascii=False)[:240]}")
+    raise RuntimeError(f"{label} text-to-image submit retries exhausted: {last_err}")
+
+
 def req_post(path: str, payload: dict, timeout: int = 30) -> dict:
     global _api_last_ts
     with _api_lock:
@@ -674,16 +722,99 @@ def detect_topic_meta(topic: str) -> dict:
         return meta
     except Exception as ex:
         log(f"题材分析失败（fallback 到中国默认）: {ex}")
-        meta = {
-            "culture": "chinese", "region": "中国", "era": "",
-            "director": "Zen contemplative cinematography, deep focus, soft warm tones, horizontal natural composition",
-            "period_visual": "bamboo scroll, red lacquer, traditional Chinese architecture, ink wash",
-            "period_costume": "Han Chinese people in traditional attire",
-            "negative": "no Western figures, no Caucasian faces, no European architecture",
-        }
+        if any(k in topic for k in ("英国", "伦敦", "乔治", "伊丽莎白", "威斯敏斯特", "欧洲", "美国", "法国", "德国", "西班牙")):
+            meta = {
+                "culture": "western", "region": "英国伦敦" if any(k in topic for k in ("英国", "伦敦", "威斯敏斯特", "乔治", "伊丽莎白")) else "西方",
+                "era": "",
+                "director": "historical sepia documentary realism, restrained royal ceremony framing, period-accurate interiors",
+                "period_visual": "stone cathedral, royal regalia, formal uniforms, clergy robes, city crowds",
+                "period_costume": "Caucasian British people in period-accurate Western formal dress, uniforms, coats and hats",
+                "negative": "no East-Asian faces, no Chinese architecture, no hanfu, no qipao, no pagoda, no Chinese palace roof, no red lanterns, no Chinese calligraphy, no ink-wash style",
+            }
+        else:
+            meta = {
+                "culture": "chinese", "region": "中国", "era": "",
+                "director": "Zen contemplative cinematography, deep focus, soft warm tones, horizontal natural composition",
+                "period_visual": "bamboo scroll, red lacquer, traditional Chinese architecture, ink wash",
+                "period_costume": "Han Chinese people in traditional attire",
+                "negative": "no Western figures, no Caucasian faces, no European architecture",
+            }
         if is_1919_global_topic(topic):
             meta = apply_1919_global_guardrails(meta)
         return meta
+
+
+def _topic_culture_guard(meta: dict) -> str:
+    culture = str((meta or {}).get("culture") or "").lower()
+    region = str((meta or {}).get("region") or "")
+    era = str((meta or {}).get("era") or "")
+    if "western" in culture or any(k in region for k in ("英国", "伦敦", "欧洲", "美国", "法国", "德国", "西班牙")):
+        return (
+            f"Western historical accuracy lock: {region}, {era}. "
+            "Use period-accurate Western/Caucasian faces, European architecture, local uniforms, coats, hats, clergy, and civic interiors. "
+            "Absolutely no Chinese architecture, no East-Asian faces, no hanfu, no qipao, no changshan, no Chinese robes, no pagoda, "
+            "no Chinese palace roof, no red lanterns, no Chinese calligraphy, no Chinese seals, no bamboo scrolls, no ink-wash Chinese style."
+        )
+    if "japanese" in culture or "日本" in region:
+        return (
+            f"Japanese historical accuracy lock: {region}, {era}. "
+            "Use period-accurate Japanese people, architecture, clothing, props, and local visual motifs. "
+            "No Chinese palace roofs, no hanfu, no qipao, no European royal court, no Western cathedral unless the topic explicitly requires it."
+        )
+    if "chinese" in culture or "中国" in region:
+        return (
+            f"Chinese historical accuracy lock: {region}, {era}. "
+            "Use period-accurate Chinese faces, clothing, architecture, props, and local visual motifs. "
+            "No Western royal court, no European cathedral, no Caucasian historical figures unless the topic explicitly requires it."
+        )
+    return f"Historical accuracy lock: {region}, {era}. Keep faces, clothing, architecture, props, and written motifs local to the topic."
+
+
+def _write_cultural_visual_qa(script: list[dict], meta: dict) -> None:
+    culture = str((meta or {}).get("culture") or "").lower()
+    region = str((meta or {}).get("region") or "")
+    guard = _topic_culture_guard(meta)
+    expected = "western" if ("western" in culture or any(k in region for k in ("英国", "伦敦", "欧洲", "美国", "法国", "德国", "西班牙"))) else culture or "unknown"
+    if expected == "western":
+        required = ("Western historical accuracy lock", "no Chinese architecture", "no East-Asian faces")
+    elif expected == "chinese":
+        required = ("Chinese historical accuracy lock", "No Western royal court")
+    elif expected == "japanese":
+        required = ("Japanese historical accuracy lock", "No Chinese palace roofs")
+    else:
+        required = ("Historical accuracy lock",)
+
+    missing: list[dict] = []
+    image_missing: list[int] = []
+    for idx, scene in enumerate(script, start=1):
+        prompt = str(scene.get("prompt") or "")
+        absent = [token for token in required if token not in prompt]
+        if absent:
+            missing.append({"scene": idx, "missing_tokens": absent})
+        img_path = Path(str(scene.get("img_path") or ""))
+        if not img_path.exists() or img_path.stat().st_size <= 10000:
+            image_missing.append(idx)
+
+    payload = {
+        "mode": "cultural_visual_prompt_guard",
+        "expected_culture": expected,
+        "region": region,
+        "guard": guard,
+        "total": len(script),
+        "prompt_guard_missing": missing,
+        "image_missing_or_too_small": image_missing,
+        "pass": not missing and not image_missing,
+        "created_at": datetime.now().isoformat(timespec="seconds"),
+    }
+    qa_path = OUTPUT_DIR / "cultural_visual_qa.json"
+    try:
+        qa_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception as e:
+        log(f"cultural_visual_qa.json 写入失败: {e}")
+    if payload["pass"]:
+        tg(f"✅ 文化一致性 QA：{expected} / {region} 提示词闸门已覆盖 {len(script)} 张图")
+    else:
+        tg(f"⚠️ 文化一致性 QA：发现 {len(missing)} 条提示词缺口、{len(image_missing)} 张图片缺失，已记录 {qa_path.name}")
 
 
 def is_1919_global_topic(topic: str) -> bool:
@@ -1816,6 +1947,7 @@ THUMBNAIL_ANCHOR: 封面视觉锚，用 4~6 个短语描述：主体、主色（
     )
     director_tag = style_key
     neg_tag = topic_meta.get("negative", "")
+    culture_guard = _topic_culture_guard(topic_meta)
 
     script = []
     emotion_count: dict[str, int] = {}
@@ -1848,7 +1980,7 @@ THUMBNAIL_ANCHOR: 封面视觉锚，用 4~6 个短语描述：主体、主色（
                 f"{subject}"
             )
         # 硬拼接：导演 + 镜头模板 + 主体 + 情绪风格 + negative
-        parts = [director_tag, shot_tmpl, subject]
+        parts = [director_tag, culture_guard, shot_tmpl, subject]
         if style:
             parts.append(style)
         prompt = ", ".join(p for p in parts if p)
@@ -1860,7 +1992,15 @@ THUMBNAIL_ANCHOR: 封面视觉锚，用 4~6 个短语描述：主体、主色（
             )
         if neg_tag:
             prompt += f". Negative: {neg_tag}"
-        item = {"text": line, "emotion": emotion, "prompt": prompt, "historical_context": historical_context, "tone": tone}
+        item = {
+            "text": line,
+            "emotion": emotion,
+            "prompt": prompt,
+            "historical_context": historical_context,
+            "tone": tone,
+            "topic_meta": topic_meta,
+            "culture_guard": culture_guard,
+        }
         if ADS_RETENTION_MODE and not ADS_DIALOGUE_MODE:
             if i == 0:
                 retention_role = "hook"
@@ -3433,14 +3573,13 @@ def generate_image(scene: dict, idx: int, _max_retries: int = 3) -> int:
     for attempt in range(_max_retries):
         try:
             _m, _ar, _extra = pick_image_model(ASPECT_RATIO)
-            _wait_image_submit_slot(f"图片 {idx+1}")
-            r = req_post("/generation/text-to-image", {
+            r = submit_text_to_image({
                 "model":        _m,
                 "prompt":       scene["prompt"],
                 "aspect_ratio": _ar,
                 "image_number": 1,
                 **_extra,
-            }, timeout=30)
+            }, f"图片 {idx+1}", timeout=30)
 
             data_part = r.get("data", {})
             task_ids = data_part.get("task_ids") or (
@@ -3481,7 +3620,7 @@ def generate_storyboard_images_gpt_image2(script: list[dict], topic: str) -> boo
 
     If anything is incomplete, return False so step6 can fall back to per-scene generation.
     """
-    if ADS_DIALOGUE_MODE or not GPT_IMAGE2_STORYBOARD:
+    if not GPT_IMAGE2_STORYBOARD:
         return False
     n = len(script)
     if n <= 0:
@@ -3521,6 +3660,7 @@ def generate_storyboard_images_gpt_image2(script: list[dict], topic: str) -> boo
         for batch_idx, start in enumerate(range(0, n, batch_size), start=1):
             end = min(n, start + batch_size)
             batch_script = script[start:end]
+            culture_guard = _topic_culture_guard(batch_script[0].get("topic_meta", {}) if batch_script else {})
             scene_lines = []
             for local_i, scene in enumerate(batch_script, start=start + 1):
                 prompt = re.sub(r"\s+", " ", str(scene.get("prompt") or "")).strip()
@@ -3533,6 +3673,7 @@ def generate_storyboard_images_gpt_image2(script: list[dict], topic: str) -> boo
                 storyboard_prompt = (
                     f"Create one single full-frame cinematic storyboard image for scene {start+1} "
                     f"of one short video about: {topic}.\n"
+                    f"{culture_guard}\n"
                     f"Aspect ratio: {ASPECT_RATIO}. This is scene {start+1}/{n}; keep the same visual identity as a continuous series. "
                     "The entire output must be one uninterrupted shot, not a layout. "
                     "Strictly forbidden: collage, contact sheet, grid, comic page, split screen, panels, frames, borders, white divider lines, captions, subtitles, watermarks, random text. "
@@ -3543,6 +3684,7 @@ def generate_storyboard_images_gpt_image2(script: list[dict], topic: str) -> boo
                 storyboard_prompt = (
                     f"Create exactly {batch_count} separate storyboard images for scenes {start+1}-{end} "
                     f"of one short video about: {topic}.\n"
+                    f"{culture_guard}\n"
                     f"Aspect ratio: {ASPECT_RATIO}. This is batch {batch_idx}/{total_batches}; keep the same visual identity as a continuous series. "
                     "Do NOT create a collage, contact sheet, grid, comic page, split screen, panels, frames, borders, or multi-panel image. Return separate standalone full-frame images, "
                     "one image per numbered scene. Keep consistent palette, lighting, era, costumes, and subject continuity. "
@@ -3553,14 +3695,13 @@ def generate_storyboard_images_gpt_image2(script: list[dict], topic: str) -> boo
                 storyboard_prompt = storyboard_prompt[:18000]
                 qa.setdefault("warnings", []).append(f"batch_{batch_idx}_prompt_truncated")
 
-            _wait_image_submit_slot(f"GPT Image 2 storyboard batch {batch_idx}/{total_batches}")
-            r = req_post("/generation/text-to-image", {
+            r = submit_text_to_image({
                 "model": "GPT_IMAGE_2",
                 "prompt": storyboard_prompt,
                 "aspect_ratio": _aspect,
                 "image_number": batch_count,
                 **_extra,
-            }, timeout=45)
+            }, f"GPT Image 2 storyboard batch {batch_idx}/{total_batches}", timeout=45)
             data_part = r.get("data", {})
             task_ids = data_part.get("task_ids") or ([data_part["task_id"]] if data_part.get("task_id") else [])
             batch_qa = {
@@ -3662,8 +3803,10 @@ def _storyboard_grid_prompt(batch_script: list[dict], start: int, total: int, to
         text = re.sub(r"\s+", " ", str(scene.get("text") or "")).strip()
         lines.append(f"{local_i:02d}. Visual: {prompt[:520]}\n    Beat: {text[:120]}")
     count = len(batch_script)
+    culture_guard = _topic_culture_guard(batch_script[0].get("topic_meta", {}) if batch_script else {})
     return f"""Create one single {aspect} cinematic storyboard grid for a documentary sequence.
 Topic: {topic}
+{culture_guard}
 Grid: exact {cols} columns x {rows} rows, {count} panels filled in reading order left-to-right then top-to-bottom. Leave unused panels empty only if the grid has more cells than requested.
 
 Panel rules:
@@ -3672,6 +3815,7 @@ Panel rules:
 - No arrows or motion graphics; motion will be handled separately.
 - Thin panel separators are acceptable, but keep every panel visually clean so it can be cropped into a standalone reference image.
 - Keep one consistent era, palette, lighting, location logic, costume design, and subject identity across all panels.
+- Cultural accuracy is mandatory; if the topic is Western/British/European, never use Chinese/East-Asian visual language.
 - Each panel must be distinct and readable at 4K.
 
 Shot beats:
@@ -3798,14 +3942,13 @@ def generate_character_sheet_gpt_image2(script: list[dict], topic: str) -> dict 
         if len(prompt) > 18000:
             prompt = prompt[:18000]
             qa.setdefault("warnings", []).append("prompt_truncated")
-        _wait_image_submit_slot("GPT Image 2 character sheet")
-        r = req_post("/generation/text-to-image", {
+        r = submit_text_to_image({
             "model": "GPT_IMAGE_2",
             "prompt": prompt,
             "aspect_ratio": aspect,
             "image_number": 1,
             "quality": "high",
-        }, timeout=45)
+        }, "GPT Image 2 character sheet", timeout=45)
         task_id = (r.get("data", {}).get("task_ids") or [r.get("data", {}).get("task_id") or None])[0]
         qa["task_id"] = task_id
         if not task_id:
@@ -3862,14 +4005,13 @@ def generate_production_storyboard_page_gpt_image2(script: list[dict], topic: st
         if len(prompt) > 18000:
             prompt = prompt[:18000]
             qa.setdefault("warnings", []).append("prompt_truncated")
-        _wait_image_submit_slot("GPT Image 2 production storyboard page")
-        r = req_post("/generation/text-to-image", {
+        r = submit_text_to_image({
             "model": "GPT_IMAGE_2",
             "prompt": prompt,
             "aspect_ratio": aspect,
             "image_number": 1,
             "quality": "high",
-        }, timeout=45)
+        }, "GPT Image 2 production storyboard page", timeout=45)
         task_id = (r.get("data", {}).get("task_ids") or [r.get("data", {}).get("task_id") or None])[0]
         qa["task_id"] = task_id
         if not task_id:
@@ -4080,7 +4222,7 @@ def generate_storyboard_grid_gpt_image2(script: list[dict], topic: str) -> bool:
     It uses GPT_IMAGE_2 to make 4K grids, then crops clean panels into normal img_N references.
     This is a safer production primitive than feeding a whole grid directly into WERYDANCE.
     """
-    if ADS_DIALOGUE_MODE or not GPT_IMAGE2_STORYBOARD_GRID:
+    if not GPT_IMAGE2_STORYBOARD_GRID:
         return False
     n = len(script)
     if n <= 0:
@@ -4115,14 +4257,13 @@ def generate_storyboard_grid_gpt_image2(script: list[dict], topic: str) -> bool:
             if len(prompt) > 18000:
                 prompt = prompt[:18000]
                 qa.setdefault("warnings", []).append(f"batch_{batch_idx}_prompt_truncated")
-            _wait_image_submit_slot(f"GPT Image 2 storyboard grid {batch_idx}")
-            r = req_post("/generation/text-to-image", {
+            r = submit_text_to_image({
                 "model": "GPT_IMAGE_2",
                 "prompt": prompt,
                 "aspect_ratio": aspect,
                 "image_number": 1,
                 "quality": "high",
-            }, timeout=45)
+            }, f"GPT Image 2 storyboard grid {batch_idx}", timeout=45)
             task_id = (r.get("data", {}).get("task_ids") or [r.get("data", {}).get("task_id") or None])[0]
             batch_qa = {
                 "batch": batch_idx,
@@ -4161,8 +4302,8 @@ def generate_storyboard_grid_gpt_image2(script: list[dict], topic: str) -> bool:
     except Exception as e:
         qa["pass"] = False
         qa["issues"].append(str(e))
-        log(f"GPT Image 2 storyboard grid 失败，回退普通图片路径：{e}")
-        tg(f"⚠️ GPT Image 2 4K storyboard grid 失败，自动回退普通图片路径：{str(e)[:160]}")
+        log(f"GPT Image 2 storyboard grid 失败，回退单图 storyboard/逐张兜底：{e}")
+        tg(f"⚠️ GPT Image 2 4K storyboard grid 重试后失败，自动回退单图 storyboard/逐张兜底：{str(e)[:160]}")
         return False
     finally:
         try:
@@ -4243,14 +4384,13 @@ def generate_gpt_image2_direct_annotated_storyboards(script: list[dict], topic: 
             if len(prompt) > 18000:
                 prompt = prompt[:18000]
                 qa.setdefault("warnings", []).append(f"scene_{i+1}_prompt_truncated")
-            _wait_image_submit_slot(f"GPT Image 2 direct annotated storyboard {i+1}/{take_n}")
-            r = req_post("/generation/text-to-image", {
+            r = submit_text_to_image({
                 "model": "GPT_IMAGE_2",
                 "prompt": prompt,
                 "aspect_ratio": aspect,
                 "image_number": 1,
                 "quality": "high",
-            }, timeout=45)
+            }, f"GPT Image 2 direct annotated storyboard {i+1}/{take_n}", timeout=45)
             task_id = (r.get("data", {}).get("task_ids") or [r.get("data", {}).get("task_id") or None])[0]
             rec = {
                 "scene": i + 1,
@@ -4515,6 +4655,8 @@ def step6_parallel(script: list[dict], topic: str, pregenerated_bgm_path: str | 
                     raise RuntimeError(f"图 {idx+1} 兜底失败: {e}")
 
         generate_gpt_image2_direct_annotated_storyboards(script, topic)
+        if script:
+            _write_cultural_visual_qa(script, script[0].get("topic_meta", {}))
 
         # ── 审批流程 ────────────────────────────────────────────────────
         if SKIP_APPROVAL:
@@ -8446,14 +8588,13 @@ def _try_almanac_cover(topic: str, script: list | None = None) -> str | None:
         time.sleep(idx * 1.5)  # 错峰 0/1.5/3/4.5s 避免并发 burst 撞 SSL
         for attempt in range(3):
             try:
-                _wait_image_submit_slot(f"黄历封面候选 {idx+1}")
-                r = req_post("/generation/text-to-image", {
+                r = submit_text_to_image({
                     "model": _m,
                     "prompt": prompt,
                     "aspect_ratio": _ar,
                     "image_number": 1,
                     **_extra,
-                }, timeout=30)
+                }, f"黄历封面候选 {idx+1}", timeout=30, max_attempts=3)
                 d = r.get("data", {})
                 tid = d.get("task_id") or (d.get("task_ids") or [None])[0]
                 if tid:
