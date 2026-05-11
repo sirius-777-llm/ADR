@@ -212,7 +212,11 @@ ADSD_ALMIGHTY_AUDIO_DUB_EXPERIMENT = (
     and (
         "--adsd-almighty-audio-dub" in sys.argv
         or "--almighty-audio-dub" in sys.argv
-        or os.environ.get("ADR_ADSD_ALMIGHTY_AUDIO_DUB", "").strip().lower() in ("1", "true", "yes", "on")
+        or (
+            "--no-adsd-almighty-audio-dub" not in sys.argv
+            and "--no-almighty-audio-dub" not in sys.argv
+            and os.environ.get("ADR_ADSD_ALMIGHTY_AUDIO_DUB", "1").strip().lower() not in ("0", "false", "no", "off")
+        )
     )
 )
 ADSD_ONSITE_POV_MODE = (
@@ -7277,7 +7281,8 @@ def step66_adsd_lip_sync(script: list[dict]):
         return
     n = len(script)
     aspect = "9:16" if IS_VERTICAL else "16:9"
-    tg(f"👄 {ADSD_MODE_NAME} 口型同步启动：WERYDANCE_2_0 Almighty Reference × {n} turn")
+    mode_note = "audio-dub 音色直配" if ADSD_ALMIGHTY_AUDIO_DUB_EXPERIMENT else "静音口型同步"
+    tg(f"👄 {ADSD_MODE_NAME} 口型同步启动：WERYDANCE_2_0 Almighty Reference × {n} turn（{mode_note}）")
     target_durs = [_lip_sync_slot_duration(script, i) for i in range(n)]
     results: dict[int, bool] = {}
     records: list[dict] = []
@@ -7321,7 +7326,16 @@ def step66_adsd_lip_sync(script: list[dict]):
         "policy": "failed_turns_keep_existing_segments",
         "master_audio_mux_required": not embedded_audio_ready,
         "final_audio_offset_required": 0.0,
-        "manual_visual_checks_required": ["mouth_visible", "active_speaker_correct", "no_face_drift", "mouth_motion_matches_syllable_timing"],
+        "voice_reference_policy": "use owned, licensed, consented, or otherwise lawful voice references; avoid undisclosed real-person impersonation",
+        "manual_visual_checks_required": [
+            "mouth_visible",
+            "active_speaker_correct",
+            "no_face_drift",
+            "mouth_motion_matches_syllable_timing",
+            "generated_dialogue_matches_script",
+            "voice_timbre_matches_authorized_reference",
+            "no_undisclosed_real_person_impersonation",
+        ],
         "records": records,
         "created_at": datetime.now().isoformat(timespec="seconds"),
     }
