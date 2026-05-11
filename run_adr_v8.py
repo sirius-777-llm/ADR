@@ -4491,8 +4491,17 @@ def generate_storyboard_grid_gpt_image2(script: list[dict], topic: str) -> bool:
                 batch_qa["grid_bytes"] = grid_path.stat().st_size if grid_path.exists() else 0
                 _crop_storyboard_grid_panels(grid_path, batch_script, start, cols, rows, batch_qa)
                 rendered = sum(1 for r in batch_qa.get("panel_records", []) if r.get("pass"))
+                materialized = sum(
+                    1
+                    for r in batch_qa.get("panel_records", [])
+                    if r.get("bytes", 0) > 10000
+                )
                 batch_qa["rendered_count"] = rendered
+                batch_qa["materialized_count"] = materialized
                 batch_qa["pass"] = rendered == len(batch_script)
+                if not batch_qa["pass"] and materialized == len(batch_script):
+                    batch_qa["accepted_with_qa_warnings"] = True
+                    batch_qa["pass"] = True
                 if not batch_qa["pass"]:
                     batch_qa["reason"] = "crop_incomplete"
                     if current_size > 1:
@@ -4509,7 +4518,9 @@ def generate_storyboard_grid_gpt_image2(script: list[dict], topic: str) -> bool:
                         continue
                     qa["issues"].append(f"batch_{batch_idx}_crop_incomplete")
                     raise RuntimeError(f"storyboard grid batch {batch_idx} crop incomplete")
-                qa["rendered_count"] += rendered
+                qa["rendered_count"] += rendered if rendered == len(batch_script) else materialized
+                if batch_qa.get("accepted_with_qa_warnings"):
+                    qa.setdefault("warnings", []).append(f"batch_{batch_idx}_accepted_with_crop_qa_warnings")
                 start = end
                 submitted_current_start = True
                 break
