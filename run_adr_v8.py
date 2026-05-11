@@ -802,6 +802,24 @@ def ffprobe_video_size(path: str) -> tuple[int | None, int | None]:
         return None, None
 
 
+def _video_decode_probe(path: str, frames: int = 3) -> bool:
+    try:
+        result = subprocess.run(
+            [
+                "ffmpeg", "-v", "error",
+                "-i", path,
+                "-map", "0:v:0",
+                "-frames:v", str(frames),
+                "-f", "null", "-",
+            ],
+            capture_output=True,
+            timeout=30,
+        )
+        return result.returncode == 0
+    except Exception:
+        return False
+
+
 def ffmpeg(*args, timeout: int = 120):
     """ffmpeg 包装：默认 120s timeout 防止损坏图/坏文件让进程无限挂起。
     单图转视频段调用方应传 timeout=30；长视频合成传 timeout=600。"""
@@ -4746,7 +4764,97 @@ def _remove_lip_sync_task(idx: int):
         _lip_sync_tasks_file().write_text(json.dumps(tasks, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
-def _motion_poll_and_download(idx: int, task_id: str, vid_path: str) -> bool:
+def _motion_output_qa(path: str, target_dur: float | None = None) -> dict:
+    qa = {
+        "path": path,
+        "exists": os.path.exists(path),
+        "bytes": os.path.getsize(path) if os.path.exists(path) else 0,
+        "width": None,
+        "height": None,
+        "duration": None,
+        "duration_delta": None,
+        "decode_pass": False,
+        "pass": False,
+        "issues": [],
+    }
+    if not qa["exists"]:
+        qa["issues"].append("missing_file")
+        return qa
+    if qa["bytes"] < 10000:
+        qa["issues"].append("file_too_small")
+    w, h = ffprobe_video_size(path)
+    qa["width"], qa["height"] = w, h
+    if not w or not h:
+        qa["issues"].append("missing_video_dimensions")
+    elif w != VIDEO_W or h != VIDEO_H:
+        qa["issues"].append(f"unexpected_dimensions:{w}x{h}_target:{VIDEO_W}x{VIDEO_H}")
+    try:
+        dur = ffprobe_duration(path)
+        qa["duration"] = round(dur, 3)
+        if target_dur is not None:
+            qa["duration_delta"] = round(abs(dur - target_dur), 3)
+            if abs(dur - target_dur) > 0.35:
+                qa["issues"].append(f"duration_mismatch:{dur:.3f}_target:{target_dur:.3f}")
+    except Exception as e:
+        qa["issues"].append(f"duration_probe_failed:{e}")
+    qa["decode_pass"] = _video_decode_probe(path)
+    if not qa["decode_pass"]:
+        qa["issues"].append("decode_probe_failed")
+    qa["pass"] = not qa["issues"]
+    return qa
+
+
+def _normalize_motion_video(src_path: str, dst_path: str, target_dur: float) -> dict:
+    qa = {
+        "source": src_path,
+        "target": dst_path,
+        "target_duration": round(float(target_dur), 3),
+        "source_duration": None,
+        "postprocess_pass": False,
+        "issues": [],
+    }
+    if not os.path.exists(src_path) or os.path.getsize(src_path) < 10000:
+        qa["issues"].append("source_missing_or_too_small")
+        return qa
+    try:
+        src_dur = ffprobe_duration(src_path)
+        qa["source_duration"] = round(src_dur, 3)
+    except Exception as e:
+        qa["issues"].append(f"source_duration_probe_failed:{e}")
+        return qa
+    tmp_out = dst_path + ".normalized.mp4"
+    pad = max(0.0, float(target_dur) - src_dur)
+    vf = (
+        f"scale={VIDEO_W}:{VIDEO_H}:force_original_aspect_ratio=increase,"
+        f"crop={VIDEO_W}:{VIDEO_H},setsar=1"
+    )
+    if pad > 0.04:
+        vf += f",tpad=stop_mode=clone:stop_duration={pad:.3f}"
+    vf += f",trim=duration={float(target_dur):.3f},setpts=PTS-STARTPTS"
+    try:
+        ffmpeg(
+            "-i", src_path,
+            "-vf", vf,
+            "-an",
+            "-c:v", "libx264", "-crf", "20", "-preset", "medium",
+            "-pix_fmt", "yuv420p",
+            tmp_out,
+            timeout=180,
+        )
+    except Exception as e:
+        qa["issues"].append(f"ffmpeg_normalize_failed:{e}")
+        return qa
+    out_qa = _motion_output_qa(tmp_out, target_dur)
+    qa["output_qa"] = out_qa
+    if not out_qa.get("pass"):
+        qa["issues"].extend(f"output_{x}" for x in out_qa.get("issues", []))
+        return qa
+    os.replace(tmp_out, dst_path)
+    qa["postprocess_pass"] = True
+    return qa
+
+
+def _motion_poll_and_download(idx: int, task_id: str, vid_path: str, target_dur: float | None = None) -> bool:
     """对已有 task_id 轮询 → 下载 → 替换。超时不删持久化记录（下次重跑可复用）"""
     # 先看任务当前状态（不必等 5s）
     err_counts = {}  # {错误类型: 次数}
@@ -4774,9 +4882,16 @@ def _motion_poll_and_download(idx: int, task_id: str, vid_path: str) -> bool:
                 log(f"[motion {idx}] 下载异常: {e}")
                 return False
             if os.path.exists(tmp_path) and os.path.getsize(tmp_path) > 10000:
-                os.replace(tmp_path, vid_path)
-                _remove_motion_task(idx)  # 成功后清记录
-                return True
+                if target_dur is None:
+                    os.replace(tmp_path, vid_path)
+                    _remove_motion_task(idx)  # 成功后清记录
+                    return True
+                normalize_qa = _normalize_motion_video(tmp_path, vid_path, target_dur)
+                if normalize_qa.get("postprocess_pass"):
+                    _remove_motion_task(idx)  # 成功后清记录
+                    return True
+                log(f"[motion {idx}] 输出 QA/归一化失败: {json.dumps(normalize_qa, ensure_ascii=False)[:500]}")
+                return False
             log(f"[motion {idx}] 下载文件异常（<10KB）")
             return False
         if st == "failed":
@@ -5007,7 +5122,7 @@ def _motion_reference_prompt(scene: dict, motion_prompt: str, safe_retry: bool =
     return (prefix + base + suffix)[:2000]
 
 
-def _try_motion_reference_video(idx: int, scene: dict, motion_prompt: str, aspect_ratio: str, dur: int, safe_retry: bool = False) -> tuple[bool, bool]:
+def _try_motion_reference_video(idx: int, scene: dict, motion_prompt: str, aspect_ratio: str, dur: int, target_dur: float | None = None, safe_retry: bool = False) -> tuple[bool, bool]:
     """Try storyboard image-to-video first.
 
     Returns (handled, ok). handled=True means a reference-video task was submitted or conclusively attempted;
@@ -5088,8 +5203,9 @@ def _try_motion_reference_video(idx: int, scene: dict, motion_prompt: str, aspec
         return False, False
 
     _save_motion_task(idx, task_id)
-    ok = _motion_poll_and_download(idx, task_id, scene["vid_path"])
+    ok = _motion_poll_and_download(idx, task_id, scene["vid_path"], target_dur=target_dur)
     timed_out_or_reusable = str(idx) in _load_motion_tasks()
+    output_qa = _motion_output_qa(scene["vid_path"], target_dur) if ok else None
     _append_motion_qa({
         "turn": idx + 1,
         "path": "image-to-video",
@@ -5102,8 +5218,10 @@ def _try_motion_reference_video(idx: int, scene: dict, motion_prompt: str, aspec
         "storyboard_mode": bool(scene.get("storyboard_mode")),
         "image_path": reference_path or img_path,
         "clean_image_path": img_path,
-        "duration": dur,
+        "submit_duration": dur,
+        "target_duration": round(float(target_dur), 3) if target_dur is not None else None,
         "aspect_ratio": aspect_ratio,
+        "output_qa": output_qa,
     })
     if not ok and timed_out_or_reusable:
         return True, False
@@ -5116,6 +5234,7 @@ def _motion_one_scene(idx: int, scene: dict, motion_prompt: str, aspect_ratio: s
     vid_path = scene["vid_path"]  # 静态 seg_N.mp4 的路径，成功就覆盖它
     # WERYDANCE 支持 5-10s；字段名统一用 vid_duration（step345_timeline 里的 key）
     _raw_dur = scene.get("vid_duration") or scene.get("dur") or 5
+    target_dur = float(_raw_dur)
     dur = int(round(max(5, min(10, _raw_dur))))
 
     # ★ 持久化：检查这个 scene 是否有未完成的历史 task_id，有则先查状态，避免重复提交烧钱
@@ -5129,20 +5248,20 @@ def _motion_one_scene(idx: int, scene: dict, motion_prompt: str, aspect_ratio: s
             if st == "succeed":
                 # 后台已完成，直接下载复用
                 log(f"[motion {idx}] 历史任务 {existing_tid} 已完成，直接下载复用")
-                return _motion_poll_and_download(idx, existing_tid, vid_path)
+                return _motion_poll_and_download(idx, existing_tid, vid_path, target_dur=target_dur)
             if st == "failed":
                 log(f"[motion {idx}] 历史任务 {existing_tid} 已 failed，移除记录，重新提交")
                 _remove_motion_task(idx)
             elif st in ("waiting", "processing"):
                 log(f"[motion {idx}] 历史任务 {existing_tid} 仍 {st}，继续轮询")
-                return _motion_poll_and_download(idx, existing_tid, vid_path)
+                return _motion_poll_and_download(idx, existing_tid, vid_path, target_dur=target_dur)
             # 其他状态：走新提交流程
         except Exception as e:
             log(f"[motion {idx}] 查历史任务失败: {e}，走新提交")
 
     try:
         handled_reference, reference_ok = _try_motion_reference_video(
-            idx, scene, motion_prompt, aspect_ratio, dur, safe_retry=safe_retry
+            idx, scene, motion_prompt, aspect_ratio, dur, target_dur=target_dur, safe_retry=safe_retry
         )
         if reference_ok:
             return True
@@ -5196,16 +5315,19 @@ def _motion_one_scene(idx: int, scene: dict, motion_prompt: str, aspect_ratio: s
         _save_motion_task(idx, task_id)
 
         # 轮询 + 下载
-        ok = _motion_poll_and_download(idx, task_id, vid_path)
+        ok = _motion_poll_and_download(idx, task_id, vid_path, target_dur=target_dur)
+        output_qa = _motion_output_qa(vid_path, target_dur) if ok else None
         _append_motion_qa({
             "turn": idx + 1,
             "path": "text-to-video",
             "model": "WERYDANCE_2_0",
             "task_id": task_id,
             "pass": ok,
-            "duration": dur,
+            "submit_duration": dur,
+            "target_duration": round(target_dur, 3),
             "aspect_ratio": aspect_ratio,
             "fallback_path": True,
+            "output_qa": output_qa,
         })
         return ok
     except Exception as e:
