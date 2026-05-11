@@ -227,6 +227,12 @@ ADS_REPORTER_MODE = (
 if ADS_REPORTER_MODE:
     WITH_MOTION = True
 
+ADS_RETENTION_MODE = (
+    "--no-ads-retention" not in sys.argv
+    and "--no-retention" not in sys.argv
+    and os.environ.get("ADR_ADS_RETENTION_MODE", "1").strip().lower() not in ("0", "false", "no", "off")
+)
+
 ADSD_MODE_NAME = ("VADSD" if IS_VERTICAL else "HADSD") if ADS_DIALOGUE_MODE else ""
 
 ADSD_VOICES = {
@@ -306,6 +312,29 @@ ADS_REPORTER_VISUAL_GUIDE = """
 【跨地域/跨场景切换】
 通过 POV 道具串联：地图上的手指、票根、电报、信件、白板更新、屏幕滚动、笔记本翻页。
 让观众感觉是同一双眼睛在不同地方目击，而不是镜头在切。"""
+
+ADS_RETENTION_SCRIPT_GUIDE = """
+
+【ADS 播放量优先模式 · 非记者版 · 默认开启】
+• 目标不是"现场记者感"，而是提高停留、完播、转发：第一句抓住人，中段不断续命，结尾能截图传播。
+• 第 1 句必须 ≤ 24 个汉字，直接给出反常识 / 损失 / 危险 / 身份冲突 / 结果悬念；不要先交代年份地点。
+• 第 2 句立刻落到具体人、物、决定或代价，不能继续卖关子。
+• 每 3~4 句必须刷新一次注意力：新冲突、新后果、新证据、新选择、新反转，严禁连续铺背景。
+• 中段必须安排一次"重新上钩"：用"真正的问题是..."、"但代价马上来了"、"谁也没想到..."这类句式把观众拉回来。
+• 结尾必须留下可评论的问题或可转发判断，但不能编造事实、不能标题党造谣。
+• 禁止低质流量词："震惊、全网、内幕、炸裂、家人们、速看、离谱到家"。
+• 禁止记者口吻、直播口吻、电视台口吻；保留电影旁白和短视频叙事效率。
+"""
+
+ADS_RETENTION_VISUAL_GUIDE = """
+
+★★★ ADS 播放量优先视觉模式（非记者版，默认开启）★★★
+• 第 1 张图必须是 thumb-stopping frame：特写/极特写 + 强物件 + 人脸或手部动作 + 明确危险/欲望/损失，禁止慢悠悠远景开场。
+• 前 3 张图必须形成"钩子三连"：冲突物件、关键人物、代价后果；让观众不用读字幕也知道有事发生。
+• 每 3~4 张图必须换一次视觉能量：景别、角度、光影或动作状态至少变一个，避免连续静态人物半身像。
+• 画面优先服务点击和完播：可截图、可做封面、可在小屏上看懂主体；不要堆复杂背景。
+• 仍然遵守事实、年代、服饰、器物一致性；吸引播放量不等于制造穿帮或低质标题党。
+"""
 
 # --speaker <id[:name]> 指定 Podcast 音色（覆盖 VDAR 默认晓曼 / LLM 自选）
 # 常用：gushijingling-720c0ae5:故事精灵（少儿）、chat-girl-105-cn:晓曼（温柔女声）、
@@ -1364,6 +1393,7 @@ def step1_script(topic: str) -> list[dict]:
 • 严禁"让我们"、"众所周知"、"话说"这类纪录片套话
 {style_guide}
 • 如果涉及老黄历、彭祖百忌、宜忌等传统禁忌内容，必须用现代白话做安全化解读，不能照搬古文原句
+{ADS_RETENTION_SCRIPT_GUIDE if ADS_RETENTION_MODE and not ADS_DIALOGUE_MODE else ""}
 {ADS_REPORTER_SCRIPT_GUIDE if ADS_REPORTER_MODE else ""}
 • 只输出 {num_lines} 行纯台词，每行一句，不加编号不加标点以外的任何内容"""
 
@@ -1685,6 +1715,7 @@ THUMBNAIL_ANCHOR: 封面视觉锚，用 4~6 个短语描述：主体、主色（
 
 ★ 严禁词汇（任何一条 prompt 里出现以下词就是失败）：
 ❌ `centered composition` / `well-lit` / `clear visibility` / `standard shot` / `documentary style` / `normal angle` / `straightforward composition`
+{ADS_RETENTION_VISUAL_GUIDE if ADS_RETENTION_MODE and not ADS_DIALOGUE_MODE else ""}
 {ADS_REPORTER_VISUAL_GUIDE if ADS_REPORTER_MODE else ""}
 
 为每句台词输出：
@@ -1830,6 +1861,19 @@ THUMBNAIL_ANCHOR: 封面视觉锚，用 4~6 个短语描述：主体、主色（
         if neg_tag:
             prompt += f". Negative: {neg_tag}"
         item = {"text": line, "emotion": emotion, "prompt": prompt, "historical_context": historical_context, "tone": tone}
+        if ADS_RETENTION_MODE and not ADS_DIALOGUE_MODE:
+            if i == 0:
+                retention_role = "hook"
+            elif i == len(lines) - 1:
+                retention_role = "payoff"
+            elif abs(i - (len(lines) // 2)) <= 1:
+                retention_role = "mid_rehook"
+            else:
+                retention_role = "progression"
+            item.update({
+                "retention_mode": True,
+                "retention_role": retention_role,
+            })
         if dialogue_meta:
             item.update({
                 "dialogue_mode": True,
@@ -1902,7 +1946,65 @@ THUMBNAIL_ANCHOR: 封面视觉锚，用 4~6 个短语描述：主体、主色（
             picked_id = "liyan2-ef9401ec"
             picked_name = "国栋"
 
+    _write_ads_retention_qa(script)
     return script, picked_id, picked_name
+
+
+def _write_ads_retention_qa(script: list[dict]) -> dict:
+    if not ADS_RETENTION_MODE or ADS_DIALOGUE_MODE:
+        return {"enabled": False}
+
+    def _plain_len(text: str) -> int:
+        return len(re.sub(r"\s+", "", str(text or "")))
+
+    def _contains_any(text: str, needles: list[str]) -> bool:
+        return any(n in text for n in needles)
+
+    first = script[0] if script else {}
+    first_text = str(first.get("text", "")).strip()
+    first_prompt = str(first.get("prompt", "")).lower()
+    all_text = "\n".join(str(x.get("text", "")) for x in script)
+    mid_items = script[max(0, len(script) // 2 - 2): len(script) // 2 + 3] if script else []
+    mid_text = "\n".join(str(x.get("text", "")) for x in mid_items)
+    banned_terms = ["震惊", "全网", "内幕", "炸裂", "家人们", "速看", "离谱到家"]
+    flat_opening = bool(re.match(r"^\s*(公元)?\d{3,4}年|^\s*\d{1,2}月\d{1,2}日|^\s*在.{0,8}\d{3,4}年", first_text))
+    hook_markers = ["？", "?", "但", "却", "竟", "只", "最", "第一", "不是", "真正", "代价", "危险", "改变", "死", "输", "赢"]
+    visual_markers = [
+        "close-up", "extreme close-up", "insert shot", "hand", "eye", "face",
+        "blood", "flame", "document", "telegram", "letter", "shadow", "silhouette",
+    ]
+    generic_visual = any(term in first_prompt for term in [
+        "wide establishing shot", "documentary style", "standard shot", "straightforward composition"
+    ])
+
+    checks = {
+        "first_line_short": _plain_len(first_text) <= 24,
+        "first_line_not_flat_date": not flat_opening,
+        "first_line_has_hook_signal": _contains_any(first_text, hook_markers),
+        "no_low_quality_traffic_terms": not _contains_any(all_text, banned_terms),
+        "first_prompt_thumb_stopping": _contains_any(first_prompt, visual_markers) and not generic_visual,
+        "has_mid_rehook": _contains_any(mid_text, ["真正", "但", "可是", "谁也没想到", "代价", "问题", "结果", "为什么", "怎么"]),
+    }
+    qa = {
+        "enabled": True,
+        "mode": "ads_retention_non_reporter",
+        "pass": all(checks.values()),
+        "checks": checks,
+        "first_text": first_text,
+        "first_prompt": first.get("prompt", ""),
+        "retention_roles": [x.get("retention_role") for x in script if x.get("retention_mode")],
+    }
+    try:
+        with open(os.path.join(OUTPUT_DIR, "retention_qa.json"), "w", encoding="utf-8") as f:
+            json.dump(qa, f, ensure_ascii=False, indent=2)
+        if qa["pass"]:
+            tg("✅ ADS 播放量模式 QA 通过：前三秒钩子、低质流量词、首图吸引力已检查")
+        else:
+            failed = ", ".join(k for k, v in checks.items() if not v)
+            tg(f"⚠️ ADS 播放量模式 QA 有警告：{failed}")
+    except Exception as e:
+        log(f"retention QA 写入失败: {e}")
+    return qa
 
 
 # ── 第二步：逐句生成音轨（WeryAI Podcast，线程池并发）─────────────────────────
