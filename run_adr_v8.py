@@ -197,9 +197,12 @@ if STORYBOARD_GRID_MULTIREF_SEGMENTS:
 if STORYBOARD_GRID_MULTIREF_MOTION or PREVIS_PAGE_MOTION or STORYBOARD_TRAILER_MODE or CHARACTER_TRAILER_MODE or ADSD_STORYBOARD_GRID:
     GPT_IMAGE2_STORYBOARD_GRID = True
 ADSD_LIP_SYNC_EXPERIMENT = (
-    "--adsd-lip-sync" in sys.argv
+    ADS_DIALOGUE_MODE
+    and "--no-lip-sync" not in sys.argv
+    and "--no-adsd-lip-sync" not in sys.argv
+    and os.environ.get("ADR_ADSD_LIP_SYNC", "1").strip().lower() not in ("0", "false", "no", "off")
+    or "--adsd-lip-sync" in sys.argv
     or "--lip-sync" in sys.argv
-    or os.environ.get("ADR_ADSD_LIP_SYNC", "").strip().lower() in ("1", "true", "yes", "on")
 )
 ADSD_RICH_MOTION_PROMPT = (
     "--adsd-rich-motion" in sys.argv
@@ -3867,9 +3870,41 @@ def _write_production_storyboard_page_qa(payload: dict) -> None:
 
 def _character_sheet_prompt(script: list[dict], topic: str, aspect: str) -> str:
     beats = []
+    speakers = []
     for i, scene in enumerate(script[:12], start=1):
         visual = re.sub(r"\s+", " ", str(scene.get("prompt") or scene.get("text") or "")).strip()
+        speaker = re.sub(r"\s+", " ", str(scene.get("speaker") or "")).strip()
+        if speaker and speaker not in speakers:
+            speakers.append(speaker)
         beats.append(f"{i:02d}. {visual[:280]}")
+    if ADS_DIALOGUE_MODE:
+        role_lines = []
+        for speaker in speakers[:8]:
+            first = next((s for s in script if s.get("speaker") == speaker), {})
+            subject = re.sub(r"\s+", " ", str(first.get("visual_subject") or first.get("speaker_visual_contract") or "")).strip()
+            role_lines.append(f"- {speaker}: {subject[:320]}")
+        role_block = "\n".join(role_lines) or "- Active historical dialogue speakers must be visually distinct and reusable."
+        return f"""Create one single {aspect} cinematic dialogue cast model sheet for an AI historical documentary.
+Topic: {topic}
+
+Purpose:
+- This sheet will be reused as a visual identity reference for ADSD lip-sync shots.
+- It must lock each dialogue speaker's face, age, gender, costume, hair, silhouette, props, and period role.
+- It is a reference sheet only; do not make a poster, comic page, subtitle card, or final video frame.
+- Cultural and period accuracy must match the topic and every embedded shot prompt.
+
+Dialogue speaker designs:
+{role_block}
+
+Layout requirements:
+- One clean row or column per speaker, each with front view, 3/4 view, side view, and a neutral talking expression.
+- Keep speakers visually distinct but in one coherent historical production style.
+- Include period-accurate costume and prop callouts for each speaker.
+- Small role labels are acceptable on the sheet; keep faces large and reusable as references.
+- No subtitles, no dialogue text, no watermarks.
+
+Story context:
+{chr(10).join(beats)}"""
     return f"""Create one single {aspect} cinematic character and creature model sheet for an AI animation trailer.
 Topic: {topic}
 
@@ -3903,7 +3938,12 @@ def _write_character_sheet_qa(payload: dict) -> None:
 
 def generate_character_sheet_gpt_image2(script: list[dict], topic: str) -> dict | None:
     """Sidecar: GPT Image 2 model sheet for identity-locked character trailer shots."""
-    if ADS_DIALOGUE_MODE or not CHARACTER_TRAILER_MODE:
+    adsd_character_sheet = (
+        ADS_DIALOGUE_MODE
+        and ADSD_LIP_SYNC_EXPERIMENT
+        and os.environ.get("ADR_ADSD_CHARACTER_SHEET", "1").strip().lower() not in ("0", "false", "no", "off")
+    )
+    if not (CHARACTER_TRAILER_MODE or adsd_character_sheet):
         return None
     external = os.environ.get("ADR_CHARACTER_SHEET", "").strip()
     qa = {
@@ -3912,10 +3952,11 @@ def generate_character_sheet_gpt_image2(script: list[dict], topic: str) -> dict 
         "model": "GPT_IMAGE_2",
         "path": str(OUTPUT_DIR / "character_sheet.png"),
         "pass": False,
-        "policy": "identity_reference_for_character_trailer_shots_not_clean_panel_crop",
+        "policy": "identity_reference_for_character_trailer_or_adsd_lip_sync_not_clean_panel_crop",
         "manual_visual_checks_required": [
             "recurring_character_identity_is_clear",
             "costume_palette_and_props_are_reusable",
+            "adsd_speaker_roles_are_distinct_if_dialogue_mode",
             "creature_or_companion_design_is_consistent_if_present",
             "sheet_is_used_as_reference_not_rendered_in_final_video",
         ],
@@ -3967,7 +4008,8 @@ def generate_character_sheet_gpt_image2(script: list[dict], topic: str) -> dict 
             "pass": out_path.exists() and out_path.stat().st_size > 100000,
         })
         if qa["pass"]:
-            tg("🧬 GPT Image 2 character sheet 已生成（用于逐镜身份锁定 trailer）")
+            target = "ADSD 口型/身份锁定" if adsd_character_sheet else "逐镜身份锁定 trailer"
+            tg(f"🧬 GPT Image 2 character sheet 已生成（用于{target}）")
         else:
             qa["reason"] = "output_too_small_or_missing"
     except Exception as e:
@@ -6635,6 +6677,7 @@ def _adsd_lip_sync_prompt(scene: dict, safe_retry: bool = False) -> str:
     if safe_retry:
         return (
             "Neutral period dialogue scene. "
+            "If a character sheet reference is provided, use it only to preserve the active speaker identity; do not render the sheet itself. "
             f"Active speaker is the {role}; any other onsite characters listen silently. "
             "The active speaker follows the provided Chinese audio reference with natural mouth movement. "
             f"Visible mouth, stable face, subtle head motion, realistic lighting.{pov} "
@@ -6644,6 +6687,7 @@ def _adsd_lip_sync_prompt(scene: dict, safe_retry: bool = False) -> str:
     shot = scene.get("shot", "")
     return (
         "Historically grounded period dialogue scene. "
+        "If a character sheet reference is provided, use it only to preserve the active speaker identity; do not render the sheet itself. "
         f"Active speaker is the {role}; any other people only listen or react. Do not display the speaker name. "
         "Use the uploaded Chinese audio reference as the only dialogue source. "
         "Do not render, write, subtitle, caption, or overlay the spoken words anywhere in the frame. "
@@ -6847,7 +6891,17 @@ def _lip_sync_one_scene(idx: int, scene: dict, target_dur: float, aspect_ratio: 
         return idx, ok, info
     try:
         image_url = _upload_to_weryai(scene["img_path"])
+        sheet_path = OUTPUT_DIR / "character_sheet.png"
+        sheet_url = None
+        if sheet_path.exists() and sheet_path.stat().st_size > 10000:
+            try:
+                sheet_url = _upload_to_weryai(str(sheet_path))
+            except Exception as e:
+                log(f"[lip-sync {idx}] character sheet upload skipped: {e}")
         audio_url = _upload_to_weryai(source_audio)
+        ref_images = [image_url]
+        if sheet_url:
+            ref_images = [sheet_url, image_url]
         api_dur = int(round(max(5, min(15, float(scene.get("dur") or target_dur)))))
         variants = [
             ("primary", "WERYDANCE_2_0", _adsd_lip_sync_prompt(scene, safe_retry=False)),
@@ -6863,7 +6917,7 @@ def _lip_sync_one_scene(idx: int, scene: dict, target_dur: float, aspect_ratio: 
                     _wait_motion_submit_slot(f"lip-sync {idx+1}")
                     r = req_post("/generation/almighty-reference-to-video", {
                         "model": model,
-                        "images": [image_url],
+                        "images": ref_images,
                         "audios": [audio_url],
                         "prompt": prompt,
                         "duration": api_dur,
@@ -6893,6 +6947,8 @@ def _lip_sync_one_scene(idx: int, scene: dict, target_dur: float, aspect_ratio: 
                 "submit_model": model,
                 "submit_duration": api_dur,
                 "image_url": image_url,
+                "character_sheet_url": sheet_url,
+                "reference_image_count": len(ref_images),
                 "audio_url": audio_url,
             })
             if ok and (repair_all or repair_requested):
@@ -6908,7 +6964,15 @@ def _lip_sync_one_scene(idx: int, scene: dict, target_dur: float, aspect_ratio: 
                 info["attempts"] = attempts
                 return idx, ok, info
         final = dict(attempts[-1]) if attempts else {"turn": idx + 1, "pass": False, "reason": "no_attempts"}
-        final.update({"turn": idx + 1, "pass": False, "attempts": attempts, "image_url": image_url, "audio_url": audio_url})
+        final.update({
+            "turn": idx + 1,
+            "pass": False,
+            "attempts": attempts,
+            "image_url": image_url,
+            "character_sheet_url": sheet_url,
+            "reference_image_count": len(ref_images),
+            "audio_url": audio_url,
+        })
         if ADSD_LIPS_CHANGE_REPAIR:
             repair_ok, repair_info = _lips_change_repair_segment(idx, scene, target_dur)
             repair_info["reason"] = "almighty_failed_fallback"
@@ -6953,10 +7017,13 @@ def step66_adsd_lip_sync(script: list[dict]):
                 tg(f"⚠️ Turn {idx+1}/{n} 口型同步失败，保留原静态/motion片段")
     records.sort(key=lambda x: int(x.get("turn", 0)))
     success_cnt = sum(1 for v in results.values() if v)
+    sheet_path = OUTPUT_DIR / "character_sheet.png"
     qa = {
         "mode": ADSD_MODE_NAME,
         "interface": "almighty-reference-to-video+video-lips-change-fallback" if ADSD_LIPS_CHANGE_REPAIR else "almighty-reference-to-video",
         "model": "WERYDANCE_2_0",
+        "character_sheet_reference": str(sheet_path) if sheet_path.exists() else None,
+        "character_sheet_reference_exists": sheet_path.exists() and sheet_path.stat().st_size > 10000,
         "lips_change_repair_enabled": ADSD_LIPS_CHANGE_REPAIR,
         "lips_change_all_enabled": ADSD_LIPS_CHANGE_ALL,
         "lips_change_requested_turns": sorted(_load_lips_change_requested_turns()),
