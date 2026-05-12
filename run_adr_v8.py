@@ -190,6 +190,10 @@ MOTION_ACTION_STORYBOARD = (
     "--no-motion-action-storyboard" not in sys.argv
     and os.environ.get("ADR_MOTION_ACTION_STORYBOARD", "1").strip().lower() not in ("0", "false", "no", "off")
 )
+MOTION_BRIDGE_REFS = (
+    "--no-motion-bridge-refs" not in sys.argv
+    and os.environ.get("ADR_MOTION_BRIDGE_REFS", "1").strip().lower() not in ("0", "false", "no", "off")
+)
 CHARACTER_TRAILER_MODE = (
     "--character-trailer-mode" in sys.argv
     or "--with-character-trailer" in sys.argv
@@ -3988,6 +3992,134 @@ def _write_motion_action_plan_qa(script: list[dict]) -> dict:
     return payload
 
 
+def _write_motion_bridge_refs_qa(payload: dict) -> None:
+    try:
+        (OUTPUT_DIR / "motion_bridge_refs_qa.json").write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception as e:
+        log(f"motion_bridge_refs_qa.json 写入失败: {e}")
+
+
+def _motion_bridge_ref_prompt(scene: dict, idx: int, total: int, topic: str, aspect: str) -> str:
+    visual = _short_board_text(scene.get("prompt") or scene.get("shot") or scene.get("text"), 760)
+    action = _short_board_text(scene.get("motion_action_beat"), 260)
+    camera = _short_board_text(scene.get("motion_camera"), 220)
+    speed = _short_board_text(scene.get("motion_speed"), 60)
+    text = _short_board_text(scene.get("text"), 160)
+    culture_guard = _topic_culture_guard(scene.get("topic_meta", {}))
+    return f"""Create one single standalone cinematic END KEYFRAME for shot {idx + 1}/{total} of a Chinese documentary: {topic}.
+{culture_guard}
+Aspect ratio: {aspect}.
+
+This image will be used as the second reference frame for image-to-video motion. It must look like the same shot a moment later, not a new scene.
+
+Continuity lock:
+- Same character identity, era, costume, hair, props, location, lighting, palette, and camera language as the visual source.
+- No captions, no subtitles, no labels, no logos, no watermark, no comic panels, no storyboard layout, no text.
+- Do not make a passive portrait. Show the action already happening or just completed.
+
+Visual source:
+{visual}
+
+Dialogue/story beat:
+{text}
+
+Required end-frame action:
+{action}
+
+Camera/motion intention:
+{camera}; speed {speed}.
+
+Output only the clean final cinematic frame at the most readable end moment of the action."""
+
+
+def generate_motion_bridge_refs_gpt_image2(script: list[dict], topic: str) -> dict | None:
+    """Generate per-shot action end keyframes so WeryDance has start/end visual anchors."""
+    if not MOTION_BRIDGE_REFS or ADS_DIALOGUE_MODE:
+        return None
+    _model, aspect, extra = pick_image_model(ASPECT_RATIO)
+    if _model != "GPT_IMAGE_2":
+        return None
+    max_refs = max(0, int(os.environ.get("ADR_MOTION_BRIDGE_REFS_MAX", "12")))
+    poll_max = float(os.environ.get("ADR_MOTION_BRIDGE_REFS_POLL_MAX", "240"))
+    energy_min = float(os.environ.get("ADR_MOTION_BRIDGE_REFS_MIN_ENERGY", "0.6"))
+    candidates = [
+        (i, scene)
+        for i, scene in enumerate(script[:max_refs])
+        if scene.get("img_path") and os.path.exists(scene.get("img_path")) and float(scene.get("motion_energy") or 0) >= energy_min
+    ]
+    qa = {
+        "mode": "gpt_image2_motion_bridge_end_keyframes",
+        "enabled": True,
+        "model": "GPT_IMAGE_2",
+        "aspect_ratio": aspect,
+        "energy_min": energy_min,
+        "requested_count": len(candidates),
+        "records": [],
+        "pass": False,
+        "created_at": datetime.now().isoformat(timespec="seconds"),
+    }
+    if not candidates:
+        qa["reason"] = "no_candidate_scenes"
+        _write_motion_bridge_refs_qa(qa)
+        return qa
+    tg(f"🎭 动作桥接关键帧启动：GPT Image 2 × {len(candidates)} 张 end keyframe")
+    ok_count = 0
+    for idx, scene in candidates:
+        out_path = OUTPUT_DIR / f"motion_bridge_ref_{idx}.jpg"
+        rec = {
+            "scene": idx + 1,
+            "path": str(out_path),
+            "motion_plan": _motion_plan_for_qa(scene),
+            "pass": False,
+        }
+        try:
+            prompt = _motion_bridge_ref_prompt(scene, idx, len(script), topic, aspect)
+            if len(prompt) > 18000:
+                prompt = prompt[:18000]
+                rec["prompt_truncated"] = True
+            r = submit_text_to_image({
+                "model": "GPT_IMAGE_2",
+                "prompt": prompt,
+                "aspect_ratio": aspect,
+                "image_number": 1,
+                **extra,
+            }, f"GPT Image 2 motion bridge ref {idx+1}/{len(script)}", timeout=45, max_attempts=3)
+            task_id = (r.get("data", {}).get("task_ids") or [r.get("data", {}).get("task_id") or None])[0]
+            rec["task_id"] = task_id
+            if not task_id:
+                rec.update({"reason": "submit_without_task_id", "response": r})
+                qa["records"].append(rec)
+                continue
+            data = poll_storyboard_task(task_id, f"GPT Image 2 motion bridge ref {idx+1}/{len(script)}", poll_max)
+            urls = _extract_img_urls(data)
+            if not urls:
+                rec["reason"] = "succeed_without_image_url"
+                qa["records"].append(rec)
+                continue
+            urllib.request.urlretrieve(urls[0], out_path)
+            contact_check = _detect_contact_sheet_like_image(str(out_path))
+            rec["contact_sheet_check"] = contact_check
+            rec["bytes"] = out_path.stat().st_size if out_path.exists() else 0
+            rec["pass"] = out_path.exists() and out_path.stat().st_size > 100000 and not contact_check.get("contact_sheet")
+            if rec["pass"]:
+                scene["motion_bridge_ref_paths"] = [str(out_path)]
+                ok_count += 1
+        except Exception as e:
+            rec.update({"pass": False, "reason": str(e)[:300]})
+        qa["records"].append(rec)
+        _write_motion_bridge_refs_qa(qa)
+    qa.update({
+        "success_count": ok_count,
+        "pass": ok_count >= max(1, math.ceil(len(candidates) * 0.7)),
+    })
+    _write_motion_bridge_refs_qa(qa)
+    if ok_count:
+        tg(f"✅ 动作桥接关键帧完成：{ok_count}/{len(candidates)} 张可用")
+    else:
+        tg("⚠️ 动作桥接关键帧全部失败，本次仍使用单帧 motion")
+    return qa
+
+
 def generate_image(scene: dict, idx: int, _max_retries: int = 3) -> int:
     last_err = None
     for attempt in range(_max_retries):
@@ -5206,6 +5338,7 @@ def step6_parallel(script: list[dict], topic: str, pregenerated_bgm_path: str | 
         storyboard_used = generate_storyboard_grid_gpt_image2(script, topic) or generate_storyboard_images_gpt_image2(script, topic)
         if storyboard_used:
             completed = {i: True for i in range(n)}
+            generate_motion_bridge_refs_gpt_image2(script, topic)
             if not SKIP_APPROVAL:
                 for idx in range(n):
                     _send_for_approval(script[idx]["img_path"], idx, script[idx])
@@ -5259,6 +5392,9 @@ def step6_parallel(script: list[dict], topic: str, pregenerated_bgm_path: str | 
                         approval_sent.add(idx)
                 except Exception as e:
                     raise RuntimeError(f"图 {idx+1} 兜底失败: {e}")
+
+        if not storyboard_used:
+            generate_motion_bridge_refs_gpt_image2(script, topic)
 
         generate_gpt_image2_direct_annotated_storyboards(script, topic)
         if script:
@@ -6210,8 +6346,16 @@ def _try_motion_audio_dub_video(idx: int, scene: dict, motion_prompt: str, aspec
     scene["_motion_reference_audio"] = source_audio
     scene["_motion_reference_audio_role"] = "voice_asset_reference"
     scene["_motion_voice_asset_reference"] = voice_asset_ref
+    bridge_paths = [
+        str(p)
+        for p in (scene.get("motion_bridge_ref_paths") or [])
+        if p and os.path.exists(str(p)) and os.path.getsize(str(p)) > 10000
+    ]
     try:
-        image_url = _upload_to_weryai(img_path)
+        image_urls = [_upload_to_weryai(img_path)]
+        for bridge_path in bridge_paths[:2]:
+            image_urls.append(_upload_to_weryai(bridge_path))
+        image_url = image_urls[0]
         audio_url = _upload_to_weryai(source_audio)
     except Exception as e:
         log(f"[motion-audio-dub {idx}] reference 上传失败，回退 motion: {e}")
@@ -6227,6 +6371,13 @@ def _try_motion_audio_dub_video(idx: int, scene: dict, motion_prompt: str, aspec
 
     strict_voice = bool(MOTION_VOICE_STRICT_LOCK or repair_requested)
     prompt = _motion_audio_dub_prompt(scene, motion_prompt, safe_retry=safe_retry, strict_voice=strict_voice)
+    if len(image_urls) > 1:
+        bridge_instruction = (
+            " Treat the uploaded images as ordered motion keyframes: image 1 is the start frame, "
+            "image 2 is the end/action frame. Create a visible motivated transition between them; "
+            "the subject must not just stare or hold a pose. "
+        )
+        prompt = (bridge_instruction + prompt)[:2000]
     caption_info = _werydance_caption_request(scene)
     task_id = None
     response = None
@@ -6235,7 +6386,7 @@ def _try_motion_audio_dub_video(idx: int, scene: dict, motion_prompt: str, aspec
             _wait_motion_submit_slot(f"motion audio-dub {idx+1}")
             response = req_post("/generation/almighty-reference-to-video", {
                 "model": "WERYDANCE_2_0",
-                "images": [image_url],
+                "images": image_urls,
                 "audios": [audio_url],
                 "prompt": prompt,
                 "negative_prompt": _werydance_negative_prompt(scene),
@@ -6278,8 +6429,11 @@ def _try_motion_audio_dub_video(idx: int, scene: dict, motion_prompt: str, aspec
         "aspect_ratio": aspect_ratio,
         "resolution": VOICE_ASSET_AUDIO_DUB_RESOLUTION,
         "image_path": img_path,
+        "reference_image_count": len(image_urls),
+        "motion_bridge_ref_paths": bridge_paths,
         "audio_url": audio_url,
         "image_url": image_url,
+        "image_urls": image_urls,
         "motion_plan": _motion_plan_for_qa(scene),
         "fallback_to_reference_motion": not ok and not timed_out_or_reusable,
         "timed_out_or_reusable": timed_out_or_reusable,
