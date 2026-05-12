@@ -133,6 +133,10 @@ python3 run_adr_v8.py "江南春日风物" v --bgm-only --with-motion
 | `ADR_TG_DASHBOARD_EDIT_INTERVAL_SEC` | `8` | dashboard 模式下进度面板最小编辑间隔 |
 | `ADR_GPT_IMAGE2_STORYBOARD_GRID_SUBMIT_STAGGER` | `12` | storyboard grid 任务错峰提交间隔，避免同时请求 |
 | `ADR_GPT_IMAGE2_STORYBOARD_GRID_POLL_WORKERS` | `20` | storyboard grid 提交后并发轮询/下载/裁剪 worker 数 |
+| `ADR_GPT_IMAGE2_STORYBOARD_SUBMIT_STAGGER` | `12` | 单图 storyboard fallback 错峰提交间隔 |
+| `ADR_GPT_IMAGE2_STORYBOARD_POLL_WORKERS` | `20` | 单图 storyboard fallback 并发轮询/下载 worker 数 |
+| `ADR_MOTION_BRIDGE_REFS_SUBMIT_STAGGER` | `12` | motion bridge end keyframe 错峰提交间隔 |
+| `ADR_MOTION_BRIDGE_REFS_POLL_WORKERS` | `20` | motion bridge end keyframe 并发轮询/下载 worker 数 |
 
 ## Telegram 进度策略
 

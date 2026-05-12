@@ -4237,6 +4237,8 @@ def generate_motion_bridge_refs_gpt_image2(script: list[dict], topic: str) -> di
     max_refs = max(0, int(os.environ.get("ADR_MOTION_BRIDGE_REFS_MAX", "12")))
     poll_max = float(os.environ.get("ADR_MOTION_BRIDGE_REFS_POLL_MAX", "240"))
     energy_min = float(os.environ.get("ADR_MOTION_BRIDGE_REFS_MIN_ENERGY", "0.6"))
+    submit_stagger_sec = max(0.0, float(os.environ.get("ADR_MOTION_BRIDGE_REFS_SUBMIT_STAGGER", "12")))
+    poll_workers = max(1, min(20, int(os.environ.get("ADR_MOTION_BRIDGE_REFS_POLL_WORKERS", "20"))))
     candidates = [
         (i, scene)
         for i, scene in enumerate(script[:max_refs])
@@ -4250,6 +4252,8 @@ def generate_motion_bridge_refs_gpt_image2(script: list[dict], topic: str) -> di
         "energy_min": energy_min,
         "requested_count": len(candidates),
         "records": [],
+        "submit_stagger_sec": submit_stagger_sec,
+        "poll_workers": poll_workers,
         "pass": False,
         "created_at": datetime.now().isoformat(timespec="seconds"),
     }
@@ -4258,8 +4262,8 @@ def generate_motion_bridge_refs_gpt_image2(script: list[dict], topic: str) -> di
         _write_motion_bridge_refs_qa(qa)
         return qa
     tg(f"🎭 动作桥接关键帧启动：GPT Image 2 × {len(candidates)} 张 end keyframe")
-    ok_count = 0
-    for idx, scene in candidates:
+    submitted: list[tuple[dict, int, dict, Path]] = []
+    for submit_i, (idx, scene) in enumerate(candidates):
         out_path = OUTPUT_DIR / f"motion_bridge_ref_{idx}.jpg"
         rec = {
             "scene": idx + 1,
@@ -4267,11 +4271,15 @@ def generate_motion_bridge_refs_gpt_image2(script: list[dict], topic: str) -> di
             "motion_plan": _motion_plan_for_qa(scene),
             "pass": False,
         }
+        qa["records"].append(rec)
         try:
             prompt = _motion_bridge_ref_prompt(scene, idx, len(script), topic, aspect)
             if len(prompt) > 18000:
                 prompt = prompt[:18000]
                 rec["prompt_truncated"] = True
+            if submit_i > 0 and submit_stagger_sec > 0:
+                log(f"GPT Image 2 motion bridge ref 错峰提交等待 {submit_stagger_sec:.1f}s（{submit_i+1}/{len(candidates)}）")
+                time.sleep(submit_stagger_sec)
             r = submit_text_to_image({
                 "model": "GPT_IMAGE_2",
                 "prompt": prompt,
@@ -4283,14 +4291,21 @@ def generate_motion_bridge_refs_gpt_image2(script: list[dict], topic: str) -> di
             rec["task_id"] = task_id
             if not task_id:
                 rec.update({"reason": "submit_without_task_id", "response": r})
-                qa["records"].append(rec)
                 continue
+            submitted.append((rec, idx, scene, out_path))
+        except Exception as e:
+            rec.update({"pass": False, "reason": str(e)[:300]})
+        _write_motion_bridge_refs_qa(qa)
+
+    def poll_motion_bridge(entry: tuple[dict, int, dict, Path]) -> dict:
+        rec, idx, scene, out_path = entry
+        try:
+            task_id = rec.get("task_id")
             data = poll_storyboard_task(task_id, f"GPT Image 2 motion bridge ref {idx+1}/{len(script)}", poll_max)
             urls = _extract_img_urls(data)
             if not urls:
                 rec["reason"] = "succeed_without_image_url"
-                qa["records"].append(rec)
-                continue
+                return rec
             urllib.request.urlretrieve(urls[0], out_path)
             contact_check = _detect_contact_sheet_like_image(str(out_path))
             rec["contact_sheet_check"] = contact_check
@@ -4298,11 +4313,17 @@ def generate_motion_bridge_refs_gpt_image2(script: list[dict], topic: str) -> di
             rec["pass"] = out_path.exists() and out_path.stat().st_size > 100000 and not contact_check.get("contact_sheet")
             if rec["pass"]:
                 scene["motion_bridge_ref_paths"] = [str(out_path)]
-                ok_count += 1
         except Exception as e:
             rec.update({"pass": False, "reason": str(e)[:300]})
-        qa["records"].append(rec)
-        _write_motion_bridge_refs_qa(qa)
+        return rec
+
+    if submitted:
+        with ThreadPoolExecutor(max_workers=min(poll_workers, len(submitted))) as ex:
+            futs = [ex.submit(poll_motion_bridge, entry) for entry in submitted]
+            for fut in as_completed(futs):
+                fut.result()
+                _write_motion_bridge_refs_qa(qa)
+    ok_count = sum(1 for r in qa["records"] if r.get("pass"))
     qa.update({
         "success_count": ok_count,
         "pass": ok_count >= max(1, math.ceil(len(candidates) * 0.7)),
@@ -4392,6 +4413,8 @@ def generate_storyboard_images_gpt_image2(script: list[dict], topic: str) -> boo
         "requested_count": n,
         "batch_size": min(4, int(os.environ.get("ADR_GPT_IMAGE2_STORYBOARD_BATCH", "1"))),
         "batch_poll_timeout_sec": float(os.environ.get("ADR_GPT_IMAGE2_STORYBOARD_POLL_MAX", "240")),
+        "submit_stagger_sec": max(0.0, float(os.environ.get("ADR_GPT_IMAGE2_STORYBOARD_SUBMIT_STAGGER", "12"))),
+        "poll_workers": max(1, min(20, int(os.environ.get("ADR_GPT_IMAGE2_STORYBOARD_POLL_WORKERS", "20")))),
         "batches": [],
         "downloaded_count": 0,
         "rendered_count": 0,
@@ -4401,9 +4424,9 @@ def generate_storyboard_images_gpt_image2(script: list[dict], topic: str) -> boo
     }
 
     try:
-        img_urls: list[str] = []
         batch_size = max(1, min(4, int(qa["batch_size"])))
         total_batches = math.ceil(n / batch_size)
+        submitted_batches: list[dict] = []
         for batch_idx, start in enumerate(range(0, n, batch_size), start=1):
             end = min(n, start + batch_size)
             batch_script = script[start:end]
@@ -4447,6 +4470,9 @@ def generate_storyboard_images_gpt_image2(script: list[dict], topic: str) -> boo
                 storyboard_prompt = storyboard_prompt[:18000]
                 qa.setdefault("warnings", []).append(f"batch_{batch_idx}_prompt_truncated")
 
+            if batch_idx > 1 and qa["submit_stagger_sec"] > 0:
+                log(f"GPT Image 2 storyboard fallback 错峰提交等待 {qa['submit_stagger_sec']:.1f}s（{batch_idx}/{total_batches}）")
+                time.sleep(float(qa["submit_stagger_sec"]))
             r = submit_text_to_image({
                 "model": "GPT_IMAGE_2",
                 "prompt": storyboard_prompt,
@@ -4468,28 +4494,47 @@ def generate_storyboard_images_gpt_image2(script: list[dict], topic: str) -> boo
             if not task_ids:
                 qa["issues"].append(f"batch_{batch_idx}_submit_without_task_id: {json.dumps(r, ensure_ascii=False)[:200]}")
                 raise RuntimeError(f"storyboard batch {batch_idx} returned no task_id")
+            submitted_batches.append({
+                "batch_qa": batch_qa,
+                "batch_count": batch_count,
+            })
 
+        def poll_storyboard_batch(entry: dict) -> tuple[int, list[str]]:
+            batch_qa = entry["batch_qa"]
             batch_urls: list[str] = []
+            task_ids = batch_qa.get("task_ids") or []
             for j, tid in enumerate(task_ids):
                 data = poll_storyboard_task(
                     tid,
-                    f"GPT Image 2 storyboard batch {batch_idx}/{total_batches} task {j+1}/{len(task_ids)}",
+                    f"GPT Image 2 storyboard batch {batch_qa['batch']}/{total_batches} task {j+1}/{len(task_ids)}",
                     qa["batch_poll_timeout_sec"],
                 )
                 batch_urls.extend(_extract_img_urls(data))
             batch_qa["image_count"] = len(batch_urls)
+            batch_count = int(entry["batch_count"])
             if len(batch_urls) < batch_count:
-                qa["issues"].append(f"batch_{batch_idx}_image_count_mismatch: got {len(batch_urls)}, need {batch_count}")
-                raise RuntimeError(f"storyboard batch {batch_idx} image count mismatch: got {len(batch_urls)}, need {batch_count}")
-            img_urls.extend(batch_urls[:batch_count])
+                qa["issues"].append(f"batch_{batch_qa['batch']}_image_count_mismatch: got {len(batch_urls)}, need {batch_count}")
+                raise RuntimeError(f"storyboard batch {batch_qa['batch']} image count mismatch: got {len(batch_urls)}, need {batch_count}")
+            return int(batch_qa["scene_start"]) - 1, batch_urls[:batch_count]
 
-        if len(img_urls) < n:
-            qa["issues"].append(f"image_count_mismatch: got {len(img_urls)}, need {n}")
-            raise RuntimeError(f"storyboard image count mismatch: got {len(img_urls)}, need {n}")
+        img_urls: list[str | None] = [None] * n
+        if submitted_batches:
+            with ThreadPoolExecutor(max_workers=min(int(qa["poll_workers"]), len(submitted_batches))) as ex:
+                futs = [ex.submit(poll_storyboard_batch, entry) for entry in submitted_batches]
+                for fut in as_completed(futs):
+                    start_idx, urls = fut.result()
+                    for offset, url in enumerate(urls):
+                        if start_idx + offset < n:
+                            img_urls[start_idx + offset] = url
+
+        if any(not u for u in img_urls):
+            missing = [i + 1 for i, u in enumerate(img_urls) if not u]
+            qa["issues"].append(f"image_count_mismatch: missing {missing}")
+            raise RuntimeError(f"storyboard image count mismatch: missing {missing}")
 
         for i, url in enumerate(img_urls[:n]):
             path = script[i]["img_path"]
-            urllib.request.urlretrieve(url, path)
+            urllib.request.urlretrieve(str(url), path)
             qa["downloaded_count"] += 1
             contact_check = _detect_contact_sheet_like_image(path)
             contact_check["scene"] = i + 1
@@ -4498,7 +4543,7 @@ def generate_storyboard_images_gpt_image2(script: list[dict], topic: str) -> boo
                 qa["issues"].append(f"scene_{i+1}_contact_sheet_detected")
                 raise RuntimeError(f"scene {i+1} storyboard looks like a contact sheet/grid: {contact_check}")
             script[i]["storyboard_mode"] = True
-            script[i]["storyboard_source_url"] = url
+            script[i]["storyboard_source_url"] = str(url)
             _render_still_segment(script[i])
             qa["rendered_count"] += 1
 
