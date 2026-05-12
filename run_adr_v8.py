@@ -1233,6 +1233,60 @@ def _parse_adsd_override_turns(raw_lines: list[str], topic: str) -> list[dict]:
     return _finalize_adsd_turns(turns)
 
 
+_TIMECODE_RANGE_RE = re.compile(
+    r"(?P<start>\d{1,2}:\d{2}(?::\d{2})?)\s*[-–—]\s*(?P<end>\d{1,2}:\d{2}(?::\d{2})?)"
+)
+
+
+def _parse_timecode_seconds(value: str) -> float:
+    parts = [float(p) for p in str(value).split(":")]
+    if len(parts) == 2:
+        return parts[0] * 60 + parts[1]
+    if len(parts) == 3:
+        return parts[0] * 3600 + parts[1] * 60 + parts[2]
+    raise ValueError(f"bad timecode: {value}")
+
+
+def _clean_override_line_text(text: str) -> str:
+    text = re.sub(r"\s+", " ", str(text or "")).strip()
+    text = text.strip(" \t\r\n\"'“”‘’")
+    return text.strip()
+
+
+def _parse_override_script_text(raw_text: str) -> tuple[list[str], list[dict | None]]:
+    """Parse manual script input; timecode-only lines are metadata, never narration."""
+    records: list[dict] = []
+    pending_time: dict | None = None
+    for raw in str(raw_text or "").splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        m = _TIMECODE_RANGE_RE.search(line)
+        timing = None
+        text = line
+        if m:
+            timing = {
+                "start": _parse_timecode_seconds(m.group("start")),
+                "end": _parse_timecode_seconds(m.group("end")),
+                "label": m.group(0).replace("–", "-").replace("—", "-"),
+            }
+            text = _clean_override_line_text((line[:m.start()] + " " + line[m.end():]).strip())
+            if not text:
+                if records and not records[-1].get("timing"):
+                    records[-1]["timing"] = timing
+                else:
+                    pending_time = timing
+                continue
+        text = _clean_override_line_text(text)
+        if not text:
+            continue
+        records.append({"text": text, "timing": timing or pending_time})
+        pending_time = None
+    lines = [r["text"] for r in records if r.get("text")]
+    timings = [r.get("timing") for r in records if r.get("text")]
+    return lines, timings
+
+
 def _adsd_pov_contract() -> str:
     return (
         "Onsite observer POV: the viewer feels physically present in the historical scene, standing at eye level "
@@ -1677,10 +1731,12 @@ def step1_script(topic: str) -> list[dict]:
     # ── 外部脚本注入（可选开关）──────────────────────────────────
     _OVERRIDE_FILE = Path("/tmp/adr_script_override.txt")
     _script_injected = False
+    _override_timings: list[dict | None] = []
     dialogue_turns: list[dict] = []
     if _OVERRIDE_FILE.exists() and _OVERRIDE_FILE.stat().st_size > 0:
-        _override_lines = [l.strip() for l in _OVERRIDE_FILE.read_text(encoding="utf-8").splitlines() if l.strip()]
-        min_override_lines = 4 if ADS_DIALOGUE_MODE else 6
+        _override_raw = _OVERRIDE_FILE.read_text(encoding="utf-8")
+        _override_lines, _override_timings = _parse_override_script_text(_override_raw)
+        min_override_lines = 1 if not ADS_DIALOGUE_MODE else 1
         if min_override_lines <= len(_override_lines) <= 22:
             lines = _override_lines
             num_lines = len(lines)
@@ -1693,7 +1749,8 @@ def step1_script(topic: str) -> list[dict]:
                 log(f"ADSD 注入脚本解析：shape={shape} roles={roles}")
                 tg(f"📥 ADSD 注入脚本解析完成\n结构：{shape}\n角色：{roles}")
             log(f"📥 外部脚本注入：读取 {num_lines} 句台词，跳过 LLM 生成")
-            tg(f"📥 检测到外部脚本注入\n读取 {num_lines} 句台词，跳过 LLM 自动生成")
+            timed_count = sum(1 for x in _override_timings if x)
+            tg(f"📥 检测到外部脚本注入\n读取 {num_lines} 句台词，时间戳 {timed_count} 条，跳过 LLM 自动生成")
             _used_path = _OVERRIDE_FILE.with_suffix(f".used_{int(time.time())}")
             _OVERRIDE_FILE.rename(_used_path)
             log(f"外部脚本已重命名为 {_used_path.name}")
@@ -2105,6 +2162,16 @@ THUMBNAIL_ANCHOR: 封面视觉锚，用 4~6 个短语描述：主体、主色（
             "topic_meta": topic_meta,
             "culture_guard": culture_guard,
         }
+        if _script_injected:
+            item["injected_script"] = True
+            if i < len(_override_timings) and _override_timings[i]:
+                timing = _override_timings[i] or {}
+                item.update({
+                    "override_time_label": timing.get("label"),
+                    "override_audio_start": timing.get("start"),
+                    "override_audio_end": timing.get("end"),
+                    "override_duration": max(0.1, float(timing.get("end", 0)) - float(timing.get("start", 0))),
+                })
         if ADS_RETENTION_MODE and not ADS_DIALOGUE_MODE:
             if i == 0:
                 retention_role = "hook"
