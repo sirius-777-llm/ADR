@@ -33,6 +33,7 @@ ADR 是一套自动纪录片生成管线。输入一个主题或带时间戳的�
 | WeryDance 字幕 | 开 | 默认交给 WeryDance 生成字幕，ASS 硬字幕作为兜底 |
 | 音色资产库 | 开 | 男声默认罗翔，女声默认 BY2，可用环境变量覆盖 |
 | 严格音色锁定 | 开 | Motion prompt 会显式锁定声音资产和人物性别 |
+| Telegram 进度 | dashboard | TG 只保留一条可编辑进度面板，显示进度条、当前阶段和最近日志 |
 | BGM-only | 关 | `--bgm-only` 跳过 TTS，只保留画面、字幕、BGM |
 
 ## 架构
@@ -127,6 +128,26 @@ python3 run_adr_v8.py "江南春日风物" v --bgm-only --with-motion
 | `ADR_MOTION_VOICE_STRICT_LOCK` | `1` | 严格锁定音色和人物性别 |
 | `ADR_ADS_REPORTER_ALLOW_ENV` | 空 | 允许环境变量触发 reporter，默认不允许 |
 | `ADR_ADS_REPORTER` | 空 | reporter 环境开关，需配合上一项 |
+| `ADR_TG_PROGRESS_MODE` | `dashboard` | TG 推送模式：`dashboard` / `compact` / `verbose` / `silent` |
+| `ADR_TG_DIGEST_INTERVAL_SEC` | `120` | compact 模式下过程摘要最小间隔 |
+| `ADR_TG_DASHBOARD_EDIT_INTERVAL_SEC` | `8` | dashboard 模式下进度面板最小编辑间隔 |
+
+## Telegram 进度策略
+
+默认 `dashboard` 模式下，ADR 只发一条可编辑进度面板，后续用 Telegram `editMessageText` 原地更新，类似软件安装进度：
+
+- 面板内容：主题、阶段、百分比、进度条、当前状态、最近日志、更新时间。
+- 强制刷新：启动、剧本、主音轨、故事板、动态化、合成、发布门禁、成片、耗时统计、告警和错误。
+- 限频刷新：普通过程日志最多每 8 秒编辑一次，避免 Telegram API 限流。
+- 最终视频、封面、社媒文案、复制按钮仍单独发送，因为这些是交付物，不应该被进度面板覆盖。
+
+`compact` 模式保留为备用，会把过程信息分为三层：
+
+- 立即发送：启动、剧本完成、主音轨完成、故事板完成、动态化启动/完成、视频拼接、发布门禁、最终成片、耗时统计、所有告警和错误。
+- 合并摘要：单张图完成、单个分镜动态化成功、Podcast task_id、轮询类信息、重复审批进度。
+- 本地日志：所有细节仍写入 stdout/log，调试时可设 `ADR_TG_PROGRESS_MODE=verbose` 恢复全量推送。
+
+目标是让 TG 对话框里能直接看到“现在跑到哪、有没有风险、最终文件在哪里”，不需要在几十条过程消息里捞结果。
 
 ## 音色资产库
 

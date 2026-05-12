@@ -102,6 +102,9 @@ def get_almanac_data(topic: str) -> str | None:
 WERYAI_API_KEY = os.environ.get("WERYAI_API_KEY", "")
 TG_BOT_TOKEN   = os.environ.get("TG_BOT_TOKEN", "")
 TG_CHAT_ID     = os.environ.get("TG_CHAT_ID", "")
+TG_PROGRESS_MODE = os.environ.get("ADR_TG_PROGRESS_MODE", "dashboard").strip().lower()
+TG_DIGEST_INTERVAL_SEC = float(os.environ.get("ADR_TG_DIGEST_INTERVAL_SEC", "120"))
+TG_DASHBOARD_EDIT_INTERVAL_SEC = float(os.environ.get("ADR_TG_DASHBOARD_EDIT_INTERVAL_SEC", "8"))
 
 if not all([WERYAI_API_KEY, TG_BOT_TOKEN, TG_CHAT_ID]):
     missing = [k for k, v in [("WERYAI_API_KEY", WERYAI_API_KEY), ("TG_BOT_TOKEN", TG_BOT_TOKEN), ("TG_CHAT_ID", TG_CHAT_ID)] if not v]
@@ -482,17 +485,209 @@ EMOTION_STYLE_BRIGHT = {
 def log(msg: str):
     print(f"[ADR V8] {msg}", flush=True)
 
+_tg_lock = threading.Lock()
+_tg_last_digest_ts = 0.0
+_tg_suppressed_count = 0
+_tg_suppressed_tail: list[str] = []
+_tg_dashboard_message_id: int | None = None
+_tg_dashboard_last_edit_ts = 0.0
+_tg_dashboard_stage = 0
+_tg_dashboard_recent: list[str] = []
 
-def tg(msg: str):
+_TG_DASHBOARD_STAGES = [
+    ("启动", 2, [r"ADR V8 启动", r"开始处理"]),
+    ("剧本", 12, [r"剧本就绪", r"现场台词就绪", r"外部脚本注入"]),
+    ("制片", 18, [r"制片人准则就绪", r"画面提示词就绪"]),
+    ("音轨", 28, [r"主音轨生成完毕", r"主音轨完成", r"音轨生成完毕"]),
+    ("时间轴", 36, [r"时间轴", r"Whisper", r"BGM-driven 时间轴"]),
+    ("故事板", 48, [r"storyboard", r"分镜", r"4K storyboard"]),
+    ("素材", 58, [r"并行生成", r"图片", r"BGM 生成完毕", r"场景 QA"]),
+    ("动态化", 74, [r"动态化启动", r"Motion prompts", r"动作桥接", r"口型同步启动"]),
+    ("动态完成", 84, [r"动态化完成", r"口型同步 QA", r"Grid multi-ref"]),
+    ("合成", 91, [r"视频轨拼接完成", r"最终合成中", r"字幕"]),
+    ("交付", 97, [r"成片输出完毕", r"发布门禁", r"社媒文案", r"封面"]),
+    ("完成", 100, [r"全流程完成", r"耗时统计"]),
+]
+
+_TG_NOISY_PATTERNS = [
+    r"^🖼 图片 \d+ 生成完毕",
+    r"^🎬 分镜 \d+/\d+ 动态化 ✓",
+    r"^👄 Turn \d+/\d+ 口型同步 ✓",
+    r"^✅ 图 \d+/\d+ 已通过",
+    r"^🔄 图 \d+/\d+ 被拒绝",
+    r"^✏️ 图 \d+",
+    r"^🎞 Previs page \d+",
+    r"^🧪 Grid multi-ref \d+",
+    r"^✅ Podcast 文本生成成功",
+    r"^✅ Podcast 音频生成成功",
+    r"^🎙 Podcast text 尝试",
+    r"^⏳ \d+s 后重建 Podcast",
+    r"^🎵 BGM 就绪:",
+    r"^🎵 BGM-driven 复用 BGM:",
+    r"^🎵 step9 BGM 正常传入:",
+]
+
+_TG_IMMEDIATE_PATTERNS = [
+    r"^❌",
+    r"^⚠️",
+    r"^🎬 ADR V8 启动",
+    r"^🎬 动态化启动",
+    r"^✅ 剧本就绪",
+    r"^✅ 主音轨",
+    r"^✅ .*主音轨完成",
+    r"^✅ 时间轴",
+    r"^🧩 GPT Image 2 4K storyboard",
+    r"^✅ 动作桥接关键帧完成",
+    r"^✅ 动态化完成",
+    r"^✅ 视频轨拼接完成",
+    r"^🎬 最终合成中",
+    r"^✅ 成片输出完毕",
+    r"^✅ .*发布门禁通过",
+    r"^📝 社媒文案",
+    r"^🎨 正在生成主题专属封面",
+    r"^✅ 全流程完成",
+    r"^⏱ 耗时统计",
+]
+
+
+def _tg_send_raw(msg: str) -> dict | None:
     """向 Telegram 推送状态消息。"""
     try:
-        requests.post(
+        r = requests.post(
             f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage",
             json={"chat_id": TG_CHAT_ID, "text": msg},
             timeout=(10, 15),
         )
+        if r.ok:
+            return r.json()
+        log(f"TG 推送失败: HTTP {r.status_code} {r.text[:160]}")
     except Exception as e:
         log(f"TG 推送失败: {e}")
+    return None
+
+
+def _tg_matches(msg: str, patterns: list[str]) -> bool:
+    return any(re.search(p, msg, re.S) for p in patterns)
+
+
+def _tg_summarize(msg: str) -> str:
+    text = " ".join(str(msg).split())
+    if len(text) > 110:
+        text = text[:107] + "..."
+    return text
+
+
+def _tg_dashboard_stage_for(msg: str) -> int:
+    text = str(msg)
+    for idx, (_, _, patterns) in enumerate(_TG_DASHBOARD_STAGES):
+        if any(re.search(p, text, re.I | re.S) for p in patterns):
+            return idx
+    return _tg_dashboard_stage
+
+
+def _tg_progress_bar(percent: int, width: int = 18) -> str:
+    pct = max(0, min(100, int(percent)))
+    filled = round(width * pct / 100)
+    return "█" * filled + "░" * (width - filled)
+
+
+def _tg_dashboard_text(current_msg: str) -> str:
+    stage_name, percent, _ = _TG_DASHBOARD_STAGES[_tg_dashboard_stage]
+    bar = _tg_progress_bar(percent)
+    title = _tg_summarize(TOPIC)
+    recent = _tg_dashboard_recent[-5:]
+    recent_lines = "\n".join(f"• {x}" for x in recent) if recent else "• 等待下一步..."
+    updated = datetime.now().strftime("%H:%M:%S")
+    return (
+        f"🎛 ADR 任务进度\n"
+        f"主题：{title}\n"
+        f"阶段：{stage_name} · {percent}%\n"
+        f"{bar}\n"
+        f"当前：{_tg_summarize(current_msg)}\n\n"
+        f"最近日志：\n{recent_lines}\n\n"
+        f"更新时间：{updated}"
+    )[:3900]
+
+
+def _tg_dashboard_update(msg: str, *, force: bool = False):
+    global _tg_dashboard_message_id, _tg_dashboard_last_edit_ts, _tg_dashboard_stage
+    text = str(msg)
+    _tg_dashboard_stage = max(_tg_dashboard_stage, _tg_dashboard_stage_for(text))
+    summary = _tg_summarize(text)
+    if not _tg_dashboard_recent or _tg_dashboard_recent[-1] != summary:
+        _tg_dashboard_recent.append(summary)
+    if len(_tg_dashboard_recent) > 12:
+        del _tg_dashboard_recent[:-12]
+    now = time.time()
+    if _tg_dashboard_message_id and not force and now - _tg_dashboard_last_edit_ts < TG_DASHBOARD_EDIT_INTERVAL_SEC:
+        log(f"[TG dashboard defer] {text}")
+        return
+    body = _tg_dashboard_text(text)
+    if not _tg_dashboard_message_id:
+        data = _tg_send_raw(body)
+        try:
+            _tg_dashboard_message_id = int(data.get("result", {}).get("message_id")) if data else None
+        except Exception:
+            _tg_dashboard_message_id = None
+        _tg_dashboard_last_edit_ts = now
+        if not _tg_dashboard_message_id:
+            log("[TG dashboard] 无法创建进度面板，回退普通消息")
+        return
+    try:
+        r = requests.post(
+            f"https://api.telegram.org/bot{TG_BOT_TOKEN}/editMessageText",
+            json={"chat_id": TG_CHAT_ID, "message_id": _tg_dashboard_message_id, "text": body},
+            timeout=(10, 15),
+        )
+        if not r.ok and "message is not modified" not in r.text.lower():
+            log(f"TG 进度面板更新失败: HTTP {r.status_code} {r.text[:160]}")
+        _tg_dashboard_last_edit_ts = now
+    except Exception as e:
+        log(f"TG 进度面板更新失败: {e}")
+
+
+def _tg_maybe_digest(force: bool = False):
+    global _tg_last_digest_ts, _tg_suppressed_count, _tg_suppressed_tail
+    if TG_PROGRESS_MODE != "compact" or _tg_suppressed_count <= 0:
+        return
+    now = time.time()
+    if not force and now - _tg_last_digest_ts < TG_DIGEST_INTERVAL_SEC:
+        return
+    tail = _tg_suppressed_tail[-6:]
+    lines = "\n".join(f"• {x}" for x in tail)
+    _tg_send_raw(f"📌 进度摘要：已合并 {_tg_suppressed_count} 条过程信息\n{lines}")
+    _tg_last_digest_ts = now
+    _tg_suppressed_count = 0
+    _tg_suppressed_tail = []
+
+
+def tg(msg: str):
+    """Telegram 状态推送。默认 dashboard：单条可编辑进度面板。"""
+    global _tg_suppressed_count, _tg_suppressed_tail
+    text = str(msg)
+    if TG_PROGRESS_MODE in ("0", "off", "silent", "none"):
+        log(f"[TG silent] {text}")
+        return
+    if TG_PROGRESS_MODE in ("verbose", "full", "debug"):
+        _tg_send_raw(text)
+        return
+    if TG_PROGRESS_MODE in ("dashboard", "panel", "progress"):
+        with _tg_lock:
+            force = _tg_matches(text, _TG_IMMEDIATE_PATTERNS) or _tg_matches(text, [r"^❌", r"^⚠️"])
+            _tg_dashboard_update(text, force=force)
+        return
+    with _tg_lock:
+        if _tg_matches(text, _TG_IMMEDIATE_PATTERNS):
+            _tg_maybe_digest(force=True)
+            _tg_send_raw(text)
+            return
+        _tg_suppressed_count += 1
+        _tg_suppressed_tail.append(_tg_summarize(text))
+        if len(_tg_suppressed_tail) > 12:
+            _tg_suppressed_tail = _tg_suppressed_tail[-12:]
+        log(f"[TG compact] {text}")
+        if not _tg_matches(text, _TG_NOISY_PATTERNS):
+            _tg_maybe_digest(force=False)
 
 
 # 全局节流：任意两次 WeryAI POST 请求轻微错峰，避免多线程精确同一时刻打上游。
