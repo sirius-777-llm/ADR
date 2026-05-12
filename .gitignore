@@ -4,9 +4,11 @@
 *.pyc
 __pycache__/
 *.bak
+*.bak.*
 *.log
 /output/
 /tmp/
+voice_assets/
 # 密钥/token 类安全兜底（任何包含这些字符串的文件都不提交）
 *secret*
 *_token*

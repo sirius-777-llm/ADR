@@ -1,123 +1,165 @@
 # ADR — Automated Documentary Rendering
 
-ADR 是一套全自动纪录片短视频生成管线。给一个主题，输出一部带配音、字幕、BGM 的 16:9 横屏或 9:16 竖屏纪录片。
+ADR 是一套自动纪录片生成管线。输入一个主题或带时间戳的台词，输出带画面、配音、字幕、BGM 的横屏或竖屏视频，并把过程状态和成片推送到 Telegram。
 
-支持两种画幅：
-- **HDAR**（默认 `h`）：1280×720 横屏 16:9
-- **VDAR**（`v`）：720×1280 竖屏 9:16（自动切女声晓曼，面向中老年视频号）
+本 README 是 ADR 的产品契约：模式名、默认行为、质量兜底和禁止误触发规则必须和代码保持一致。每次改动 `run_adr_v8.py` 或 Telegram 启动器时，都要同步更新这里。
 
-扩展工作流：
-- **VADS**：`VDAR + --ads-reporter`，竖屏拟现场记者动态化短片（自动开启 WERYDANCE motion）
-- **HADS**：`HDAR + --ads-reporter`，横屏拟现场记者动态化纪录片（自动开启 WERYDANCE motion）
+## 当前模式
 
-## 架构（截至本 README 更新日）
+| 模式 | 画幅 | 触发 | 含义 |
+|---|---:|---|---|
+| `HDAR` | 16:9 | `h` | 横屏纪录片，默认模式 |
+| `VDAR` | 9:16 | `v` | 竖屏纪录片，偏短视频发布 |
+| `HADS` | 16:9 | `h --with-motion` | 横屏动态纪录片，WeryDance 逐分镜动态化 |
+| `VADS` | 9:16 | `v --with-motion` | 竖屏动态纪录片，WeryDance 逐分镜动态化 |
+| `HADSD` | 16:9 | `h --ads-dialogue` | 横屏多角色对话纪录片 |
+| `VADSD` | 9:16 | `v --ads-dialogue` | 竖屏多角色对话纪录片 |
 
+重要边界：
+
+- `HADS/VADS` 只表示“动态纪录片”，不等于现场记者。
+- 只有显式传 `--ads-reporter`，或用户明确说“拟现场记者 / 战地记者 / dispatch / 第一人称记者 / POV 记者”，才进入记者 POV。
+- `--ads-reporter` 会自动开启 `--with-motion`，但 `--with-motion` 不会反向开启记者。
+- `--ads-dialogue` 和 `--ads-reporter` 互斥；多角色对话优先。
+
+## 默认策略
+
+| 能力 | 默认 | 说明 |
+|---|---:|---|
+| GPT Image 2 故事板 | 开 | 主线分镜优先生成故事板和网格故事板 |
+| Storyboard reference motion | 开 | WeryDance 动态化优先吃 clean keyframe / storyboard 参考 |
+| Motion action storyboard | 开 | 每个分镜生成动作起点、过程、终点，避免人物发呆 |
+| Motion bridge refs | 开 | 为关键镜头补终点参考图，提升动作幅度 |
+| WeryDance 字幕 | 开 | 默认交给 WeryDance 生成字幕，ASS 硬字幕作为兜底 |
+| 音色资产库 | 开 | 男声默认罗翔，女声默认 BY2，可用环境变量覆盖 |
+| 严格音色锁定 | 开 | Motion prompt 会显式锁定声音资产和人物性别 |
+| BGM-only | 关 | `--bgm-only` 跳过 TTS，只保留画面、字幕、BGM |
+
+## 架构
+
+```text
+主题 / 台词输入
+  |
+  |-- Step 1: 剧本、考证、分镜
+  |   |-- 题材分析：文化、地域、年代、服饰、负面禁令
+  |   |-- 台词生成或外部台词解析：支持带时间戳文本
+  |   |-- 历史顾问：校准时代视觉，避免文化和年代穿帮
+  |   |-- 分镜提示词：画面、角色、镜头、情绪、动作
+  |
+  |-- Step 2: 配音 / 音色
+  |   |-- 普通 ADR：Podcast/TTS 生成整段音轨
+  |   |-- ADSD：逐 turn 配音，支持口型同步
+  |   |-- WeryDance audio-dub：可用音色资产参考音频完成视频内配音
+  |
+  |-- Step 3: 时间轴
+  |   |-- Whisper 字级时间戳
+  |   |-- 外部带时间戳台词优先
+  |   |-- 字幕、画面、音频按分镜对齐
+  |
+  |-- Step 4: 故事板
+  |   |-- GPT Image 2 单镜故事板
+  |   |-- 4K storyboard grid / 多 storyboard fallback
+  |   |-- crop QA，避免切到相邻格
+  |
+  |-- Step 5: 静态画面和封面
+  |   |-- 分镜图并发生成
+  |   |-- 失败重试，必要时重写 prompt
+  |   |-- Telegram 图片审批可选
+  |
+  |-- Step 6.5: WeryDance 动态化
+  |   |-- clean keyframe 优先，其次 annotated storyboard 实验模式
+  |   |-- 每镜头 motion prompt + 动作计划 + 可选终点参考
+  |   |-- 失败镜头保留静态兜底，不中断整片
+  |
+  |-- Step 7: 合成
+  |   |-- ffmpeg 拼接视频
+  |   |-- WeryDance 字幕优先，ASS 字幕兜底
+  |   |-- 配音、BGM 混音
+  |
+  `-- Step 8: QA 和交付
+      |-- motion_qa.json
+      |-- storyboard / crop / caption / voice QA
+      |-- Telegram 推送成片和文案
 ```
-主题输入
-  │
-  ├─ Step 1: 剧本 + 考证 + 画面规划
-  │    题材基调分析 (GEMINI_3_1_FLASH_LITE) → 紧张/温暖/中性 情绪基调
-  │    分镜规划师 (GEMINI_3_1_FLASH_LITE) → 动态决定 N 句分镜（6~22）
-  │    斯皮尔伯格 AI (GEMINI_3_1_FLASH_LITE) → 旁白台词 (3 次重试保障)
-  │    ★ 历史顾问 (CLAUDE_4_6_OPUS) → 时代视觉考证（服饰/建筑/器物/证据级外观）
-  │    姜文 AI (GEMINI_25_FLASH) → 情绪标签 + 历史准确的画面提示词
-  │    音频导演 (GEMINI_25_FLASH) → 从中文音色库智选（竖屏强制女声晓曼）
-  │
-  ├─ Step 2: 配音合成
-  │    WeryAI Podcast API → 单次请求生成完整音轨
-  │    content_status 轮询 (text-success → audio-success)
-  │    text-fail 自动重试 5 次；全失败降级 Edge TTS 兜底
-  │
-  ├─ Step 3-5: 时间轴对齐
-  │    Whisper (base 模型) 字级时间戳
-  │    char_time_map 语速曲线 + 二分查找 + 线性插值 → 每句精确起止
-  │    影视三层感知节奏：画面 → +0.2s 字幕 → +0.5s 配音（J-Cut）
-  │
-  ├─ Step 6: 并发媒体生成
-  │    20 路线程池: N 张 AI 画作 (GEMINI_3_1_FLASH_IMAGE / Nano Banana 2) + 1 段 BGM
-  │    全局 POST 节流锁 (5s 间隔, 防 Redis 限流)
-  │    图片重做：同 prompt 最多 3 次 → 超过则 GEMINI_25_FLASH 重写 prompt 最多 2 次
-  │    支持图片审批交互（Telegram InlineKeyboard）；`--skip-approval` 跳过
-  │
-  ├─ Step 6.5: 动态化（★ 新增，可选）
-  │    触发：CLI `--with-motion` 或 tool 参数 `with_motion=true`
-  │    ADS 拟现场记者模式：CLI `--ads-reporter`（自动开启 `--with-motion`）
-  │    WERYDANCE_2_0 × N 分镜并发（aspect 跟随 h/v）
-  │    GEMINI_25_FLASH 为每分镜生成英文 motion prompt
-  │    替换原 seg_N.mp4；per-scene 失败保留静态版，不中断流程
-  │    代价：耗时 +5-10 min，费用 +≈$2.5/条
-  │
-  ├─ Step 7-9: 合成
-  │    ffmpeg concat demuxer 拼接视频轨
-  │    ASS 硬字幕烧录 (Arial Unicode MS)
-  │    -itsoffset J-Cut 音画错位
-  │    配音 vol=1.5 + BGM vol=0.25 amix 混音；CRF 20 + medium preset
-  │
-  └─ Step 10: 推送
-       短标题 + 社媒文案 (GEMINI_25_FLASH) → Telegram 一键复制按钮
-       ★ 专属封面 (GEMINI_3_1_FLASH_IMAGE) → 中老年视频号红金大字报风，留白叠标题
-       成片 mp4 发送 Telegram（requests + curl 兜底 3 次重试）
-       全流程耗时统计
-```
-
-## 模型分工速查（实测代码，README 跟代码同步后）
-
-| 岗位 | 模型 | 备注 |
-|---|---|---|
-| 题材基调 / 分镜规划 / 台词生成 | `GEMINI_3_1_FLASH_LITE` | 最便宜，适合大量结构化输出 |
-| **历史顾问（视觉考证）** | **`CLAUDE_4_6_OPUS`** | 唯一升级到 Opus 的岗位，防穿帮 |
-| 姜文 / 音频导演 / prompt 重写 / 字幕拆句 / 社媒文案 / motion prompt | `GEMINI_25_FLASH` | 通用性价比 |
-| 图片生成（分镜图 + 封面） | `GEMINI_3_1_FLASH_IMAGE`（Nano Banana 2） | WeryAI 中转 |
-| 图生视频（Step 6.5） | `WERYDANCE_2_0` | 可选，默认关 |
-| 配音 | WeryAI Podcast API（晓曼 / 国栋 等）| text-fail 降级 Edge TTS |
-
-## 关键设计决策
-
-- **全部 LLM 调用通过 WeryAI `/chat/completions` 统一中转**（消除多供应商故障点）
-- **历史顾问单独用 Claude Opus**：历史穿帮成本最高，用最强模型兜底；其他岗位用 Gemini 省钱
-- **Whisper 时间对齐**：从贪心合并改为语速曲线插值，准确度显著提升
-- **动态化可选**：WERYDANCE 模型把 PPT 切换感变电影感，成本 10x 速度 2x，默认关
-- **ADS 拟现场记者模式**：`--ads-reporter` 自动开启动态化，把剧本、分镜和 motion prompt 统一为第一人称历史现场报道；严禁现代直播设备穿帮
-- **专属封面独立生成**：Step 10 里从 9 张分镜里不是随机抽两张，而是专门出一张中老年优化封面
 
 ## 快速开始
 
 ```bash
-# 设置环境变量
 export WERYAI_API_KEY="your-key"
 export TG_BOT_TOKEN="your-bot-token"
 export TG_CHAT_ID="your-chat-id"
 
-# 安装依赖
-pip install requests faster-whisper
-
-# 运行
-python3 run_adr_v8.py "1924年泰戈尔访华"
-
-# ADS 拟现场记者 + 动态化
-python3 run_adr_v8.py "1915年二十一条最后通牒与科技强权" v --ads-reporter
+python3 run_adr_v8.py "1924年泰戈尔访华" h
+python3 run_adr_v8.py "黄仁勋CMU毕业演讲核心内容" h --with-motion
+python3 run_adr_v8.py "1915年二十一条最后通牒" v --ads-reporter
+python3 run_adr_v8.py "AI时代就业市场访谈" h --ads-dialogue
+python3 run_adr_v8.py "江南春日风物" v --bgm-only --with-motion
 ```
 
-## 环境变量
+## 常用参数
 
-WERYAI_API_KEY — 必填, WeryAI API 密钥
-TG_BOT_TOKEN — 必填, Telegram Bot Token
-TG_CHAT_ID — 必填, Telegram Chat ID (状态推送)
-OUTPUT_DIR — 可选, 输出目录, 默认 /tmp/adr_v8_{timestamp}
+| 参数 | 用途 |
+|---|---|
+| `h` / `v` | 横屏 16:9 / 竖屏 9:16 |
+| `--with-motion` | 开启 WeryDance 动态化 |
+| `--ads-reporter` | 开启第一人称现场记者 POV |
+| `--no-ads-reporter` | 强制禁止 reporter |
+| `--ads-dialogue` | 开启多角色对话纪录片 |
+| `--adsd-lip-sync` | ADSD 口型同步实验 |
+| `--bgm-only` | 无旁白，仅画面、字幕、BGM |
+| `--skip-approval` | 跳过 Telegram 图片审批 |
+| `--speaker <id:name>` | 指定 Podcast 音色 |
 
-## 系统依赖
+## 关键环境变量
 
-Python 3.10+, ffmpeg/ffprobe, requests, faster-whisper
+| 变量 | 默认 | 用途 |
+|---|---:|---|
+| `ADR_GPT_IMAGE2_STORYBOARD` | `1` | 开关故事板 |
+| `ADR_DEFAULT_STORYBOARD_GRID` | `1` | 开关默认 storyboard grid |
+| `ADR_STORYBOARD_REFERENCE_MOTION` | `1` | 动态化使用故事板参考 |
+| `ADR_STORYBOARD_ANNOTATED_MOTION` | `0` | 使用 annotated storyboard 喂 WeryDance |
+| `ADR_MOTION_ACTION_STORYBOARD` | `1` | 动作计划故事板 |
+| `ADR_MOTION_BRIDGE_REFS` | `1` | 终点关键帧参考 |
+| `ADR_WERYDANCE_CAPTIONS` | `1` | WeryDance 字幕优先 |
+| `ADR_DEFAULT_MALE_VOICE_ASSET` | `external_luo_xiang_xyma_001` | 默认男声音色资产 |
+| `ADR_DEFAULT_FEMALE_VOICE_ASSET` | `external_by2_e7gn_001` | 默认女声音色资产 |
+| `ADR_DEFAULT_VOICE_ASSET` | 空 | 全局强制默认音色资产 |
+| `ADR_MOTION_VOICE_STRICT_LOCK` | `1` | 严格锁定音色和人物性别 |
+| `ADR_ADS_REPORTER_ALLOW_ENV` | 空 | 允许环境变量触发 reporter，默认不允许 |
+| `ADR_ADS_REPORTER` | 空 | reporter 环境开关，需配合上一项 |
 
-## 关键技术决策
+## 音色资产库
 
-1. 单次 Podcast 请求: 9 句合并为一次 API 调用, 避免并发限流
-2. content_status 轮询: WeryAI Podcast 必须检查 content_status 而非 task_status
-3. 语速曲线插值: char_time_map 记录累积字数→时间映射, 二分查找定位每句起止
-4. 全局 POST 节流: threading.Lock + 5s 间隔, 防 Redis 限流
-5. 影视三层感知: 画面先出 → +0.2s 字幕预读 → +0.5s 配音确认
-6. 历史考证注入: 画面提示词受时代视觉约束, 不凭空生成
-7. Gemini 统一: 全链路 Gemini 系列, 消除多供应商故障点
+音色资产配置位于 `voice_assets/voice_assets.json`。当前库中包含候选资产：
+
+- `external_luo_xiang_xyma_001`：罗翔，默认男声。
+- `external_by2_e7gn_001`：BY2，默认女声。
+- `external_xu_zhiyuan_xyma_001`：许知远，访谈/文化类备选。
+- `external_huang_renxun_fzh_001`：黄仁勋，英文科技领袖演讲备选。
+
+外部人物声音默认只允许内部测试和分析；公开发布、商业用途、拟真冒充必须另行做权利审查。
+
+## QA 检查点
+
+每次改管线后至少验证：
+
+- `python3 -m py_compile run_adr_v8.py`
+- HADS 不带 `--ads-reporter` 时，日志必须显示 `HDAR/VDAR`，不能出现“拟现场记者”。
+- `motion_qa.json` 里应记录参考图数量、字幕策略、音色策略。
+- storyboard crop QA 不能把两个分镜切在同一张输出里。
+- WeryDance 字幕失败时，ASS 兜底必须仍能合成。
+- 自定义音色任务要检查声音性别、画面人物性别、台词内容三者一致。
+
+## README 更新规则
+
+README 只写已经落地并通过基础 QA 的能力，不写愿景。每次新增默认开关或改变模式含义时，要同步更新四处：
+
+- `当前模式`
+- `默认策略`
+- `常用参数` 或 `关键环境变量`
+- `QA 检查点`
+
+任何会影响 TG bot 调用判断的规则，也要同步更新 `/Users/wekoidubai/telegram-claude-bot/tools/registry.py`。
 
 ## License
 
