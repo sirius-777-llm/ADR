@@ -243,6 +243,14 @@ VOICE_ASSET_AUDIO_DUB_EXPERIMENT = (
     and os.environ.get("ADR_VOICE_ASSET_AUDIO_DUB", "1").strip().lower() not in ("0", "false", "no", "off")
 )
 VOICE_ASSET_AUDIO_DUB_RESOLUTION = os.environ.get("ADR_VOICE_ASSET_AUDIO_DUB_RESOLUTION", "720p").strip() or "720p"
+MOTION_VISUAL_QA = (
+    "--no-motion-visual-qa" not in sys.argv
+    and os.environ.get("ADR_MOTION_VISUAL_QA", "1").strip().lower() not in ("0", "false", "no", "off")
+)
+MOTION_VISUAL_MIN_SCORE = float(os.environ.get("ADR_MOTION_VISUAL_MIN_SCORE", "1.2"))
+MOTION_VISUAL_SAMPLE_FPS = max(1, int(os.environ.get("ADR_MOTION_VISUAL_SAMPLE_FPS", "3")))
+MOTION_VISUAL_SAMPLE_WIDTH = max(64, int(os.environ.get("ADR_MOTION_VISUAL_SAMPLE_WIDTH", "160")))
+MOTION_VISUAL_IGNORE_BOTTOM_RATIO = min(0.45, max(0.0, float(os.environ.get("ADR_MOTION_VISUAL_IGNORE_BOTTOM_RATIO", "0.22"))))
 MOTION_VOICE_REPAIR = (
     "--motion-voice-repair" in sys.argv
     or "--voice-repair" in sys.argv
@@ -2230,6 +2238,7 @@ THUMBNAIL_ANCHOR: 封面视觉锚，用 4~6 个短语描述：主体、主色（
   - {'每张画面必须包含该板块的核心视觉元素' if almanac_data else '人物描述与制片人 Hero Anchor 完全一致（同一主角、同一发型、同一服饰）；场景取自 Setting Anchor' if tone == '轻松' else '人物的穿着、发型、体态必须符合该历史时期'}
   - ★ 中文元素渲染：如果制片人 VISUAL_CONTINUITY 里指定了 Chinese Text Anchors，在对应分镜号里，必须在画面自然位置（校牌 / 门楣 / 勋章 / 墙面 / 校徽）渲染这些中文字串。英文 prompt 里要用 `render the exact Chinese text "..."` 明确指令 Nano Banana 2
   - 每张图必须与对应台词内容直接相关，严禁出现与台词主题无关的画面
+  - ★ 动态素材优先：普通 ADR/HADS 不是全程口播头像。即使题材来自演讲/采访/人物传记，也最多少量使用讲台/正面发言镜头；其余必须优先给可运动 B-roll（人物走动、手部操作、设备运转、观众反应、场景穿行、道具特写、屏幕/机器/车辆/人群运动），避免连续静态 talking-head。
   - {'★ 黄历反 cliché：严禁"翻黄历的老者/老头/白须长袍老人"刻板形象出现在任何一张图里。默认无人（物件派）；允许人物的板块必须多样化（织女/医者/书生/农夫/神像/现代家庭），不得重复老者。英文 prompt 里可加 negative 指令 "no elderly man reading almanac, no white-bearded old scholar in robe"' if almanac_data else ''}
   - 最后一张图必须是{'明亮温馨的收尾场景（如孩子们的笑脸、阳光洒满场景、竖起大拇指、举手欢呼等），充满希望与祝福' if tone == '轻松' else '温馨收尾调性（如福字、红灯笼、家庭团圆、祝福场景）'}，与结尾祝语呼应
 
@@ -2366,6 +2375,11 @@ THUMBNAIL_ANCHOR: 封面视觉锚，用 4~6 个短语描述：主体、主色（
             )
         if neg_tag:
             prompt += f". Negative: {neg_tag}"
+        if not ADS_DIALOGUE_MODE:
+            prompt += (
+                ". Motion-ready shot design: avoid static talking-head or podium repetition; include one visible kinetic element "
+                "such as walking, hand operation, machinery, crowd reaction, screen interaction, fabric, smoke, dust, or a moving camera path"
+            )
         item = {
             "text": line,
             "emotion": emotion,
@@ -6022,6 +6036,10 @@ def _finalize_motion_qa(total: int, success_count: int) -> None:
             "generated_audio_segment_count": generated_audio_success,
             "embedded_voice_audio_ready": embedded_voice_audio_ready,
             "motion_action_storyboard_enabled": MOTION_ACTION_STORYBOARD,
+            "motion_visual_qa_enabled": MOTION_VISUAL_QA,
+            "motion_visual_min_score": MOTION_VISUAL_MIN_SCORE,
+            "motion_visual_sample_fps": MOTION_VISUAL_SAMPLE_FPS,
+            "motion_visual_ignore_bottom_ratio": MOTION_VISUAL_IGNORE_BOTTOM_RATIO,
             "voice_timbre_auto_verification": "not_available",
             "voice_timbre_manual_required_count": voice_timbre_manual_required,
             "voice_repair_enabled": MOTION_VOICE_REPAIR,
@@ -6101,6 +6119,78 @@ def _remove_lip_sync_task(idx: int):
         _lip_sync_tasks_file().write_text(json.dumps(tasks, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
+def _video_visual_motion_qa(path: str) -> dict:
+    qa = {
+        "enabled": MOTION_VISUAL_QA,
+        "sample_fps": MOTION_VISUAL_SAMPLE_FPS,
+        "sample_width": MOTION_VISUAL_SAMPLE_WIDTH,
+        "ignore_bottom_ratio": MOTION_VISUAL_IGNORE_BOTTOM_RATIO,
+        "min_score": MOTION_VISUAL_MIN_SCORE,
+        "sample_frames": 0,
+        "score": None,
+        "p90_score": None,
+        "pass": True,
+        "issues": [],
+    }
+    if not MOTION_VISUAL_QA:
+        return qa
+    if not os.path.exists(path) or os.path.getsize(path) < 10000:
+        qa.update({"pass": False})
+        qa["issues"].append("missing_or_too_small")
+        return qa
+    w, h = ffprobe_video_size(path)
+    if not w or not h:
+        qa.update({"pass": False})
+        qa["issues"].append("missing_video_dimensions")
+        return qa
+    sample_w = MOTION_VISUAL_SAMPLE_WIDTH
+    sample_h = max(36, int(round(sample_w * h / max(1, w))))
+    usable_h = max(1, int(sample_h * (1.0 - MOTION_VISUAL_IGNORE_BOTTOM_RATIO)))
+    frame_size = sample_w * sample_h
+    max_frames = max(8, min(90, MOTION_VISUAL_SAMPLE_FPS * 18))
+    try:
+        proc = subprocess.run(
+            [
+                "ffmpeg", "-v", "error", "-i", path,
+                "-vf", f"fps={MOTION_VISUAL_SAMPLE_FPS},scale={sample_w}:{sample_h},format=gray",
+                "-frames:v", str(max_frames),
+                "-f", "rawvideo", "-",
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=90,
+        )
+    except Exception as e:
+        qa.update({"pass": False})
+        qa["issues"].append(f"motion_probe_failed:{e}")
+        return qa
+    raw = proc.stdout or b""
+    frames = [raw[i:i + frame_size] for i in range(0, len(raw) - frame_size + 1, frame_size)]
+    qa["sample_frames"] = len(frames)
+    if len(frames) < 2:
+        qa.update({"pass": False, "score": 0.0, "p90_score": 0.0})
+        qa["issues"].append("insufficient_motion_frames")
+        return qa
+    usable_size = sample_w * usable_h
+    diffs = []
+    for prev, cur in zip(frames, frames[1:]):
+        total = 0
+        for row in range(usable_h):
+            start = row * sample_w
+            end = start + sample_w
+            total += sum(abs(a - b) for a, b in zip(prev[start:end], cur[start:end]))
+        diffs.append(total / usable_size)
+    diffs.sort()
+    score = sum(diffs) / len(diffs) if diffs else 0.0
+    p90 = diffs[min(len(diffs) - 1, int(len(diffs) * 0.9))] if diffs else 0.0
+    qa["score"] = round(score, 3)
+    qa["p90_score"] = round(p90, 3)
+    if score < MOTION_VISUAL_MIN_SCORE:
+        qa["pass"] = False
+        qa["issues"].append(f"visual_motion_too_low:{score:.3f}<min:{MOTION_VISUAL_MIN_SCORE:.3f}")
+    return qa
+
+
 def _motion_output_qa(path: str, target_dur: float | None = None) -> dict:
     qa = {
         "path": path,
@@ -6137,6 +6227,11 @@ def _motion_output_qa(path: str, target_dur: float | None = None) -> dict:
     qa["decode_pass"] = _video_decode_probe(path)
     if not qa["decode_pass"]:
         qa["issues"].append("decode_probe_failed")
+    visual_motion = _video_visual_motion_qa(path)
+    qa["visual_motion"] = visual_motion
+    qa["visual_motion_score"] = visual_motion.get("score")
+    if not visual_motion.get("pass", True):
+        qa["issues"].extend(f"visual_{x}" for x in visual_motion.get("issues", []))
     qa["pass"] = not qa["issues"]
     return qa
 
@@ -6543,6 +6638,7 @@ def _motion_audio_dub_prompt(scene: dict, motion_prompt: str, safe_retry: bool =
             f"{voice_lock}"
             f"Speak exactly this Chinese line and nothing else: 「{narration}」. "
             "The narration may be off-screen unless a clear speaker is visible. "
+            "Visible motion is mandatory: include a readable body, object, or camera movement beat; do not output a static portrait, freeze-frame, or only lip/subtitle movement. "
         )
         return (prompt[: max(0, 1000 - len(caption_instruction) - 24)] + caption_instruction + " No logos or watermarks.")[:1000]
     prompt = (
@@ -6552,6 +6648,8 @@ def _motion_audio_dub_prompt(scene: dict, motion_prompt: str, safe_retry: bool =
         f"{voice_lock}"
         f"Generate clear Mandarin narration speaking exactly this line and nothing else: 「{narration}」. "
         "If no speaker face is visible, treat the voice as off-screen narration; if a speaker is visible, keep mouth motion natural and understated. "
+        "Visible visual motion is mandatory: the subject, a prop, machinery, crowd, or the camera must complete a clear start-middle-end movement beat. "
+        "Do not create a static talking-photo, freeze-frame, or a shot where only subtitles or mouth pixels change. "
         f"Camera/action instruction: {visual}. "
     )
     tail = caption_instruction + " No on-screen labels, logos, watermarks, or storyboard pages."
