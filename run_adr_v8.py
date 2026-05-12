@@ -175,7 +175,7 @@ STORYBOARD_GRID_MULTIREF_MOTION = (
 )
 STORYBOARD_GRID_MULTIREF_SEGMENTS = (
     "--use-grid-multiref-segments" in sys.argv
-    or os.environ.get("ADR_STORYBOARD_GRID_MULTIREF_SEGMENTS", "").strip().lower() in ("1", "true", "yes", "on")
+    and "--no-grid-multiref-segments" not in sys.argv
 )
 PREVIS_PAGE_MOTION = (
     "--with-previs-page-motion" in sys.argv
@@ -261,9 +261,16 @@ if ADSD_LIPS_CHANGE_ALL:
 # 该模式自动开启 --with-motion，并约束剧本、分镜与 motion prompt；
 # 注意它是"拟现场报道"，不是现代直播，严禁手机/电视台/现代麦克风穿帮。
 ADS_REPORTER_MODE = (
-    "--ads-reporter" in sys.argv
-    or "--first-person-reporter" in sys.argv
-    or os.environ.get("ADR_ADS_REPORTER", "").strip().lower() in ("1", "true", "yes", "on")
+    "--no-ads-reporter" not in sys.argv
+    and "--no-first-person-reporter" not in sys.argv
+    and (
+        "--ads-reporter" in sys.argv
+        or "--first-person-reporter" in sys.argv
+        or (
+            os.environ.get("ADR_ADS_REPORTER_ALLOW_ENV", "").strip().lower() in ("1", "true", "yes", "on")
+            and os.environ.get("ADR_ADS_REPORTER", "").strip().lower() in ("1", "true", "yes", "on")
+        )
+    )
 )
 if ADS_REPORTER_MODE:
     WITH_MOTION = True
@@ -3718,6 +3725,65 @@ def _render_still_segment(scene: dict, timeout: int = 30) -> None:
     )
 
 
+def _scene_text_visual_alignment(scene: dict, idx: int) -> dict:
+    text = str(scene.get("text") or "")
+    prompt = str(scene.get("prompt") or "")
+    prompt_l = prompt.lower()
+    tokens = []
+    tokens.extend(re.findall(r"[A-Za-z][A-Za-z0-9_\-]{2,}", text))
+    tokens.extend(re.findall(r"\d{2,4}(?:年|月|日)?", text))
+    tokens.extend(re.findall(r"[\u4e00-\u9fff]{2,6}", text))
+    stop = {
+        "这个", "那个", "他们", "我们", "你们", "一个", "一种", "不是", "就是", "因为", "所以", "但是", "如果",
+        "今天", "历史", "时候", "事情", "真正", "所有", "可能", "没有", "已经", "开始", "最后", "中国",
+    }
+    dedup = []
+    for token in tokens:
+        t = token.strip()
+        if not t or t in stop or len(t) < 2:
+            continue
+        if t not in dedup:
+            dedup.append(t)
+    core = dedup[:10]
+    matched = [t for t in core if t.lower() in prompt_l or t in prompt]
+    min_match = 1 if len(core) <= 3 else 2
+    pass_flag = len(matched) >= min_match or not core
+    return {
+        "scene": idx + 1,
+        "pass": pass_flag,
+        "text": text[:160],
+        "core_terms": core,
+        "matched_terms": matched,
+        "match_count": len(matched),
+        "required_match_count": min_match,
+        "prompt_excerpt": prompt[:260],
+        "reason": "" if pass_flag else "dialogue_core_terms_not_reflected_in_visual_prompt",
+    }
+
+
+def _write_text_visual_alignment_qa(script: list[dict]) -> dict:
+    records = [_scene_text_visual_alignment(scene, i) for i, scene in enumerate(script)]
+    failed = [r for r in records if not r.get("pass")]
+    payload = {
+        "mode": ADSD_MODE_NAME if ADS_DIALOGUE_MODE else ("VDAR" if IS_VERTICAL else "HDAR"),
+        "policy": "warn_on_dialogue_visual_prompt_mismatch",
+        "total": len(records),
+        "failed_count": len(failed),
+        "failed_scenes": [r.get("scene") for r in failed],
+        "pass": len(failed) == 0,
+        "records": records,
+        "created_at": datetime.now().isoformat(timespec="seconds"),
+    }
+    try:
+        (OUTPUT_DIR / "text_visual_alignment_qa.json").write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+    except Exception as e:
+        log(f"text_visual_alignment_qa.json 写入失败: {e}")
+    return payload
+
+
 def generate_image(scene: dict, idx: int, _max_retries: int = 3) -> int:
     last_err = None
     for attempt in range(_max_retries):
@@ -4356,10 +4422,61 @@ def _qa_clean_storyboard_panel(path: Path) -> dict:
         qa["lower_center_marker_component_ratio"] = round(lower_components["marker_ratio"], 4)
         qa["lower_center_marker_aspect"] = round(lower_components["marker_aspect"], 2)
         qa["lower_center_marker_fill"] = round(lower_components["marker_fill"], 2)
+        small_w = 320
+        small_h = max(1, int(round(small_w * H / max(W, 1))))
+        small = im.resize((small_w, small_h))
+        spix = small.load()
+        vertical_separator_columns = []
+        for x in range(int(small_w * 0.08), int(small_w * 0.92)):
+            bright = 0
+            dark = 0
+            for y in range(int(small_h * 0.06), int(small_h * 0.94)):
+                v = spix[x, y]
+                if v > 242:
+                    bright += 1
+                elif v < 13:
+                    dark += 1
+            denom = max(1, int(small_h * 0.88))
+            if max(bright, dark) / denom > 0.72:
+                vertical_separator_columns.append(x)
+        horizontal_separator_rows = []
+        for y in range(int(small_h * 0.08), int(small_h * 0.92)):
+            bright = 0
+            dark = 0
+            for x in range(int(small_w * 0.06), int(small_w * 0.94)):
+                v = spix[x, y]
+                if v > 242:
+                    bright += 1
+                elif v < 13:
+                    dark += 1
+            denom = max(1, int(small_w * 0.88))
+            if max(bright, dark) / denom > 0.72:
+                horizontal_separator_rows.append(y)
+
+        def compact_runs(vals: list[int]) -> list[tuple[int, int]]:
+            if not vals:
+                return []
+            runs = []
+            start = prev = vals[0]
+            for val in vals[1:]:
+                if val <= prev + 1:
+                    prev = val
+                    continue
+                runs.append((start, prev))
+                start = prev = val
+            runs.append((start, prev))
+            return runs
+
+        qa["interior_vertical_separator_runs"] = compact_runs(vertical_separator_columns)
+        qa["interior_horizontal_separator_runs"] = compact_runs(horizontal_separator_rows)
         if min(qa["top_black_ratio"], qa["bottom_black_ratio"]) > 0.42:
             qa["issues"].append("possible_horizontal_letterbox")
         if min(qa["left_black_ratio"], qa["right_black_ratio"]) > 0.42:
             qa["issues"].append("possible_vertical_letterbox")
+        if qa["interior_vertical_separator_runs"]:
+            qa["issues"].append("possible_vertical_panel_separator_bleed")
+        if qa["interior_horizontal_separator_runs"]:
+            qa["issues"].append("possible_horizontal_panel_separator_bleed")
         if 0.002 <= qa["top_left_bright_component_ratio"] <= 0.09 and qa["top_left_bright_ratio"] > 0.015:
             qa["issues"].append("possible_shot_number_residue")
         if qa["lower_center_bright_ratio"] > 0.015 and qa["lower_center_marker_component_ratio"] > 0.0015:
@@ -4376,9 +4493,9 @@ def _crop_storyboard_grid_panels(grid_path: Path, batch_script: list[dict], star
     W, H = im.size
     cell_w = W / cols
     cell_h = H / rows
-    inset_x = max(10, int(cell_w * float(os.environ.get("ADR_STORYBOARD_GRID_CROP_INSET_X", "0.045"))))
-    inset_top = max(10, int(cell_h * float(os.environ.get("ADR_STORYBOARD_GRID_CROP_INSET_TOP", "0.13"))))
-    inset_bottom = max(10, int(cell_h * float(os.environ.get("ADR_STORYBOARD_GRID_CROP_INSET_BOTTOM", "0.045"))))
+    inset_x = max(16, int(cell_w * float(os.environ.get("ADR_STORYBOARD_GRID_CROP_INSET_X", "0.075"))))
+    inset_top = max(16, int(cell_h * float(os.environ.get("ADR_STORYBOARD_GRID_CROP_INSET_TOP", "0.16"))))
+    inset_bottom = max(16, int(cell_h * float(os.environ.get("ADR_STORYBOARD_GRID_CROP_INSET_BOTTOM", "0.075"))))
     qa_batch["grid_width"] = W
     qa_batch["grid_height"] = H
     qa_batch["crop_inset_x"] = inset_x
@@ -4393,6 +4510,7 @@ def _crop_storyboard_grid_panels(grid_path: Path, batch_script: list[dict], star
         top = int(row * cell_h) + inset_top
         right = int((col + 1) * cell_w) - inset_x
         bottom = int((row + 1) * cell_h) - inset_bottom
+        crop_box = (left, top, right, bottom)
         crop = im.crop((left, top, right, bottom))
         target_w = VIDEO_W
         target_h = VIDEO_H
@@ -4408,6 +4526,7 @@ def _crop_storyboard_grid_panels(grid_path: Path, batch_script: list[dict], star
             "scene": start + local_i + 1,
             "row": row + 1,
             "col": col + 1,
+            "crop_box": crop_box,
             "path": str(panel_path),
             "bytes": panel_path.stat().st_size if panel_path.exists() else 0,
             **qa,
@@ -4531,11 +4650,18 @@ def generate_storyboard_grid_gpt_image2(script: list[dict], topic: str) -> bool:
                 batch_qa["rendered_count"] = rendered
                 batch_qa["materialized_count"] = materialized
                 batch_qa["pass"] = rendered == len(batch_script)
-                if not batch_qa["pass"] and materialized == len(batch_script):
-                    batch_qa["accepted_with_qa_warnings"] = True
-                    batch_qa["pass"] = True
                 if not batch_qa["pass"]:
                     batch_qa["reason"] = "crop_incomplete"
+                    failed_panels = [
+                        {
+                            "scene": r.get("scene"),
+                            "issues": r.get("issues", []),
+                            "crop_box": r.get("crop_box"),
+                        }
+                        for r in batch_qa.get("panel_records", [])
+                        if not r.get("pass")
+                    ]
+                    batch_qa["failed_panels"] = failed_panels
                     if current_size > 1:
                         next_size = max(1, current_size // 2)
                         batch_qa["retry_with_smaller_grid"] = next_size
@@ -4544,15 +4670,14 @@ def generate_storyboard_grid_gpt_image2(script: list[dict], topic: str) -> bool:
                             "scene_end": end,
                             "from_size": current_size,
                             "to_size": next_size,
-                            "reason": "crop_incomplete",
+                            "reason": "crop_incomplete_or_panel_bleed",
+                            "failed_panels": failed_panels,
                         })
                         current_size = next_size
                         continue
                     qa["issues"].append(f"batch_{batch_idx}_crop_incomplete")
                     raise RuntimeError(f"storyboard grid batch {batch_idx} crop incomplete")
                 qa["rendered_count"] += rendered if rendered == len(batch_script) else materialized
-                if batch_qa.get("accepted_with_qa_warnings"):
-                    qa.setdefault("warnings", []).append(f"batch_{batch_idx}_accepted_with_crop_qa_warnings")
                 start = end
                 submitted_current_start = True
                 break
@@ -4919,6 +5044,12 @@ def step6_parallel(script: list[dict], topic: str, pregenerated_bgm_path: str | 
 
         generate_gpt_image2_direct_annotated_storyboards(script, topic)
         if script:
+            alignment_qa = _write_text_visual_alignment_qa(script)
+            if alignment_qa.get("failed_count"):
+                tg(
+                    f"⚠️ 台词-分镜绑定 QA 提醒：{alignment_qa.get('failed_count')}/{alignment_qa.get('total')} 镜疑似不匹配，"
+                    f"场次 {alignment_qa.get('failed_scenes')}；已记录 text_visual_alignment_qa.json"
+                )
             _write_cultural_visual_qa(script, script[0].get("topic_meta", {}))
             _write_adsd_gender_voice_qa(script)
 
@@ -6440,6 +6571,26 @@ def _apply_grid_multiref_segments(script: list[dict], motion_qa: dict | None) ->
     """Experimental mainline: split successful multi-ref chunks back into seg_N.mp4 files."""
     if not STORYBOARD_GRID_MULTIREF_SEGMENTS or ADS_DIALOGUE_MODE:
         return None
+    if os.environ.get("ADR_UNSAFE_ALLOW_GRID_MULTIREF_PROPORTIONAL_SPLIT", "").strip().lower() not in ("1", "true", "yes", "on"):
+        qa = {
+            "mode": "grid_multiref_video_split_to_main_segments",
+            "enabled": True,
+            "pass": False,
+            "reason": "disabled_by_default_proportional_split_can_mix_adjacent_storyboard_shots",
+            "policy": "do_not_replace_main_timeline_without_verified_shot_boundaries",
+            "records": [],
+            "manual_visual_checks_required": [
+                "shot_boundary_timestamps_verified",
+                "each_output_segment_contains_only_its_own_storyboard_panel",
+                "no_adjacent_panel_bleed",
+                "segment_start_end_match_script_timeline",
+            ],
+            "created_at": datetime.now().isoformat(timespec="seconds"),
+            "finalized_at": datetime.now().isoformat(timespec="seconds"),
+        }
+        _write_grid_multiref_segment_qa(qa)
+        tg("⚠️ Grid multi-ref 主线切片已阻断：比例切分会混入相邻分镜，改走逐镜 WeryDance/静态兜底")
+        return qa
     records = (motion_qa or {}).get("records") or []
     qa = {
         "mode": "grid_multiref_video_split_to_main_segments",
