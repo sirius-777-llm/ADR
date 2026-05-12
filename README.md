@@ -131,6 +131,8 @@ python3 run_adr_v8.py "江南春日风物" v --bgm-only --with-motion
 | `ADR_TG_PROGRESS_MODE` | `dashboard` | TG 推送模式：`dashboard` / `compact` / `verbose` / `silent` |
 | `ADR_TG_DIGEST_INTERVAL_SEC` | `120` | compact 模式下过程摘要最小间隔 |
 | `ADR_TG_DASHBOARD_EDIT_INTERVAL_SEC` | `8` | dashboard 模式下进度面板最小编辑间隔 |
+| `ADR_GPT_IMAGE2_STORYBOARD_GRID_SUBMIT_STAGGER` | `12` | storyboard grid 任务错峰提交间隔，避免同时请求 |
+| `ADR_GPT_IMAGE2_STORYBOARD_GRID_POLL_WORKERS` | `20` | storyboard grid 提交后并发轮询/下载/裁剪 worker 数 |
 
 ## Telegram 进度策略
 

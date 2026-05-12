@@ -5092,6 +5092,8 @@ def generate_storyboard_grid_gpt_image2(script: list[dict], topic: str) -> bool:
     batch_size = max(1, min(16, int(os.environ.get("ADR_GPT_IMAGE2_STORYBOARD_GRID_BATCH", "16"))))
     prompt_limit = _storyboard_grid_prompt_limit()
     poll_max = float(os.environ.get("ADR_GPT_IMAGE2_STORYBOARD_GRID_POLL_MAX", "300"))
+    submit_stagger_sec = max(0.0, float(os.environ.get("ADR_GPT_IMAGE2_STORYBOARD_GRID_SUBMIT_STAGGER", "12")))
+    poll_workers = max(1, min(20, int(os.environ.get("ADR_GPT_IMAGE2_STORYBOARD_GRID_POLL_WORKERS", "20"))))
     qa = {
         "mode": "gpt_image2_storyboard_grid_4k",
         "enabled": True,
@@ -5104,49 +5106,147 @@ def generate_storyboard_grid_gpt_image2(script: list[dict], topic: str) -> bool:
         "rendered_count": 0,
         "batches": [],
         "issues": [],
+        "submit_stagger_sec": submit_stagger_sec,
+        "poll_workers": poll_workers,
         "policy": "adaptive_multi_4k_grid_generate_then_crop_clean_panels_for_motion_refs",
         "created_at": datetime.now().isoformat(timespec="seconds"),
     }
     try:
-        start = 0
         batch_idx = 0
-        while start < n:
-            current_size = min(batch_size, n - start)
-            submitted_current_start = False
-            while current_size >= 1:
-                end = min(n, start + current_size)
-                batch_script = script[start:end]
-                cols, rows = _storyboard_grid_cols_rows(len(batch_script))
-                prompt = _storyboard_grid_prompt(batch_script, start, n, topic, cols, rows, aspect)
-                if len(prompt) > prompt_limit and current_size > 1:
-                    next_size = max(1, current_size // 2)
-                    qa.setdefault("adaptive_splits", []).append({
-                        "scene_start": start + 1,
-                        "scene_end": end,
-                        "from_size": current_size,
-                        "to_size": next_size,
-                        "reason": f"prompt_too_long:{len(prompt)}>{prompt_limit}",
+        passed_scenes: set[int] = set()
+
+        def make_jobs(range_start: int, range_end: int, max_size: int, reason: str) -> list[dict]:
+            jobs = []
+            cur = range_start
+            while cur < range_end:
+                current_size = min(max(1, max_size), range_end - cur)
+                while current_size >= 1:
+                    end = min(range_end, cur + current_size)
+                    batch_script = script[cur:end]
+                    cols, rows = _storyboard_grid_cols_rows(len(batch_script))
+                    prompt = _storyboard_grid_prompt(batch_script, cur, n, topic, cols, rows, aspect)
+                    if len(prompt) > prompt_limit and current_size > 1:
+                        next_size = max(1, current_size // 2)
+                        qa.setdefault("adaptive_splits", []).append({
+                            "scene_start": cur + 1,
+                            "scene_end": end,
+                            "from_size": current_size,
+                            "to_size": next_size,
+                            "reason": f"prompt_too_long:{len(prompt)}>{prompt_limit}",
+                        })
+                        current_size = next_size
+                        continue
+                    if len(prompt) > 10000:
+                        prompt = prompt[:10000]
+                        qa.setdefault("warnings", []).append(f"scene_{cur+1}_{end}_prompt_hard_truncated")
+                    jobs.append({
+                        "start": cur,
+                        "end": end,
+                        "batch_script": batch_script,
+                        "cols": cols,
+                        "rows": rows,
+                        "prompt": prompt,
+                        "reason": reason,
                     })
-                    current_size = next_size
-                    continue
-                if len(prompt) > 10000:
-                    prompt = prompt[:10000]
-                    qa.setdefault("warnings", []).append(f"scene_{start+1}_{end}_prompt_hard_truncated")
+                    cur = end
+                    break
+                else:
+                    raise RuntimeError(f"storyboard grid prompt split failed at scene {cur + 1}")
+            return jobs
+
+        def poll_and_materialize(entry: dict) -> tuple[dict, list[dict], list[int]]:
+            batch_qa = entry["batch_qa"]
+            job = entry["job"]
+            task_id = batch_qa["task_id"]
+            data = poll_storyboard_task(task_id, f"GPT Image 2 storyboard grid {batch_qa['batch']}", poll_max)
+            urls = _extract_img_urls(data)
+            if not urls:
+                batch_qa["reason"] = "succeed_without_image_url"
+                qa["issues"].append(f"batch_{batch_qa['batch']}_without_image_url")
+                raise RuntimeError(batch_qa["reason"])
+            grid_path = OUTPUT_DIR / f"storyboard_grid_{batch_qa['batch']:02d}.png"
+            urllib.request.urlretrieve(urls[0], grid_path)
+            batch_qa["grid_path"] = str(grid_path)
+            batch_qa["grid_bytes"] = grid_path.stat().st_size if grid_path.exists() else 0
+            _crop_storyboard_grid_panels(
+                grid_path,
+                job["batch_script"],
+                job["start"],
+                job["cols"],
+                job["rows"],
+                batch_qa,
+            )
+            rendered = sum(1 for r in batch_qa.get("panel_records", []) if r.get("pass"))
+            materialized = sum(
+                1
+                for r in batch_qa.get("panel_records", [])
+                if r.get("bytes", 0) > 10000
+            )
+            batch_qa["rendered_count"] = rendered
+            batch_qa["materialized_count"] = materialized
+            batch_qa["pass"] = rendered == len(job["batch_script"])
+            if batch_qa["pass"]:
+                return batch_qa, [], list(range(job["start"] + 1, job["end"] + 1))
+
+            batch_qa["reason"] = "crop_incomplete"
+            failed_panels = [
+                {
+                    "scene": r.get("scene"),
+                    "issues": r.get("issues", []),
+                    "crop_box": r.get("crop_box"),
+                }
+                for r in batch_qa.get("panel_records", [])
+                if not r.get("pass")
+            ]
+            batch_qa["failed_panels"] = failed_panels
+            current_size = job["end"] - job["start"]
+            if current_size > 1:
+                next_size = max(1, current_size // 2)
+                batch_qa["retry_with_smaller_grid"] = next_size
+                qa.setdefault("adaptive_splits", []).append({
+                    "scene_start": job["start"] + 1,
+                    "scene_end": job["end"],
+                    "from_size": current_size,
+                    "to_size": next_size,
+                    "reason": "crop_incomplete_or_panel_bleed",
+                    "failed_panels": failed_panels,
+                })
+                return batch_qa, make_jobs(job["start"], job["end"], next_size, "crop_retry"), []
+            qa["issues"].append(f"batch_{batch_qa['batch']}_crop_incomplete")
+            raise RuntimeError(f"storyboard grid batch {batch_qa['batch']} crop incomplete")
+
+        pending_jobs = make_jobs(0, n, batch_size, "initial")
+        wave_no = 0
+        while pending_jobs:
+            wave_no += 1
+            qa.setdefault("waves", []).append({
+                "wave": wave_no,
+                "job_count": len(pending_jobs),
+                "submit_stagger_sec": submit_stagger_sec,
+            })
+            submitted = []
+            for job_i, job in enumerate(pending_jobs):
                 batch_idx += 1
                 batch_qa = {
                     "batch": batch_idx,
-                    "scene_start": start + 1,
-                    "scene_end": end,
-                    "grid": f"{cols}x{rows}",
-                    "panel_count": len(batch_script),
-                    "prompt_chars": len(prompt),
+                    "wave": wave_no,
+                    "scene_start": job["start"] + 1,
+                    "scene_end": job["end"],
+                    "grid": f"{job['cols']}x{job['rows']}",
+                    "panel_count": len(job["batch_script"]),
+                    "prompt_chars": len(job["prompt"]),
+                    "submit_stagger_sec": submit_stagger_sec if job_i > 0 else 0.0,
+                    "source_reason": job.get("reason"),
                     "task_id": None,
                     "pass": False,
                 }
                 qa["batches"].append(batch_qa)
+                if job_i > 0 and submit_stagger_sec > 0:
+                    log(f"GPT Image 2 storyboard grid 错峰提交等待 {submit_stagger_sec:.1f}s（{job_i+1}/{len(pending_jobs)}）")
+                    time.sleep(submit_stagger_sec)
                 r = submit_text_to_image({
                     "model": "GPT_IMAGE_2",
-                    "prompt": prompt,
+                    "prompt": job["prompt"],
                     "aspect_ratio": aspect,
                     "image_number": 1,
                     "quality": "high",
@@ -5155,74 +5255,36 @@ def generate_storyboard_grid_gpt_image2(script: list[dict], topic: str) -> bool:
                 batch_qa["task_id"] = task_id
                 if not task_id:
                     batch_qa["reason"] = f"submit_without_task_id: {json.dumps(r, ensure_ascii=False)[:200]}"
+                    current_size = job["end"] - job["start"]
                     if current_size > 1 and _is_prompt_limit_response(r):
                         next_size = max(1, current_size // 2)
                         batch_qa["retry_with_smaller_grid"] = next_size
                         qa.setdefault("adaptive_splits", []).append({
-                            "scene_start": start + 1,
-                            "scene_end": end,
+                            "scene_start": job["start"] + 1,
+                            "scene_end": job["end"],
                             "from_size": current_size,
                             "to_size": next_size,
                             "reason": "api_prompt_limit",
                         })
-                        current_size = next_size
+                        submitted.extend({"job": retry_job, "batch_qa": None, "retry_without_task": True} for retry_job in make_jobs(job["start"], job["end"], next_size, "api_prompt_limit_retry"))
                         continue
                     qa["issues"].append(f"batch_{batch_idx}_submit_without_task_id")
                     raise RuntimeError(batch_qa["reason"])
-                data = poll_storyboard_task(task_id, f"GPT Image 2 storyboard grid {batch_idx}", poll_max)
-                urls = _extract_img_urls(data)
-                if not urls:
-                    batch_qa["reason"] = "succeed_without_image_url"
-                    qa["issues"].append(f"batch_{batch_idx}_without_image_url")
-                    raise RuntimeError(batch_qa["reason"])
-                grid_path = OUTPUT_DIR / f"storyboard_grid_{batch_idx:02d}.png"
-                urllib.request.urlretrieve(urls[0], grid_path)
-                batch_qa["grid_path"] = str(grid_path)
-                batch_qa["grid_bytes"] = grid_path.stat().st_size if grid_path.exists() else 0
-                _crop_storyboard_grid_panels(grid_path, batch_script, start, cols, rows, batch_qa)
-                rendered = sum(1 for r in batch_qa.get("panel_records", []) if r.get("pass"))
-                materialized = sum(
-                    1
-                    for r in batch_qa.get("panel_records", [])
-                    if r.get("bytes", 0) > 10000
-                )
-                batch_qa["rendered_count"] = rendered
-                batch_qa["materialized_count"] = materialized
-                batch_qa["pass"] = rendered == len(batch_script)
-                if not batch_qa["pass"]:
-                    batch_qa["reason"] = "crop_incomplete"
-                    failed_panels = [
-                        {
-                            "scene": r.get("scene"),
-                            "issues": r.get("issues", []),
-                            "crop_box": r.get("crop_box"),
-                        }
-                        for r in batch_qa.get("panel_records", [])
-                        if not r.get("pass")
-                    ]
-                    batch_qa["failed_panels"] = failed_panels
-                    if current_size > 1:
-                        next_size = max(1, current_size // 2)
-                        batch_qa["retry_with_smaller_grid"] = next_size
-                        qa.setdefault("adaptive_splits", []).append({
-                            "scene_start": start + 1,
-                            "scene_end": end,
-                            "from_size": current_size,
-                            "to_size": next_size,
-                            "reason": "crop_incomplete_or_panel_bleed",
-                            "failed_panels": failed_panels,
-                        })
-                        current_size = next_size
-                        continue
-                    qa["issues"].append(f"batch_{batch_idx}_crop_incomplete")
-                    raise RuntimeError(f"storyboard grid batch {batch_idx} crop incomplete")
-                qa["rendered_count"] += rendered if rendered == len(batch_script) else materialized
-                start = end
-                submitted_current_start = True
-                break
-            if not submitted_current_start:
-                raise RuntimeError(f"storyboard grid failed at scene {start + 1}")
+                submitted.append({"job": job, "batch_qa": batch_qa})
+
+            retry_jobs = [entry["job"] for entry in submitted if entry.get("retry_without_task")]
+            poll_entries = [entry for entry in submitted if entry.get("batch_qa") and entry["batch_qa"].get("task_id")]
+            if poll_entries:
+                with ThreadPoolExecutor(max_workers=min(poll_workers, len(poll_entries))) as ex:
+                    futs = [ex.submit(poll_and_materialize, entry) for entry in poll_entries]
+                    for fut in as_completed(futs):
+                        _batch_qa, more_retry_jobs, scenes = fut.result()
+                        retry_jobs.extend(more_retry_jobs)
+                        passed_scenes.update(scenes)
+                        qa["rendered_count"] = len(passed_scenes)
+            pending_jobs = retry_jobs
         qa["used"] = True
+        qa["rendered_count"] = len(passed_scenes)
         qa["pass"] = qa["rendered_count"] == n
         tg(f"🧩 GPT Image 2 4K storyboard multi-grid 成功：{qa['rendered_count']}/{n} 格已裁成 clean refs（{batch_idx} 张 grid）")
         return qa["pass"]
