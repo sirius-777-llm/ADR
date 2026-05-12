@@ -186,6 +186,10 @@ STORYBOARD_TRAILER_MODE = (
     or "--with-storyboard-trailer" in sys.argv
     or os.environ.get("ADR_STORYBOARD_TRAILER_MODE", "").strip().lower() in ("1", "true", "yes", "on")
 )
+MOTION_ACTION_STORYBOARD = (
+    "--no-motion-action-storyboard" not in sys.argv
+    and os.environ.get("ADR_MOTION_ACTION_STORYBOARD", "1").strip().lower() not in ("0", "false", "no", "off")
+)
 CHARACTER_TRAILER_MODE = (
     "--character-trailer-mode" in sys.argv
     or "--with-character-trailer" in sys.argv
@@ -232,6 +236,16 @@ VOICE_ASSET_AUDIO_DUB_EXPERIMENT = (
     and os.environ.get("ADR_VOICE_ASSET_AUDIO_DUB", "1").strip().lower() not in ("0", "false", "no", "off")
 )
 VOICE_ASSET_AUDIO_DUB_RESOLUTION = os.environ.get("ADR_VOICE_ASSET_AUDIO_DUB_RESOLUTION", "720p").strip() or "720p"
+MOTION_VOICE_REPAIR = (
+    "--motion-voice-repair" in sys.argv
+    or "--voice-repair" in sys.argv
+    or os.environ.get("ADR_MOTION_VOICE_REPAIR", "").strip().lower() in ("1", "true", "yes", "on")
+)
+MOTION_VOICE_STRICT_LOCK = (
+    "--motion-voice-strict" in sys.argv
+    or "--voice-strict" in sys.argv
+    or os.environ.get("ADR_MOTION_VOICE_STRICT_LOCK", "1").strip().lower() not in ("0", "false", "no", "off")
+)
 WERYDANCE_CAPTIONS = (
     not NO_VOICE
     and "--with-ass-subtitles" not in sys.argv
@@ -2205,6 +2219,7 @@ THUMBNAIL_ANCHOR: 封面视觉锚，用 4~6 个短语描述：主体、主色（
         emotion_count[emotion] = emotion_count.get(emotion, 0) + 1
 
     emotion_summary = " / ".join(f"{k}×{v}" for k, v in emotion_count.items())
+    _ensure_motion_action_plan(script)
     tg(f"✅ 画面提示词就绪，情绪标签分布：{emotion_summary}")
 
     # 音色选择：根据主题和情绪由 LLM 推荐最合适的音色
@@ -3851,6 +3866,128 @@ def _write_text_visual_alignment_qa(script: list[dict]) -> dict:
     return payload
 
 
+def _scene_motion_action_plan(scene: dict, idx: int) -> dict:
+    """Build a reusable action beat for storyboard, motion prompt, and QA."""
+    if not MOTION_ACTION_STORYBOARD:
+        return {}
+    text = re.sub(r"\s+", " ", str(scene.get("text") or "")).strip()
+    visual = re.sub(r"\s+", " ", str(scene.get("shot") or scene.get("prompt") or "")).strip()
+    src = f"{text} {visual}"
+    lowered = src.lower()
+
+    def has(*words: str) -> bool:
+        return any(w in src or w.lower() in lowered for w in words)
+
+    if has("剑", "刀", "战", "军", "冲", "杀", "追", "火", "爆", "危", "怒", "纷争", "恩怨"):
+        action = "the figure snaps into a decisive martial or confrontational gesture, fabric and dust reacting as tension rises"
+        camera = "handheld push-in, short whip-pan into a low-angle parallax slide, then rack focus to the weapon or hand"
+        speed = "fast"
+        energy = 0.9
+        sfx = "cloth snap, footstep hit, blade air, tense room tone"
+    elif has("无人机", "拖拉机", "机器人", "工厂", "农机", "导弹", "汽车", "压铸", "AGV", "生产线"):
+        action = "machines move through frame with one clear operational beat, arms, vehicles, belts, or drones completing a visible task"
+        camera = "tracking move alongside the machine, foreground parallax, quick rack focus from operator interface to moving hardware"
+        speed = "medium-fast"
+        energy = 0.82
+        sfx = "servo motors, engine hum, conveyor rhythm, pneumatic hits"
+    elif has("说", "讲", "问", "知道", "意味着", "道路", "本心", "逍遥", "智慧", "未来"):
+        action = "the speaker changes posture, raises a hand, points to a meaningful object, or turns toward the listener on the key phrase"
+        camera = "medium close tracking push with over-the-shoulder parallax and a clean rack focus to hands, eyes, or a prop"
+        speed = "medium"
+        energy = 0.68
+        sfx = "breath, sleeve movement, ambient room tone"
+    elif has("看", "记忆", "历史", "时代", "开朗", "释然", "平和"):
+        action = "the subject shifts from stillness into a readable reveal, turning or stepping as the environment responds subtly"
+        camera = "controlled pull-back reveal with side parallax and a soft rack focus from detail to full composition"
+        speed = "medium-slow"
+        energy = 0.58
+        sfx = "wind, distant ambience, fabric movement"
+    else:
+        action = "the main subject performs one clear readable gesture or movement beat instead of remaining still"
+        camera = "motivated dolly-in with foreground parallax and a brief rack focus to the key prop or face"
+        speed = "medium"
+        energy = 0.65
+        sfx = "location ambience, cloth and object movement"
+    return {
+        "motion_action_beat": action,
+        "motion_camera": camera,
+        "motion_speed": speed,
+        "motion_energy": energy,
+        "motion_sfx": sfx,
+    }
+
+
+def _ensure_motion_action_plan(script: list[dict]) -> None:
+    if not MOTION_ACTION_STORYBOARD:
+        return
+    for idx, scene in enumerate(script):
+        plan = _scene_motion_action_plan(scene, idx)
+        for key, value in plan.items():
+            scene.setdefault(key, value)
+
+
+def _motion_action_block(scene: dict, limit: int = 700) -> str:
+    if not MOTION_ACTION_STORYBOARD:
+        return ""
+    action = _short_board_text(scene.get("motion_action_beat"), 220)
+    camera = _short_board_text(scene.get("motion_camera"), 220)
+    speed = _short_board_text(scene.get("motion_speed"), 60)
+    sfx = _short_board_text(scene.get("motion_sfx"), 140)
+    energy = scene.get("motion_energy")
+    parts = []
+    if action:
+        parts.append(f"Action beat: {action}")
+    if camera:
+        parts.append(f"Camera: {camera}")
+    if speed:
+        parts.append(f"Speed: {speed}")
+    if energy is not None:
+        parts.append(f"Motion energy target: {energy}")
+    if sfx:
+        parts.append(f"SFX: {sfx}")
+    return _short_board_text(". ".join(parts), limit)
+
+
+def _motion_plan_for_qa(scene: dict) -> dict:
+    return {
+        "motion_action_beat": scene.get("motion_action_beat"),
+        "motion_camera": scene.get("motion_camera"),
+        "motion_speed": scene.get("motion_speed"),
+        "motion_energy_target": scene.get("motion_energy"),
+        "motion_sfx": scene.get("motion_sfx"),
+    }
+
+
+def _write_motion_action_plan_qa(script: list[dict]) -> dict:
+    records = []
+    for idx, scene in enumerate(script, start=1):
+        plan = _motion_plan_for_qa(scene)
+        missing = [k for k, v in plan.items() if v in (None, "")]
+        energy = float(plan.get("motion_energy_target") or 0)
+        records.append({
+            "scene": idx,
+            "pass": not missing and energy >= 0.55,
+            "missing": missing,
+            **plan,
+        })
+    failed = [r for r in records if not r.get("pass")]
+    payload = {
+        "mode": "motion_action_storyboard_plan",
+        "enabled": MOTION_ACTION_STORYBOARD,
+        "total": len(records),
+        "failed_count": len(failed),
+        "failed_scenes": [r["scene"] for r in failed],
+        "pass": len(failed) == 0,
+        "records": records,
+        "created_at": datetime.now().isoformat(timespec="seconds"),
+    }
+    try:
+        (OUTPUT_DIR / "motion_action_plan_qa.json").write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception as e:
+        log(f"motion_action_plan_qa.json 写入失败: {e}")
+    return payload
+
+
 def generate_image(scene: dict, idx: int, _max_retries: int = 3) -> int:
     last_err = None
     for attempt in range(_max_retries):
@@ -3948,8 +4085,11 @@ def generate_storyboard_images_gpt_image2(script: list[dict], topic: str) -> boo
             for local_i, scene in enumerate(batch_script, start=start + 1):
                 prompt = re.sub(r"\s+", " ", str(scene.get("prompt") or "")).strip()
                 text = re.sub(r"\s+", " ", str(scene.get("text") or "")).strip()
+                action_block = _motion_action_block(scene, 520)
                 scene_lines.append(
-                    f"{local_i}. Visual prompt: {prompt[:900]}\n   Internal story beat: {text[:160]}"
+                    f"{local_i}. Visual prompt: {prompt[:760]}\n"
+                    f"   Internal story beat: {text[:150]}\n"
+                    f"   Motion plan: {action_block}"
                 )
             batch_count = len(batch_script)
             if batch_count == 1:
@@ -3960,7 +4100,8 @@ def generate_storyboard_images_gpt_image2(script: list[dict], topic: str) -> boo
                     f"Aspect ratio: {ASPECT_RATIO}. This is scene {start+1}/{n}; keep the same visual identity as a continuous series. "
                     "The entire output must be one uninterrupted shot, not a layout. "
                     "Strictly forbidden: collage, contact sheet, grid, comic page, split screen, panels, frames, borders, white divider lines, captions, subtitles, watermarks, random text. "
-                    "Keep consistent palette, lighting, era, costumes, and subject continuity.\n\n"
+                    "Keep consistent palette, lighting, era, costumes, and subject continuity. "
+                    "Pose the frame at the most dynamic readable moment of the action beat, not a passive still.\n\n"
                     "Scene:\n" + "\n".join(scene_lines)
                 )
             else:
@@ -3971,6 +4112,7 @@ def generate_storyboard_images_gpt_image2(script: list[dict], topic: str) -> boo
                     f"Aspect ratio: {ASPECT_RATIO}. This is batch {batch_idx}/{total_batches}; keep the same visual identity as a continuous series. "
                     "Do NOT create a collage, contact sheet, grid, comic page, split screen, panels, frames, borders, or multi-panel image. Return separate standalone full-frame images, "
                     "one image per numbered scene. Keep consistent palette, lighting, era, costumes, and subject continuity. "
+                    "Each frame must show the most dynamic readable moment of its action beat, not a passive still. "
                     "No watermarks, no captions, no subtitles, no random text.\n\n"
                     "Scenes:\n" + "\n".join(scene_lines)
                 )
@@ -4084,7 +4226,8 @@ def _storyboard_grid_prompt(batch_script: list[dict], start: int, total: int, to
     for local_i, scene in enumerate(batch_script, start=start + 1):
         prompt = re.sub(r"\s+", " ", str(scene.get("prompt") or scene.get("text") or "")).strip()
         text = re.sub(r"\s+", " ", str(scene.get("text") or "")).strip()
-        lines.append(f"{local_i:02d}. Visual: {prompt[:380]}\n    Beat: {text[:90]}")
+        action = _motion_action_block(scene, 360)
+        lines.append(f"{local_i:02d}. Visual: {prompt[:300]}\n    Beat: {text[:80]}\n    Motion: {action}")
     count = len(batch_script)
     culture_guard = _topic_culture_guard(batch_script[0].get("topic_meta", {}) if batch_script else {})
     return f"""Create one single {aspect} cinematic storyboard grid for a documentary sequence.
@@ -4097,6 +4240,7 @@ Panel rules:
 - No shot numbers, no labels, no captions, no subtitles, no speech bubbles, no watermarks, no logos.
 - No arrows or motion graphics; motion will be handled separately.
 - Thin panel separators are acceptable, but keep every panel visually clean so it can be cropped into a standalone reference image.
+- Pose every panel at an active moment from its Motion plan; avoid static portrait/key art unless the Motion plan says reveal.
 - Keep one consistent era, palette, lighting, location logic, costume design, and subject identity across all panels.
 - Cultural accuracy is mandatory; if the topic is Western/British/European, never use Chinese/East-Asian visual language.
 - Each panel must be distinct and readable at 4K.
@@ -4120,7 +4264,8 @@ def _production_storyboard_prompt(script: list[dict], topic: str, aspect: str) -
     for i, scene in enumerate(script, start=1):
         visual = re.sub(r"\s+", " ", str(scene.get("prompt") or scene.get("text") or "")).strip()
         beat = re.sub(r"\s+", " ", str(scene.get("text") or "")).strip()
-        lines.append(f"{i:02d}. VISUAL: {visual[:360]} | STORY BEAT: {beat[:100]}")
+        action = _motion_action_block(scene, 300)
+        lines.append(f"{i:02d}. VISUAL: {visual[:300]} | STORY BEAT: {beat[:90]} | MOTION: {action}")
     return f"""Create one single {aspect} AI animation production storyboard board.
 Topic: {topic}
 
@@ -4780,6 +4925,10 @@ def _gpt_image2_direct_annotated_aspect() -> str:
 def _gpt_image2_direct_annotated_prompt(scene: dict, idx: int, total: int, topic: str, aspect: str) -> str:
     visual = _short_board_text(scene.get("prompt") or scene.get("text"), 650)
     text = _short_board_text(scene.get("text"), 220)
+    action = _short_board_text(scene.get("motion_action_beat") or visual, 160)
+    camera = _short_board_text(scene.get("motion_camera") or "motivated camera move with foreground parallax and a clear action beat", 160)
+    speed = _short_board_text(scene.get("motion_speed") or "medium", 40)
+    sfx = _short_board_text(scene.get("motion_sfx") or "period ambience, cloth and object movement", 120)
     duration = int(round(max(1, float(scene.get("vid_duration") or scene.get("dur") or 5))))
     return f"""Create one single {aspect} high-resolution annotated cinematic storyboard board for a historical documentary shot.
 Topic: {topic}
@@ -4797,10 +4946,10 @@ Layout requirements:
 - No random extra text, no watermark, no logo, no comic panels, no contact sheet.
 
 Director notes content:
-ACTION: {_short_board_text(visual, 120)}
-CAMERA: slow cinematic push-in, subtle period atmosphere, plausible motion only.
+ACTION: {action}
+CAMERA: {camera}; speed {speed}.
 DIALOGUE/VO: {_short_board_text(text, 120)}
-SFX: period ambience, crowd bed, cloth and paper movement."""
+SFX: {sfx}."""
 
 
 def generate_gpt_image2_direct_annotated_storyboards(script: list[dict], topic: str) -> bool:
@@ -5035,6 +5184,8 @@ def generate_bgm(topic: str, tone: str = "中性") -> str | None:
 
 
 def step6_parallel(script: list[dict], topic: str, pregenerated_bgm_path: str | None = None) -> str | None:
+    _ensure_motion_action_plan(script)
+    _write_motion_action_plan_qa(script)
     n = len(script)
     if pregenerated_bgm_path:
         tg(f"🚀 并行生成：{n} 张图片（复用 BGM-driven 已生成音乐）...")
@@ -5307,20 +5458,25 @@ def _generate_motion_prompts(script: list[dict]) -> list[str]:
 """ if ADS_DIALOGUE_MODE else ""
     try:
         summary_lines = "\n".join(
-            f"{i+1}. ({sc.get('dur', 5):.0f}s, speaker: {sc.get('speaker', '旁白')}, emotion: {sc.get('emotion', 'neutral')}) {sc['text'][:80]}"
+            f"{i+1}. ({sc.get('dur', 5):.0f}s, speaker: {sc.get('speaker', '旁白')}, emotion: {sc.get('emotion', 'neutral')}) "
+            f"{sc['text'][:80]} | {_motion_action_block(sc, 260)}"
             for i, sc in enumerate(script)
         )
         raw = chat(
             "GEMINI_25_FLASH",
-            "You are a cinematographer giving motion direction for still documentary frames. Output strict JSON only.",
-            f"""Generate {n} motion prompts for a Chinese documentary. Each scene already has a static keyframe image; you only describe camera movement and subtle motion within the frame (40-60 words, English).
+            "You are an action-oriented cinematographer giving motion direction for still documentary frames. Output strict JSON only.",
+            f"""Generate {n} motion prompts for a Chinese documentary. Each scene already has a static keyframe image; describe camera movement plus one clear in-frame action beat (40-60 words, English).
 
 Scene summary:
 {summary_lines}
 
 Rules:
-- Describe camera moves (slow push-in, gentle pan, orbit, pull-back, dolly) + subtle in-frame motion (light drift, smoke, water ripples, leaves swaying).
-- Match emotion: tense → sharper moves; calm → slow; historical → steady.
+- Do not make every shot a slow zoom. Avoid overusing "slow", "gentle", "subtle", and "calm".
+- Each prompt must include a dominant action verb: steps, turns, raises, draws, strikes, opens, points, kneels, reacts, rushes, crosses, reveals, or similar.
+- Use a motivated camera move: handheld push, tracking move, whip-pan, rack focus, low-angle orbit, reveal, pull-back, parallax slide, or dolly move.
+- Follow the Motion plan embedded in each scene summary; do not replace it with generic drifting or breathing motion.
+- Match emotion: tense → sharper moves and faster reactions; reflective → controlled but still active; calm → restrained action, not static.
+- Keep identities and costumes stable; action must be plausible from one keyframe and should not require a full choreography reset.
 - End with ", cinematic atmosphere, smooth motion" for consistency.
 - Do NOT describe what's in the frame (that's already fixed).
 {reporter_motion_guide}
@@ -5339,7 +5495,13 @@ Output strict JSON array of {n} strings:
     except Exception as e:
         log(f"motion prompts 生成失败: {e}")
     # 兜底：所有 scene 用通用 prompt
-    return ["slow zoom in with gentle camera drift, subtle ambient motion, cinematic atmosphere, smooth motion"] * n
+    fallback = [
+        "handheld push-in with a clear foreground parallax slide as the main figure turns or raises a hand, cloth and dust reacting to the movement, quick rack focus to the key prop, cinematic atmosphere, smooth motion",
+        "tracking move from side to front while the subject steps forward, gestures, or reacts decisively, background elements shift with visible depth, brief focus pull and controlled camera sway, cinematic atmosphere, smooth motion",
+        "low-angle dolly-in followed by a short orbit as hands, fabric, smoke, or papers move with the action beat, the frame feels motivated and alive without changing identity, cinematic atmosphere, smooth motion",
+        "pull-back reveal from a tight detail to the full scene while the character crosses frame or changes posture, secondary figures or environment respond naturally, cinematic atmosphere, smooth motion",
+    ]
+    return [fallback[i % len(fallback)] for i in range(n)]
 
 
 _motion_tasks_lock = threading.Lock()
@@ -5403,6 +5565,10 @@ def _finalize_motion_qa(total: int, success_count: int) -> None:
             1 for r in records
             if r.get("pass") and r.get("video_has_audio") and r.get("generated_audio_from_prompt_dialogue")
         )
+        voice_timbre_manual_required = sum(
+            1 for r in records
+            if r.get("pass") and r.get("path") == "almighty-reference-audio-dub" and not r.get("voice_timbre_auto_verified")
+        )
         werydance_caption_success = sum(
             1 for r in records
             if r.get("pass") and r.get("werydance_captions_requested") and not r.get("ass_fallback_required")
@@ -5417,6 +5583,12 @@ def _finalize_motion_qa(total: int, success_count: int) -> None:
             "text_fallback_success_count": text_success,
             "generated_audio_segment_count": generated_audio_success,
             "embedded_voice_audio_ready": embedded_voice_audio_ready,
+            "motion_action_storyboard_enabled": MOTION_ACTION_STORYBOARD,
+            "voice_timbre_auto_verification": "not_available",
+            "voice_timbre_manual_required_count": voice_timbre_manual_required,
+            "voice_repair_enabled": MOTION_VOICE_REPAIR,
+            "voice_repair_turns": sorted(_load_motion_voice_repair_turns()) if MOTION_VOICE_REPAIR else [],
+            "voice_strict_lock_prompt_enabled": MOTION_VOICE_STRICT_LOCK,
             "werydance_captions_enabled": WERYDANCE_CAPTIONS,
             "werydance_caption_segment_count": werydance_caption_success,
             "ass_caption_fallback_count": max(0, total - werydance_caption_success) if WERYDANCE_CAPTIONS else total,
@@ -5644,6 +5816,7 @@ def _motion_poll_and_download(idx: int, task_id: str, vid_path: str, target_dur:
 
 
 def _build_motion_video_prompt(scene: dict, motion_prompt: str, safe_retry: bool = False) -> str:
+    action_block = _motion_action_block(scene, 520)
     if ADS_DIALOGUE_MODE:
         speaker = scene.get("speaker", "")
         contract = _adsd_visual_contract(speaker)
@@ -5654,7 +5827,7 @@ def _build_motion_video_prompt(scene: dict, motion_prompt: str, safe_retry: bool
             return (
                 "Neutral period spoken scene with one or more adult historical onsite characters, "
                 f"active {role} is clearly speaking while any other characters only listen or react. "
-                f"Simple slow camera push, slight head movement, subtle paper movement, natural light, realistic motion.{pov} "
+                f"{action_block}. Natural light, realistic motion.{pov} "
                 "Keep the scene immersive for its topic era, no famous style, no branded references, no movie references, no text, no logos, no watermark."
             )
         return (
@@ -5662,11 +5835,14 @@ def _build_motion_video_prompt(scene: dict, motion_prompt: str, safe_retry: bool
             "warm sepia paper tones, period clothing and topic-accurate props. "
             f"{contract}. "
             f"Scene action: {shot}. "
+            f"{action_block}. "
             f"Camera motion: {motion_prompt}. "
             "Avoid branded style references, artist names, movie-title references, copyrighted characters, modern devices, subtitles, logos, watermarks."
         )
     scene_prompt = scene.get("prompt", "")
-    return f"{scene_prompt}. Camera motion: {motion_prompt}" if scene_prompt else motion_prompt
+    if scene_prompt:
+        return f"{scene_prompt}. {action_block}. Camera motion: {motion_prompt}"
+    return f"{action_block}. Camera motion: {motion_prompt}" if action_block else motion_prompt
 
 
 def _short_board_text(value: object, limit: int = 170) -> str:
@@ -5795,10 +5971,11 @@ def _build_annotated_storyboard_reference(scene: dict, idx: int, motion_prompt: 
         y = panel_y1 + max(92, int(H * 0.085))
         max_w = right_w - 48
         rows = [
-            ("ACTION", _short_board_text(scene.get("prompt") or scene.get("text"), 210), 3),
-            ("CAMERA", _short_board_text(motion_prompt, 210), 3),
+            ("ACTION", _short_board_text(scene.get("motion_action_beat") or scene.get("prompt") or scene.get("text"), 210), 3),
+            ("CAMERA", _short_board_text(scene.get("motion_camera") or motion_prompt, 210), 3),
+            ("SPEED", _short_board_text(scene.get("motion_speed") or "medium", 80), 1),
             ("DIALOGUE/VO", _short_board_text(scene.get("text"), 150), 2),
-            ("SFX", "period ambience, crowd bed, cloth and paper movement", 2),
+            ("SFX", _short_board_text(scene.get("motion_sfx") or "period ambience, crowd bed, cloth and paper movement", 180), 2),
         ]
         card_gap = max(14, H // 90)
         for label, value, max_lines in rows:
@@ -5903,8 +6080,8 @@ def _motion_reference_prompt(scene: dict, motion_prompt: str, safe_retry: bool =
     else:
         prefix = (
             "Use the uploaded storyboard frame as the strict visual reference for character identity, "
-            "costume, era, composition, lighting, and scene geography. Animate only plausible motion "
-            "within that frame; do not redesign the shot. "
+            "costume, era, composition, lighting, and scene geography. Add a clear motivated action beat "
+            "and camera move that can plausibly start from this frame; do not redesign the shot. "
         )
     suffix = _werydance_caption_instruction(scene) + (
         " No storyboard annotations. Preserve faces, clothing, props, color palette, and historical setting from the reference image."
@@ -5912,14 +6089,20 @@ def _motion_reference_prompt(scene: dict, motion_prompt: str, safe_retry: bool =
     return (prefix + base[: max(0, 2000 - len(prefix) - len(suffix))] + suffix)[:2000]
 
 
-def _motion_audio_dub_prompt(scene: dict, motion_prompt: str, safe_retry: bool = False) -> str:
+def _motion_audio_dub_prompt(scene: dict, motion_prompt: str, safe_retry: bool = False, strict_voice: bool = False) -> str:
     narration = re.sub(r"\s+", " ", str(scene.get("text") or "")).strip()[:260]
     visual = _build_motion_video_prompt(scene, motion_prompt, safe_retry=safe_retry)
     caption_instruction = _werydance_caption_instruction(scene)
+    voice_lock = (
+        "Voice lock is mandatory: match the uploaded reference speaker's timbre, gender impression, pitch range, pace, breath, and delivery style as closely as possible. "
+        "Do not substitute a generic narrator or a different speaker. "
+        if strict_voice else ""
+    )
     if safe_retry:
         prompt = (
             "Create a realistic Chinese documentary video from the uploaded image. "
             "Use the uploaded audio only as a voice timbre and speaking-style reference, then generate new Mandarin narration. "
+            f"{voice_lock}"
             f"Speak exactly this Chinese line and nothing else: 「{narration}」. "
             "The narration may be off-screen unless a clear speaker is visible. "
         )
@@ -5928,6 +6111,7 @@ def _motion_audio_dub_prompt(scene: dict, motion_prompt: str, safe_retry: bool =
         "Create a cinematic Chinese documentary shot with generated voice audio. "
         "Use the uploaded image as the strict visual reference for era, character identity, costume, composition, lighting, and geography. "
         "Use the uploaded audio only as a lawful voice/timbre reference: preserve tone color, gender impression, pace, and delivery style; do not use it as music. "
+        f"{voice_lock}"
         f"Generate clear Mandarin narration speaking exactly this line and nothing else: 「{narration}」. "
         "If no speaker face is visible, treat the voice as off-screen narration; if a speaker is visible, keep mouth motion natural and understated. "
         f"Camera/action instruction: {visual}. "
@@ -6007,7 +6191,10 @@ def _try_motion_audio_dub_video(idx: int, scene: dict, motion_prompt: str, aspec
     img_path = scene.get("img_path")
     if not img_path or not os.path.exists(img_path):
         return False, False
-    voice_asset_ref = _select_voice_asset_reference(scene, mode="motion")
+    voice_repair_turns = _load_motion_voice_repair_turns()
+    repair_requested = MOTION_VOICE_REPAIR and ((idx + 1) in voice_repair_turns)
+    ref_offset = 1 if repair_requested else 0
+    voice_asset_ref = _select_voice_asset_reference(scene, mode="motion", ref_offset=ref_offset)
     if not voice_asset_ref:
         _append_motion_qa({
             "turn": idx + 1,
@@ -6038,7 +6225,8 @@ def _try_motion_audio_dub_video(idx: int, scene: dict, motion_prompt: str, aspec
         })
         return False, False
 
-    prompt = _motion_audio_dub_prompt(scene, motion_prompt, safe_retry=safe_retry)
+    strict_voice = bool(MOTION_VOICE_STRICT_LOCK or repair_requested)
+    prompt = _motion_audio_dub_prompt(scene, motion_prompt, safe_retry=safe_retry, strict_voice=strict_voice)
     caption_info = _werydance_caption_request(scene)
     task_id = None
     response = None
@@ -6092,9 +6280,15 @@ def _try_motion_audio_dub_video(idx: int, scene: dict, motion_prompt: str, aspec
         "image_path": img_path,
         "audio_url": audio_url,
         "image_url": image_url,
+        "motion_plan": _motion_plan_for_qa(scene),
         "fallback_to_reference_motion": not ok and not timed_out_or_reusable,
         "timed_out_or_reusable": timed_out_or_reusable,
         "voice_asset_reference": voice_asset_ref,
+        "voice_repair_requested": repair_requested,
+        "voice_repair_turns": sorted(voice_repair_turns) if MOTION_VOICE_REPAIR else [],
+        "voice_reference_variant": "alternate_reference_strict" if repair_requested else "primary_reference_strict" if strict_voice else "primary_reference",
+        "voice_timbre_auto_verified": False,
+        "voice_timbre_qa": "manual_required",
         "werydance_captions_enabled": WERYDANCE_CAPTIONS,
         "werydance_captions_requested": caption_info.get("requested"),
         "werydance_caption_text": caption_info.get("text") if caption_info.get("requested") else None,
@@ -6208,6 +6402,7 @@ def _try_motion_reference_video(idx: int, scene: dict, motion_prompt: str, aspec
         "storyboard_mode": bool(scene.get("storyboard_mode")),
         "image_path": reference_path or img_path,
         "clean_image_path": img_path,
+        "motion_plan": _motion_plan_for_qa(scene),
         "submit_duration": dur,
         "target_duration": round(float(target_dur), 3) if target_dur is not None else None,
         "aspect_ratio": aspect_ratio,
@@ -6334,6 +6529,7 @@ def _motion_one_scene(idx: int, scene: dict, motion_prompt: str, aspect_ratio: s
             "target_duration": round(target_dur, 3),
             "aspect_ratio": aspect_ratio,
             "fallback_path": True,
+            "motion_plan": _motion_plan_for_qa(scene),
             "werydance_captions_enabled": WERYDANCE_CAPTIONS,
             "werydance_captions_requested": caption_info.get("requested"),
             "werydance_caption_text": caption_info.get("text") if caption_info.get("requested") else None,
@@ -7636,6 +7832,40 @@ def _load_lips_change_requested_turns() -> set[int]:
     return set()
 
 
+def _parse_turn_set(value) -> set[int]:
+    turns: set[int] = set()
+    if value is None:
+        return turns
+    if isinstance(value, dict):
+        value = value.get("turns") or value.get("repair_turns") or value.get("voice_repair_turns") or []
+    if isinstance(value, str):
+        parts = re.split(r"[\s,，;；]+", value.strip())
+    elif isinstance(value, (list, tuple, set)):
+        parts = list(value)
+    else:
+        parts = [value]
+    for part in parts:
+        try:
+            turn = int(part)
+        except Exception:
+            continue
+        if turn > 0:
+            turns.add(turn)
+    return turns
+
+
+def _load_motion_voice_repair_turns() -> set[int]:
+    """1-based turn indexes requested by manual QA for voice-timbre repair."""
+    turns = _parse_turn_set(os.environ.get("ADR_VOICE_REPAIR_TURNS") or os.environ.get("ADR_MOTION_VOICE_REPAIR_TURNS"))
+    p = Path("/tmp/adr_voice_repair_turns.json")
+    if p.exists():
+        try:
+            turns |= _parse_turn_set(json.loads(p.read_text(encoding="utf-8")))
+        except Exception as e:
+            log(f"读取 motion voice-repair 指定 turn 失败: {e}")
+    return turns
+
+
 def _voice_assets_file() -> Path:
     return Path(__file__).resolve().parent / "voice_assets" / "voice_assets.json"
 
@@ -7662,7 +7892,7 @@ def _load_voice_assets() -> dict:
     return data
 
 
-def _select_voice_asset_reference(scene: dict, *, mode: str = "adsd") -> dict | None:
+def _select_voice_asset_reference(scene: dict, *, mode: str = "adsd", ref_offset: int = 0) -> dict | None:
     if mode == "adsd":
         if not ADSD_ALMIGHTY_AUDIO_DUB_EXPERIMENT:
             return None
@@ -7696,21 +7926,28 @@ def _select_voice_asset_reference(scene: dict, *, mode: str = "adsd") -> dict | 
         return None
     refs = sorted(refs, key=lambda r: float(r.get("clean_score") or 0), reverse=True)
     root = Path(__file__).resolve().parent
+    valid_refs = []
     for ref in refs:
         path = root / str(ref.get("path", ""))
         if path.exists() and path.stat().st_size > 10000:
-            return {
-                "asset_id": asset_id,
-                "display_name": asset.get("display_name"),
-                "identified_person": asset.get("identified_person"),
-                "license_status": asset.get("license_status"),
-                "allowed_use": asset.get("allowed_use", []),
-                "forbidden_use": asset.get("forbidden_use", []),
-                "quality_flags": asset.get("quality_flags", []),
-                "path": str(path),
-                "sha256": ref.get("sha256"),
-                "duration": ref.get("duration"),
-            }
+            valid_refs.append((ref, path))
+    if valid_refs:
+        ref_index = max(0, min(int(ref_offset or 0), len(valid_refs) - 1))
+        ref, path = valid_refs[ref_index]
+        return {
+            "asset_id": asset_id,
+            "display_name": asset.get("display_name"),
+            "identified_person": asset.get("identified_person"),
+            "license_status": asset.get("license_status"),
+            "allowed_use": asset.get("allowed_use", []),
+            "forbidden_use": asset.get("forbidden_use", []),
+            "quality_flags": asset.get("quality_flags", []),
+            "path": str(path),
+            "sha256": ref.get("sha256"),
+            "duration": ref.get("duration"),
+            "reference_index": ref_index,
+            "reference_count": len(valid_refs),
+        }
     log(f"[voice-asset] 默认音色 {asset_id} reference 文件缺失，回退 turn TTS")
     return None
 
@@ -8006,6 +8243,8 @@ def step66_adsd_lip_sync(script: list[dict]):
 
 def step65_motion(script: list[dict]):
     """把静态 seg_N.mp4 替换为 WERYDANCE_2_0 动态版本（并发 + 单轮内失败自动重试 1 次）"""
+    _ensure_motion_action_plan(script)
+    _write_motion_action_plan_qa(script)
     n = len(script)
     reporter_tag = " · ADS拟现场记者" if ADS_REPORTER_MODE else ""
     if STORYBOARD_REFERENCE_MOTION and STORYBOARD_ANNOTATED_MOTION and not ADS_DIALOGUE_MODE:
@@ -8086,6 +8325,8 @@ def step65_motion(script: list[dict]):
 
 def step65_grid_multiref_motion_qa(script: list[dict]):
     """Run only the 4K storyboard-grid multi-reference motion QA sidecar."""
+    _ensure_motion_action_plan(script)
+    _write_motion_action_plan_qa(script)
     n = len(script)
     tg(f"🧪 Grid multi-ref motion QA-only 启动：{n} 分镜")
     motion_prompts = _generate_motion_prompts(script)
