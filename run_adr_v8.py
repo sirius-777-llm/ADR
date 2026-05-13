@@ -2738,11 +2738,11 @@ def _record_adsd_tts_rewrite(idx: int, speaker: str, before: str, after: str, er
         log(f"ADSD TTS policy 改写记录失败: {e}")
 
 
-# text-to-audio 主路径默认 voice_id（按画幅切换）
+# text-to-audio 主路径默认 voice_id：横竖屏均默认女声（万年历视频号主力听众偏好）
 # 用户可通过 ADR_TTS_VOICE_ID 显式覆盖；--speaker 走 podcast 兜底路径不影响这里
 _TEXT_TO_AUDIO_DEFAULT_VOICE = {
-    "h": 69,   # Reliable Executive  - 男声沉稳，对标 podcast 国栋
-    "v": 78,   # Gentle Senior       - 女声温柔，对标 podcast 晓曼
+    "h": 78,   # Gentle Senior       - 女声温柔知性，纪录片向
+    "v": 78,   # Gentle Senior       - 同上
 }
 
 
@@ -2800,11 +2800,10 @@ def step2_master_voice(script: list[dict], speaker_id: str = "liyan2-ef9401ec", 
     MAX_RETRIES = 5
 
     # ★ 新主路径：text-to-audio（速度更稳、API 更简洁），失败降级到现有 Podcast 路径
-    # 用户显式 --speaker 时（speaker_id 含 "-" 的 podcast-format）跳过 text-to-audio，直接走 Podcast
+    # 注意：ADR step1 的 LLM 自选 speaker_id 是 podcast-format 字符串（含 "-"），
+    # 不能用 "-" 判定"用户显式 --speaker"。要走 podcast 必须显式 ADR_TTS_LEGACY_PODCAST=1
     use_text_to_audio = (
-        not os.environ.get("ADR_TTS_LEGACY_PODCAST", "").strip().lower() in ("1", "true", "yes", "on")
-        and "-" not in (os.environ.get("ADR_PODCAST_SPEAKER_OVERRIDE", "") or speaker_id or "")
-        or os.environ.get("ADR_TTS_FORCE_T2A", "").strip().lower() in ("1", "true", "yes", "on")
+        os.environ.get("ADR_TTS_LEGACY_PODCAST", "").strip().lower() not in ("1", "true", "yes", "on")
     )
     if use_text_to_audio:
         try:
