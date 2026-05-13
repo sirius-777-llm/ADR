@@ -8795,7 +8795,13 @@ def _select_voice_asset_reference(scene: dict, *, mode: str = "adsd", ref_offset
     if not refs:
         log(f"[voice-asset] 默认音色 {asset_id} 无 reference audio，回退 turn TTS")
         return None
-    refs = sorted(refs, key=lambda r: float(r.get("clean_score") or 0), reverse=True)
+    def _voice_ref_sort_key(ref: dict) -> tuple[float, float]:
+        return (
+            float(ref.get("priority") or ref.get("reference_priority") or 0),
+            float(ref.get("clean_score") or 0),
+        )
+
+    refs = sorted(refs, key=_voice_ref_sort_key, reverse=True)
     root = Path(__file__).resolve().parent
     valid_refs = []
     for ref in refs:
