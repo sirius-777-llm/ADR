@@ -172,6 +172,12 @@ ADSD_STORYBOARD_GRID = (
     ADS_DIALOGUE_MODE
     and os.environ.get("ADR_ADSD_STORYBOARD_GRID", "1").strip().lower() not in ("0", "false", "no", "off")
 )
+# ADS（单人 POV 记者）也可以可选启用角色形象表——锁住"记者本人 + 受访者 + 关键道具"跨镜一致性
+# 默认 OFF；通过 --ads-character-sheet 或 ADR_ADS_CHARACTER_SHEET=1 开启
+ADS_CHARACTER_SHEET_REQUESTED = (
+    "--ads-character-sheet" in sys.argv
+    or os.environ.get("ADR_ADS_CHARACTER_SHEET", "").strip().lower() in ("1", "true", "yes", "on")
+)
 STORYBOARD_GRID_MULTIREF_MOTION = (
     "--with-grid-multiref-motion" in sys.argv
     or os.environ.get("ADR_STORYBOARD_GRID_MULTIREF_MOTION", "").strip().lower() in ("1", "true", "yes", "on")
@@ -4775,7 +4781,12 @@ def generate_character_sheet_gpt_image2(script: list[dict], topic: str) -> dict 
         and ADSD_LIP_SYNC_EXPERIMENT
         and os.environ.get("ADR_ADSD_CHARACTER_SHEET", "1").strip().lower() not in ("0", "false", "no", "off")
     )
-    if not (CHARACTER_TRAILER_MODE or adsd_character_sheet):
+    ads_character_sheet = (
+        ADS_REPORTER_MODE
+        and not ADS_DIALOGUE_MODE
+        and ADS_CHARACTER_SHEET_REQUESTED
+    )
+    if not (CHARACTER_TRAILER_MODE or adsd_character_sheet or ads_character_sheet):
         return None
     external = os.environ.get("ADR_CHARACTER_SHEET", "").strip()
     qa = {
@@ -4840,7 +4851,12 @@ def generate_character_sheet_gpt_image2(script: list[dict], topic: str) -> dict 
             "pass": out_path.exists() and out_path.stat().st_size > 100000,
         })
         if qa["pass"]:
-            target = "ADSD 口型/身份锁定" if adsd_character_sheet else "逐镜身份锁定 trailer"
+            if adsd_character_sheet:
+                target = "ADSD 口型/身份锁定"
+            elif ads_character_sheet:
+                target = "ADS 单人 POV 身份锁定（记者+受访者+道具跨镜一致）"
+            else:
+                target = "逐镜身份锁定 trailer"
             tg(f"🧬 GPT Image 2 character sheet 已生成（用于{target}）")
         else:
             qa["reason"] = "output_too_small_or_missing"
