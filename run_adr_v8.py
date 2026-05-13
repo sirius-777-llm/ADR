@@ -736,7 +736,7 @@ IMAGE_RATE_LIMIT_BACKOFF = float(os.environ.get("ADR_IMAGE_RATE_LIMIT_BACKOFF", 
 # 单独节流 submit；后续 poll/download 仍并发，避免把 20 路 worker 全串行化。
 _motion_submit_lock = threading.Lock()
 _motion_last_submit_ts = 0.0
-MOTION_SUBMIT_MIN_INTERVAL = float(os.environ.get("ADR_MOTION_SUBMIT_INTERVAL", "10"))
+MOTION_SUBMIT_MIN_INTERVAL = float(os.environ.get("ADR_MOTION_SUBMIT_INTERVAL", "5"))
 MOTION_RATE_LIMIT_BACKOFF = float(os.environ.get("ADR_MOTION_RATE_LIMIT_BACKOFF", "30"))
 
 
