@@ -9079,31 +9079,45 @@ def step65_grid_multiref_motion_qa(script: list[dict]):
 # ── 第七步：拼接视频轨 ────────────────────────────────────────────────────────
 def step7_concat(script: list[dict]) -> str:
     # 故事板 trailer 主路径：直接用 storyboard_trailer.mp4 作为 raw 视频
-    # 用 tpad 把 15s trailer 拉伸到旁白总长度（最后一帧 clone 填充），字幕走原 ASS 烧录
+    # 用 tpad+fps 把 trailer 拉伸到旁白长度并强制 24fps CFR（关键：避免后端通过拉 PTS 凑长度导致播放卡顿）
     if STORYBOARD_TRAILER_MAIN:
         trailer_path = OUTPUT_DIR / "storyboard_trailer.mp4"
         if trailer_path.exists() and trailer_path.stat().st_size > 100000:
             raw_path = str(OUTPUT_DIR / "raw_concat.mp4")
             try:
                 trailer_dur = ffprobe_duration(str(trailer_path))
-                # 目标时长：所有 scene end 时间的最大值（旁白尾） + 0.5s buffer
-                target_dur = max((s.get("end") or s.get("audio_end") or 0) for s in script) + 0.5
+                # 目标时长：优先 master_voice.mp3 实际时长（最准），其次用 script 时间轴
+                voice_path = OUTPUT_DIR / "master_voice.mp3"
+                if voice_path.exists() and voice_path.stat().st_size > 10000:
+                    target_dur = ffprobe_duration(str(voice_path)) + 0.5
+                else:
+                    target_dur = max(
+                        (s.get("audio_start", 0) + s.get("vid_duration", s.get("dur", 0))) for s in script
+                    ) + 0.5
                 pad_dur = max(0.0, target_dur - trailer_dur)
                 if pad_dur > 0.2:
+                    # tpad clone 真实生成填充帧 + fps=24 强制 CFR，避免 nb_frames 异常少导致播放卡
                     ffmpeg(
                         "-i", str(trailer_path),
-                        "-vf", f"tpad=stop_mode=clone:stop_duration={pad_dur:.3f}",
+                        "-vf", f"tpad=stop_mode=clone:stop_duration={pad_dur:.3f},fps=24",
+                        "-c:v", "libx264", "-crf", "20", "-preset", "medium",
+                        "-an",
+                        raw_path,
+                        timeout=300,
+                    )
+                    tg(f"🎬 step7: trailer ({trailer_dur:.1f}s) 拉伸至 {target_dur:.1f}s @24fps CFR")
+                else:
+                    # 即使不需要拉伸也重编码到 CFR，避免源 VFR 引发后续播放问题
+                    ffmpeg(
+                        "-i", str(trailer_path),
+                        "-vf", "fps=24",
                         "-c:v", "libx264", "-crf", "20", "-preset", "medium",
                         "-an",
                         raw_path,
                         timeout=180,
                     )
-                    tg(f"🎬 step7: trailer ({trailer_dur:.1f}s) 拉伸至 {target_dur:.1f}s 作 raw 视频")
-                else:
-                    import shutil
-                    shutil.copy(str(trailer_path), raw_path)
-                    tg(f"🎬 step7: trailer ({trailer_dur:.1f}s) 直作 raw 视频")
-                log(f"step7 STORYBOARD_TRAILER_MAIN: raw_concat <- storyboard_trailer (pad={pad_dur:.2f}s)")
+                    tg(f"🎬 step7: trailer ({trailer_dur:.1f}s) 直作 raw 视频 (CFR 24fps 转码)")
+                log(f"step7 STORYBOARD_TRAILER_MAIN: raw_concat <- storyboard_trailer (target={target_dur:.2f}s, pad={pad_dur:.2f}s, fps=24)")
                 return raw_path
             except Exception as e:
                 tg(f"⚠️ trailer 拉伸失败：{str(e)[:120]}，回退到逐镜拼接")
