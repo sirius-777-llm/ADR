@@ -2738,9 +2738,85 @@ def _record_adsd_tts_rewrite(idx: int, speaker: str, before: str, after: str, er
         log(f"ADSD TTS policy 改写记录失败: {e}")
 
 
+# text-to-audio 主路径默认 voice_id（按画幅切换）
+# 用户可通过 ADR_TTS_VOICE_ID 显式覆盖；--speaker 走 podcast 兜底路径不影响这里
+_TEXT_TO_AUDIO_DEFAULT_VOICE = {
+    "h": 69,   # Reliable Executive  - 男声沉稳，对标 podcast 国栋
+    "v": 78,   # Gentle Senior       - 女声温柔，对标 podcast 晓曼
+}
+
+
+def _text_to_audio_master_voice(script: list[dict]) -> str | None:
+    """主路径：用 /generation/text-to-audio per-line TTS，拼接成主音轨。
+    成功返回 master_voice.mp3 路径；失败返回 None 让调用方降级到 Podcast。"""
+    fmt_key = "v" if IS_VERTICAL else "h"
+    default_voice = _TEXT_TO_AUDIO_DEFAULT_VOICE[fmt_key]
+    voice_id = int(os.environ.get("ADR_TTS_VOICE_ID", default_voice))
+    speed = os.environ.get("ADR_TTS_SPEED", "1.0")
+    vol = os.environ.get("ADR_TTS_VOL", "4.0")
+    n = len(script)
+    tg(f"🎙 text-to-audio 主路径：voice_id={voice_id}，逐句生成 × {n} 句...")
+    seg_paths: list[str] = []
+    for i, s in enumerate(script):
+        original = (s.get("text") or "").strip()
+        if not original:
+            return None
+        text = _sanitize_for_external_api(original)[:500]
+        try:
+            r = req_post("/generation/text-to-audio", {
+                "text": text,
+                "voice_id": voice_id,
+                "speed": speed,
+                "vol": vol,
+                "trace_id": f"adr-{OUTPUT_DIR.name}-line-{i+1}",
+            }, timeout=30)
+            task_id = r.get("data", {}).get("task_id") or (r.get("data", {}).get("task_ids") or [None])[0]
+            if not task_id:
+                log(f"text-to-audio line {i+1} 无 task_id: {json.dumps(r, ensure_ascii=False)[:200]}")
+                return None
+            data = poll_task_status(task_id, f"text-to-audio line {i+1}", max_wait=180)
+            audios = data.get("audios") or []
+            if not audios:
+                log(f"text-to-audio line {i+1} succeed 但无 audios")
+                return None
+            mp3_path = str(OUTPUT_DIR / f"tts_line_{i:02d}.mp3")
+            urllib.request.urlretrieve(audios[0], mp3_path)
+            seg_paths.append(mp3_path)
+        except Exception as e:
+            log(f"text-to-audio line {i+1} 失败：{e}")
+            return None
+    # 拼接
+    concat_list = OUTPUT_DIR / "tts_concat.txt"
+    with open(concat_list, "w") as f:
+        for p in seg_paths:
+            f.write(f"file '{p}'\n")
+    voice_path = str(OUTPUT_DIR / "master_voice.mp3")
+    ffmpeg("-f", "concat", "-safe", "0", "-i", str(concat_list), "-c", "copy", voice_path)
+    return voice_path
+
+
 def step2_master_voice(script: list[dict], speaker_id: str = "liyan2-ef9401ec", speaker_name: str = "国栋") -> str:
     n = len(script)
     MAX_RETRIES = 5
+
+    # ★ 新主路径：text-to-audio（速度更稳、API 更简洁），失败降级到现有 Podcast 路径
+    # 用户显式 --speaker 时（speaker_id 含 "-" 的 podcast-format）跳过 text-to-audio，直接走 Podcast
+    use_text_to_audio = (
+        not os.environ.get("ADR_TTS_LEGACY_PODCAST", "").strip().lower() in ("1", "true", "yes", "on")
+        and "-" not in (os.environ.get("ADR_PODCAST_SPEAKER_OVERRIDE", "") or speaker_id or "")
+        or os.environ.get("ADR_TTS_FORCE_T2A", "").strip().lower() in ("1", "true", "yes", "on")
+    )
+    if use_text_to_audio:
+        try:
+            voice_path = _text_to_audio_master_voice(script)
+            if voice_path and os.path.exists(voice_path) and os.path.getsize(voice_path) > 5000:
+                total_dur = ffprobe_duration(voice_path)
+                size_kb = os.path.getsize(voice_path) // 1024
+                tg(f"✅ text-to-audio 主音轨完成 {total_dur:.1f}s {size_kb}KB")
+                return voice_path
+            tg("⚠️ text-to-audio 主路径未产出有效音轨，降级到 Podcast")
+        except Exception as e:
+            tg(f"⚠️ text-to-audio 主路径异常：{str(e)[:120]}，降级到 Podcast")
 
     tg(f"🎙 单次 Podcast 生成完整音轨（音色：{speaker_name}），{n} 句...")
 
@@ -11326,7 +11402,7 @@ def _print_execution_plan() -> None:
     # (模块名, 是否激活, 预估时间 min, 预估 credits, 说明)
     plan: list[tuple[str, bool, str, str, str]] = [
         ("Step1 剧本+视觉规划", True, "1-2", "0", "LLM 链 (Gemini/Claude)"),
-        ("Step2 Podcast TTS 主音轨", not NO_VOICE and not ADS_DIALOGUE_MODE, "1-3", "~30", "weryai podcast，失败降级 OpenAI/Edge TTS"),
+        ("Step2 text-to-audio 主音轨", not NO_VOICE and not ADS_DIALOGUE_MODE, "1-3", "~25", "主路径：text-to-audio per-line；失败降级 Podcast → OpenAI → Edge TTS"),
         ("Step2 BGM-only 静音轨", NO_VOICE, "0.1", "0", "ffmpeg 生成静音占位"),
         ("ADSD 逐句 text-to-audio", ADS_DIALOGUE_MODE, "2-3", "~25", "每 turn 一次 TTS"),
         ("Step6 character_sheet", CHARACTER_TRAILER_MODE or (ADS_DIALOGUE_MODE and ADSD_LIP_SYNC_EXPERIMENT) or (ADS_REPORTER_MODE and not ADS_DIALOGUE_MODE and ADS_CHARACTER_SHEET_REQUESTED), "2-3", "~60", "GPT Image 2 model sheet"),
