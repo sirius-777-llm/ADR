@@ -736,7 +736,7 @@ IMAGE_RATE_LIMIT_BACKOFF = float(os.environ.get("ADR_IMAGE_RATE_LIMIT_BACKOFF", 
 # 单独节流 submit；后续 poll/download 仍并发，避免把 20 路 worker 全串行化。
 _motion_submit_lock = threading.Lock()
 _motion_last_submit_ts = 0.0
-MOTION_SUBMIT_MIN_INTERVAL = float(os.environ.get("ADR_MOTION_SUBMIT_INTERVAL", "5"))
+MOTION_SUBMIT_MIN_INTERVAL = float(os.environ.get("ADR_MOTION_SUBMIT_INTERVAL", "2.5"))
 MOTION_RATE_LIMIT_BACKOFF = float(os.environ.get("ADR_MOTION_RATE_LIMIT_BACKOFF", "30"))
 
 
@@ -8126,7 +8126,8 @@ def _generate_multi_trailer_segments(script: list[dict], aspect_ratio: str) -> s
             return gi, None, str(e)[:200]
 
     results: dict[int, tuple[str | None, str]] = {}
-    max_concurrent = min(n, int(os.environ.get("ADR_TRAILER_SEG_MAX_CONCURRENT", "5")))
+    # weryai 并发上限 20，trailer 分段通常 4-8 段，远低于上限，直接放开
+    max_concurrent = min(n, int(os.environ.get("ADR_TRAILER_SEG_MAX_CONCURRENT", "20")))
     with ThreadPoolExecutor(max_workers=max_concurrent) as ex:
         futs = [ex.submit(_gen_segment, gi, g) for gi, g in enumerate(groups)]
         for f in as_completed(futs):
@@ -9049,7 +9050,8 @@ def step66_adsd_lip_sync(script: list[dict]):
     target_durs = [_lip_sync_slot_duration(script, i) for i in range(n)]
     results: dict[int, bool] = {}
     records: list[dict] = []
-    max_workers = min(10, n)
+    # weryai 并发上限 20，贴顶以便长 ADR (>10 turn) 不会排队跑成串行
+    max_workers = min(int(os.environ.get("ADR_LIP_SYNC_MAX_CONCURRENT", "20")), n)
     with ThreadPoolExecutor(max_workers=max_workers) as ex:
         futs = {ex.submit(_lip_sync_one_scene, i, script[i], target_durs[i], aspect): i for i in range(n)}
         for fut in as_completed(futs):
