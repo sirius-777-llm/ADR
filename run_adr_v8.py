@@ -2747,51 +2747,98 @@ _TEXT_TO_AUDIO_DEFAULT_VOICE = {
 
 
 def _text_to_audio_master_voice(script: list[dict]) -> str | None:
-    """主路径：用 /generation/text-to-audio per-line TTS，拼接成主音轨。
+    """主路径：用 /generation/text-to-audio TTS，拼接成主音轨。
+    优先策略：脚本总字符 ≤ 500 时一次性整段送，保留 TTS 引擎自然语义停顿；
+    超长则按句号边界 smart-split 成多个 ≤ 500 字符 chunk。
     成功返回 master_voice.mp3 路径；失败返回 None 让调用方降级到 Podcast。"""
     fmt_key = "v" if IS_VERTICAL else "h"
     default_voice = _TEXT_TO_AUDIO_DEFAULT_VOICE[fmt_key]
     voice_id = int(os.environ.get("ADR_TTS_VOICE_ID", default_voice))
     speed = os.environ.get("ADR_TTS_SPEED", "1.0")
     vol = os.environ.get("ADR_TTS_VOL", "4.0")
-    n = len(script)
-    tg(f"🎙 text-to-audio 主路径：voice_id={voice_id}，逐句生成 × {n} 句...")
+
+    # 拼接所有台词，句末加中文句号确保 TTS 识别停顿
+    parts: list[str] = []
+    for s in script:
+        t = (s.get("text") or "").strip()
+        if not t:
+            continue
+        # 确保句末有标点，让 TTS 自然换气
+        if t and t[-1] not in "。！？.!?；;":
+            t = t + "。"
+        parts.append(t)
+    full_text = "".join(parts)
+    if not full_text:
+        return None
+    full_text = _sanitize_for_external_api(full_text)
+
+    # smart-split：尽量按句号切，控制每块 ≤ 500 字符
+    LIMIT = 500
+    chunks: list[str] = []
+    if len(full_text) <= LIMIT:
+        chunks = [full_text]
+    else:
+        # 按句号/感叹/问号切分，贪心装箱
+        sentences = re.split(r"(?<=[。！？!?])", full_text)
+        sentences = [s for s in sentences if s.strip()]
+        cur = ""
+        for s in sentences:
+            if len(s) > LIMIT:
+                # 单句超长（罕见），硬切
+                if cur:
+                    chunks.append(cur)
+                    cur = ""
+                for j in range(0, len(s), LIMIT):
+                    chunks.append(s[j:j + LIMIT])
+                continue
+            if len(cur) + len(s) > LIMIT:
+                chunks.append(cur)
+                cur = s
+            else:
+                cur += s
+        if cur:
+            chunks.append(cur)
+
+    tg(f"🎙 text-to-audio 主路径：voice_id={voice_id}，{len(full_text)} 字 → {len(chunks)} 段...")
+
     seg_paths: list[str] = []
-    for i, s in enumerate(script):
-        original = (s.get("text") or "").strip()
-        if not original:
-            return None
-        text = _sanitize_for_external_api(original)[:500]
+    for i, chunk in enumerate(chunks):
         try:
             r = req_post("/generation/text-to-audio", {
-                "text": text,
+                "text": chunk,
                 "voice_id": voice_id,
                 "speed": speed,
                 "vol": vol,
-                "trace_id": f"adr-{OUTPUT_DIR.name}-line-{i+1}",
+                "trace_id": f"adr-{OUTPUT_DIR.name}-chunk-{i+1}",
             }, timeout=30)
             task_id = r.get("data", {}).get("task_id") or (r.get("data", {}).get("task_ids") or [None])[0]
             if not task_id:
-                log(f"text-to-audio line {i+1} 无 task_id: {json.dumps(r, ensure_ascii=False)[:200]}")
+                log(f"text-to-audio chunk {i+1} 无 task_id: {json.dumps(r, ensure_ascii=False)[:200]}")
                 return None
-            data = poll_task_status(task_id, f"text-to-audio line {i+1}", max_wait=180)
+            data = poll_task_status(task_id, f"text-to-audio chunk {i+1}", max_wait=180)
             audios = data.get("audios") or []
             if not audios:
-                log(f"text-to-audio line {i+1} succeed 但无 audios")
+                log(f"text-to-audio chunk {i+1} succeed 但无 audios")
                 return None
-            mp3_path = str(OUTPUT_DIR / f"tts_line_{i:02d}.mp3")
+            mp3_path = str(OUTPUT_DIR / f"tts_chunk_{i:02d}.mp3")
             urllib.request.urlretrieve(audios[0], mp3_path)
             seg_paths.append(mp3_path)
         except Exception as e:
-            log(f"text-to-audio line {i+1} 失败：{e}")
+            log(f"text-to-audio chunk {i+1} 失败：{e}")
             return None
-    # 拼接
-    concat_list = OUTPUT_DIR / "tts_concat.txt"
-    with open(concat_list, "w") as f:
-        for p in seg_paths:
-            f.write(f"file '{p}'\n")
+
     voice_path = str(OUTPUT_DIR / "master_voice.mp3")
-    ffmpeg("-f", "concat", "-safe", "0", "-i", str(concat_list), "-c", "copy", voice_path)
+    if len(seg_paths) == 1:
+        # 单 chunk 直接重命名/copy，零拼接开销
+        import shutil
+        shutil.copy(seg_paths[0], voice_path)
+    else:
+        # 多 chunk concat
+        concat_list = OUTPUT_DIR / "tts_concat.txt"
+        with open(concat_list, "w") as f:
+            for p in seg_paths:
+                f.write(f"file '{p}'\n")
+        ffmpeg("-f", "concat", "-safe", "0", "-i", str(concat_list), "-c", "copy", voice_path)
     return voice_path
 
 
