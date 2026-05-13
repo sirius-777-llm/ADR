@@ -8026,6 +8026,139 @@ def _generate_character_trailer_motion(script: list[dict], motion_prompts: list[
     return qa
 
 
+def _multi_trailer_prompt_for_group(script: list[dict], start_idx: int, end_idx: int, has_character_sheet: bool) -> str:
+    """构造单段 trailer 的 prompt，限定 panel 范围 + 强禁止文字渲染。"""
+    panels_text = []
+    for i in range(start_idx, end_idx + 1):
+        s = script[i]
+        visual = _short_board_text(s.get("prompt") or s.get("shot") or s.get("text"), 130)
+        panels_text.append(f"{i+1}. {visual}")
+    character_rule = (
+        "Use the second uploaded image as character/style sheet to lock identity, costume, palette, and era consistent with prior segments. "
+        if has_character_sheet else ""
+    )
+    return (
+        f"Create a smooth cinematic segment covering ONLY storyboard panels {start_idx+1} through {end_idx+1} of the uploaded production board. "
+        "The first uploaded image is a director board; ignore panels outside the requested range. "
+        f"{character_rule}"
+        "Do not render the production board itself. Do not show paper, panel borders, handwriting, captions, labels, UI text, shot numbers, arrows, or any subtitles. "
+        "ABSOLUTELY NO TEXT IN THE OUTPUT VIDEO: no Chinese characters, no English letters, no numbers, no glyphs, no garbled pseudo-text. "
+        "Paper/signs/banners/screens visible in scene must be BLANK or abstract texture only. "
+        "Translate the selected panels into immersive cinematic shots in order, with motivated camera movement, clear action, continuous style, consistent characters, no freeze-frame stretching. "
+        f"PANEL ORDER: {' '.join(panels_text)}"
+    )[:2000]
+
+
+def _generate_multi_trailer_segments(script: list[dict], aspect_ratio: str) -> str | None:
+    """STORYBOARD_TRAILER_MAIN 主路径：把脚本按旁白时长贪心装箱成 N 组，
+    每组提交一次 WERYDANCE，并发等全部完成，ffmpeg concat 拼成 storyboard_trailer.mp4。
+    成功返回最终 mp4 路径；任一段失败返回 None，让 step7 fallback 到单 trailer 循环或逐镜。"""
+    if not STORYBOARD_TRAILER_MAIN or ADS_DIALOGUE_MODE:
+        return None
+    board_path = OUTPUT_DIR / "production_storyboard_page.png"
+    if not board_path.exists() or board_path.stat().st_size < 100000:
+        tg("⚠️ multi-trailer: production_storyboard_page.png 缺失，跳过")
+        return None
+
+    # 1. 贪心装箱：每组 panels 旁白总时长 ≤ max_dur
+    max_dur = int(os.environ.get("ADR_TRAILER_MAX_DURATION", "15"))
+    min_dur = int(os.environ.get("ADR_TRAILER_MIN_DURATION", "5"))
+    groups: list[dict] = []
+    cur_panels: list[int] = []
+    cur_dur = 0.0
+    for i, s in enumerate(script):
+        pdur = float(s.get("vid_duration") or s.get("dur") or 5.0)
+        if cur_panels and cur_dur + pdur > max_dur:
+            d = int(round(min(max(cur_dur, min_dur), max_dur)))
+            groups.append({"start": cur_panels[0], "end": cur_panels[-1], "duration": d})
+            cur_panels, cur_dur = [], 0.0
+        cur_panels.append(i)
+        cur_dur += pdur
+    if cur_panels:
+        d = int(round(min(max(cur_dur, min_dur), max_dur)))
+        groups.append({"start": cur_panels[0], "end": cur_panels[-1], "duration": d})
+
+    n = len(groups)
+    if n == 0:
+        return None
+    tg(f"🎬 multi-trailer 分组：{n} 段 × {[g['duration'] for g in groups]}s 覆盖 panels {[(g['start']+1, g['end']+1) for g in groups]}")
+
+    # 2. 上传公共素材
+    try:
+        board_url = _upload_to_weryai(str(board_path))
+    except Exception as e:
+        log(f"multi-trailer board upload failed: {e}")
+        return None
+    sheet_path = OUTPUT_DIR / "character_sheet.png"
+    sheet_url = None
+    if sheet_path.exists() and sheet_path.stat().st_size > 100000:
+        try:
+            sheet_url = _upload_to_weryai(str(sheet_path))
+        except Exception as e:
+            log(f"multi-trailer character_sheet upload skipped: {e}")
+
+    # 3. 并发提交 N 段
+    has_sheet = sheet_url is not None
+    poll_iters = int(os.environ.get("ADR_TRAILER_SEG_POLL_ITERS", "360"))
+
+    def _gen_segment(gi: int, group: dict) -> tuple[int, str | None, str]:
+        prompt = _multi_trailer_prompt_for_group(script, group["start"], group["end"], has_sheet)
+        images = [board_url] + ([sheet_url] if sheet_url else [])
+        try:
+            _wait_motion_submit_slot(f"multi-trailer seg {gi+1}")
+            r = req_post("/generation/almighty-reference-to-video", {
+                "model": "WERYDANCE_2_0",
+                "images": images,
+                "prompt": prompt,
+                "duration": group["duration"],
+                "aspect_ratio": aspect_ratio,
+                "resolution": os.environ.get("ADR_STORYBOARD_TRAILER_RESOLUTION", "720p"),
+                "generate_audio": "false",
+                "video_number": 1,
+            }, timeout=30)
+            task_id = r.get("data", {}).get("task_id") or (r.get("data", {}).get("task_ids") or [None])[0]
+            if not task_id:
+                return gi, None, "submit_no_task_id"
+            out_path = OUTPUT_DIR / f"trailer_seg_{gi:02d}.mp4"
+            ok, info = _poll_video_task_download(task_id, out_path, f"multi-trailer seg {gi+1}/{n}", max_iterations=poll_iters)
+            return gi, (str(out_path) if ok else None), str(info)
+        except Exception as e:
+            return gi, None, str(e)[:200]
+
+    results: dict[int, tuple[str | None, str]] = {}
+    max_concurrent = min(n, int(os.environ.get("ADR_TRAILER_SEG_MAX_CONCURRENT", "5")))
+    with ThreadPoolExecutor(max_workers=max_concurrent) as ex:
+        futs = [ex.submit(_gen_segment, gi, g) for gi, g in enumerate(groups)]
+        for f in as_completed(futs):
+            gi, path, info = f.result()
+            results[gi] = (path, info)
+            tg(f"{'✓' if path else '⚠️'} multi-trailer seg {gi+1}/{n} {'完成' if path else '失败: ' + info[:80]}")
+
+    seg_paths = [results[i][0] for i in range(n)]
+    if any(p is None for p in seg_paths):
+        tg(f"⚠️ multi-trailer 有 {sum(1 for p in seg_paths if p is None)}/{n} 段失败，降级")
+        return None
+
+    # 4. concat（先标准化 fps 再合并）
+    concat_list = OUTPUT_DIR / "trailer_segs_concat.txt"
+    with open(concat_list, "w") as f:
+        for p in seg_paths:
+            f.write(f"file '{p}'\n")
+    final_path = OUTPUT_DIR / "storyboard_trailer.mp4"
+    try:
+        ffmpeg("-f", "concat", "-safe", "0", "-i", str(concat_list),
+               "-c:v", "libx264", "-crf", "20", "-preset", "medium",
+               "-vf", "fps=24",
+               "-an",
+               str(final_path), timeout=240)
+    except Exception as e:
+        log(f"multi-trailer concat failed: {e}")
+        return None
+    total_dur = ffprobe_duration(str(final_path))
+    tg(f"✅ multi-trailer 拼接完成：{n} 段 → {total_dur:.1f}s @24fps CFR")
+    return str(final_path)
+
+
 def _generate_storyboard_trailer_motion(script: list[dict], motion_prompts: list[str], aspect_ratio: str) -> dict | None:
     """Sidecar: production storyboard page -> short trailer. Never replaces the main timeline."""
     if not STORYBOARD_TRAILER_MODE or ADS_DIALOGUE_MODE:
@@ -9065,9 +9198,21 @@ def step65_grid_multiref_motion_qa(script: list[dict]):
     _ensure_motion_action_plan(script)
     _write_motion_action_plan_qa(script)
     n = len(script)
+    aspect = "9:16" if IS_VERTICAL else "16:9"
+
+    # STORYBOARD_TRAILER_MAIN：优先 multi-trailer 分段，每段对应一组 panels 的旁白时长
+    # 成功则覆盖 storyboard_trailer.mp4，step7 拿来作 raw_concat
+    # 失败 fall through 到原单 trailer 路径 + step7 的循环兜底
+    if STORYBOARD_TRAILER_MAIN:
+        tg(f"🧪 STORYBOARD_TRAILER_MAIN 启动：multi-trailer 分段并发")
+        multi_path = _generate_multi_trailer_segments(script, aspect)
+        if multi_path:
+            # 成功，跳过 sidecar 单 trailer 调用避免重复消耗 credits
+            return
+        tg("⚠️ multi-trailer 失败，回退到单 trailer + 循环 fallback")
+
     tg(f"🧪 Grid multi-ref motion QA-only 启动：{n} 分镜")
     motion_prompts = _generate_motion_prompts(script)
-    aspect = "9:16" if IS_VERTICAL else "16:9"
     character_trailer_qa = _generate_character_trailer_motion(script, motion_prompts, aspect)
     trailer_qa = _generate_storyboard_trailer_motion(script, motion_prompts, aspect)
     previs_qa = _generate_previs_page_motion_segments(script, motion_prompts, aspect)
