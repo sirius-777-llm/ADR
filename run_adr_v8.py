@@ -7693,6 +7693,11 @@ def _storyboard_trailer_prompt(script: list[dict], motion_prompts: list[str], ha
         f"{character_sheet_rule}"
         "Do not show the production board itself in the final video. Do not render paper, panel borders, handwriting, "
         "captions, labels, UI text, shot numbers, arrows, checklists, logos, or subtitles. "
+        # ★ 关键文字禁令：实测 WERYDANCE 会把故事板里的中英文标注当画面元素重新渲染，导致乱码涂鸦
+        "ABSOLUTELY NO TEXT IN THE OUTPUT VIDEO: no Chinese characters, no English letters, no numbers, "
+        "no glyphs, no inscriptions on signs/walls/papers/screens, no calligraphy strokes resembling text, "
+        "no garbled pseudo-text. The output must be purely visual cinematic footage with zero readable or unreadable text overlays. "
+        "If a scene has paper/signs/banners/screens visible, leave them BLANK or with abstract texture only, never with letters or characters. "
         "Translate the board into immersive cinematic shots in order, with motivated camera movement, clear action, "
         "continuous style, consistent characters, and no freeze-frame stretching. Keep pacing brisk and trailer-like. "
         f"SHOT ORDER: {' '.join(lines)}"
