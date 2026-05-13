@@ -4267,6 +4267,10 @@ def generate_motion_bridge_refs_gpt_image2(script: list[dict], topic: str) -> di
     """Generate per-shot action end keyframes so WeryDance has start/end visual anchors."""
     if not MOTION_BRIDGE_REFS or ADS_DIALOGUE_MODE:
         return None
+    # trailer-main 模式不跑单镜 motion，bridge refs 没消费方，跳过省 ~5min + 12 张 GPT Image 2 credits
+    if STORYBOARD_TRAILER_MAIN:
+        log("STORYBOARD_TRAILER_MAIN 开启，跳过 motion_bridge_refs（trailer 主路径不消费）")
+        return None
     _model, aspect, extra = pick_image_model(ASPECT_RATIO)
     if _model != "GPT_IMAGE_2":
         return None
