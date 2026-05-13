@@ -8916,7 +8916,13 @@ def _lip_sync_one_scene(idx: int, scene: dict, target_dur: float, aspect_ratio: 
         ref_images = [image_url]
         if sheet_url:
             ref_images = [sheet_url, image_url]
-        api_dur = int(round(max(5, min(15, float(scene.get("dur") or target_dur)))))
+        # duration 计算：TTS 时长可能因 prosody 波动偏短，导致 WERYDANCE 被强制加速朗读 (~2x)
+        # 用 ceil(字数/6) 做最小值兜底（6 字/秒是中文播报舒适上限）
+        # 最终 cap 在 WERYDANCE 硬上限 15s
+        _tts_dur = float(scene.get("dur") or target_dur)
+        _text = str(scene.get("text") or "")
+        _char_min = math.ceil(len(_text) / 6.0) if _text else 0
+        api_dur = int(round(min(15, max(5, _char_min, _tts_dur))))
         if ADSD_ALMIGHTY_AUDIO_DUB_EXPERIMENT:
             variants = [
                 ("audio_dub_primary", "WERYDANCE_2_0", _adsd_almighty_audio_dub_prompt(scene, safe_retry=False), "true"),
