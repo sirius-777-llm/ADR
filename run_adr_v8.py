@@ -243,6 +243,10 @@ VOICE_ASSET_AUDIO_DUB_EXPERIMENT = (
     and os.environ.get("ADR_VOICE_ASSET_AUDIO_DUB", "1").strip().lower() not in ("0", "false", "no", "off")
 )
 VOICE_ASSET_AUDIO_DUB_RESOLUTION = os.environ.get("ADR_VOICE_ASSET_AUDIO_DUB_RESOLUTION", "720p").strip() or "720p"
+VOICE_ASSET_AUDIO_DUB_PARTIAL_OK = (
+    os.environ.get("ADR_VOICE_ASSET_AUDIO_DUB_PARTIAL_OK", "1").strip().lower() not in ("0", "false", "no", "off")
+)
+VOICE_ASSET_AUDIO_DUB_MIN_COVERAGE = min(1.0, max(0.0, float(os.environ.get("ADR_VOICE_ASSET_AUDIO_DUB_MIN_COVERAGE", "0.85"))))
 MOTION_VISUAL_QA = (
     "--no-motion-visual-qa" not in sys.argv
     and os.environ.get("ADR_MOTION_VISUAL_QA", "1").strip().lower() not in ("0", "false", "no", "off")
@@ -6026,6 +6030,12 @@ def _finalize_motion_qa(total: int, success_count: int) -> None:
             if r.get("pass") and r.get("werydance_captions_requested") and not r.get("ass_fallback_required")
         )
         embedded_voice_audio_ready = generated_audio_success == total and generated_audio_success > 0
+        embedded_voice_audio_partial_ready = (
+            VOICE_ASSET_AUDIO_DUB_PARTIAL_OK
+            and total > 0
+            and generated_audio_success > 0
+            and generated_audio_success / max(total, 1) >= VOICE_ASSET_AUDIO_DUB_MIN_COVERAGE
+        )
         payload.update({
             "total": total,
             "success_count": success_count,
@@ -6035,6 +6045,8 @@ def _finalize_motion_qa(total: int, success_count: int) -> None:
             "text_fallback_success_count": text_success,
             "generated_audio_segment_count": generated_audio_success,
             "embedded_voice_audio_ready": embedded_voice_audio_ready,
+            "embedded_voice_audio_partial_ready": embedded_voice_audio_partial_ready,
+            "embedded_voice_audio_coverage": round(generated_audio_success / max(total, 1), 4),
             "motion_action_storyboard_enabled": MOTION_ACTION_STORYBOARD,
             "motion_visual_qa_enabled": MOTION_VISUAL_QA,
             "motion_visual_min_score": MOTION_VISUAL_MIN_SCORE,
@@ -6049,6 +6061,8 @@ def _finalize_motion_qa(total: int, success_count: int) -> None:
             "werydance_caption_segment_count": werydance_caption_success,
             "ass_caption_fallback_count": max(0, total - werydance_caption_success) if WERYDANCE_CAPTIONS else total,
             "voice_asset_audio_dub_experiment": VOICE_ASSET_AUDIO_DUB_EXPERIMENT,
+            "voice_asset_audio_dub_partial_ok": VOICE_ASSET_AUDIO_DUB_PARTIAL_OK,
+            "voice_asset_audio_dub_min_coverage": VOICE_ASSET_AUDIO_DUB_MIN_COVERAGE,
             "default_voice_assets": {
                 "male": DEFAULT_MALE_VOICE_ASSET,
                 "female": DEFAULT_FEMALE_VOICE_ASSET,
@@ -6057,7 +6071,7 @@ def _finalize_motion_qa(total: int, success_count: int) -> None:
             "static_fallback_count": max(0, total - success_count),
             "pass": success_count >= max(1, math.ceil(total * 0.7)),
             "policy": "voice_asset_audio_dub_first_clean_keyframe_image_to_video_text_to_video_static_last",
-            "master_audio_mux_required": not embedded_voice_audio_ready,
+            "master_audio_mux_required": not (embedded_voice_audio_ready or embedded_voice_audio_partial_ready),
             "finalized_at": datetime.now().isoformat(timespec="seconds"),
         })
         p.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -8898,7 +8912,38 @@ def step7_concat(script: list[dict]) -> str:
     concat_txt = OUTPUT_DIR / "concat.txt"
     segment_paths = [str(s["vid_path"]) for s in script]
     audio_flags = [_has_audio_stream(p) for p in segment_paths]
-    if any(audio_flags) and not all(audio_flags):
+    prefer_embedded_partial_audio = (
+        any(audio_flags)
+        and not all(audio_flags)
+        and (
+            (WITH_MOTION and VOICE_ASSET_AUDIO_DUB_EXPERIMENT and VOICE_ASSET_AUDIO_DUB_PARTIAL_OK)
+            or (ADS_DIALOGUE_MODE and ADSD_ALMIGHTY_AUDIO_DUB_EXPERIMENT)
+        )
+    )
+    if prefer_embedded_partial_audio:
+        log("视频片段音轨混合：部分片段含段内语音，缺音片段补静音，保留 WeryDance 段内音色")
+        filled_paths: list[str] = []
+        for i, src in enumerate(segment_paths):
+            if audio_flags[i]:
+                filled_paths.append(src)
+                continue
+            dur = ffprobe_duration(src)
+            dst = str(OUTPUT_DIR / f"seg_{i}_concat_silence_audio.mp4")
+            ffmpeg(
+                "-f", "lavfi", "-t", f"{dur:.3f}",
+                "-i", "anullsrc=channel_layout=stereo:sample_rate=44100",
+                "-i", src,
+                "-map", "1:v",
+                "-map", "0:a",
+                "-c:v", "copy",
+                "-c:a", "aac", "-b:a", "128k",
+                "-shortest",
+                dst,
+                timeout=120,
+            )
+            filled_paths.append(dst)
+        segment_paths = filled_paths
+    elif any(audio_flags) and not all(audio_flags):
         log("视频片段音轨混合：部分片段含段内语音，拼接前剥离为静音视频，最终回退主音轨")
         stripped_paths: list[str] = []
         for i, src in enumerate(segment_paths):
@@ -9619,9 +9664,16 @@ def step9_render(raw_path: str, voice_path: str, bgm_path: str | None, ass_path:
             generated_count = sum(1 for r in records if r.get("pass") and r.get("video_has_audio") and r.get("generated_audio_from_prompt_dialogue"))
             expected_count = int(motion_qa.get("total") or len({int(r.get("turn", 0)) for r in records if r.get("turn")}) or len(records) or 0)
             has_raw_audio = _has_audio_stream(raw_path)
-            use_embedded_dialogue_audio = has_raw_audio and generated_count == expected_count and generated_count > 0
+            coverage = generated_count / max(expected_count, 1)
+            full_ready = generated_count == expected_count and generated_count > 0
+            partial_ready = (
+                VOICE_ASSET_AUDIO_DUB_PARTIAL_OK
+                and generated_count > 0
+                and coverage >= VOICE_ASSET_AUDIO_DUB_MIN_COVERAGE
+            )
+            use_embedded_dialogue_audio = has_raw_audio and (full_ready or partial_ready)
             if use_embedded_dialogue_audio:
-                embedded_audio_mode = "motion_voice_asset_audio_dub"
+                embedded_audio_mode = "motion_voice_asset_audio_dub" if full_ready else f"motion_voice_asset_audio_dub_partial_{generated_count}_of_{expected_count}"
         except Exception as e:
             log(f"motion voice-asset audio-dub embedded audio 检测失败，继续使用主音轨: {e}")
     render_audio_offset = 0.0 if (ADS_DIALOGUE_MODE and ADSD_LIP_SYNC_EXPERIMENT) else AUDIO_DELAY
