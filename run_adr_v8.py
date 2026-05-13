@@ -208,6 +208,18 @@ CHARACTER_TRAILER_MODE = (
     or "--with-character-trailer" in sys.argv
     or os.environ.get("ADR_CHARACTER_TRAILER_MODE", "").strip().lower() in ("1", "true", "yes", "on")
 )
+# 实验：故事板 trailer 升格为主路径——跳过单镜 motion，整张故事板一次 WERYDANCE 出主视频
+# trailer 时长 5-15s，会被 ffmpeg tpad 拉伸到旁白长度，字幕走原 ASS 烧录
+# 暂定 opt-in，验证多题材后可考虑升为默认
+STORYBOARD_TRAILER_MAIN = (
+    "--storyboard-trailer-main" in sys.argv
+    or os.environ.get("ADR_STORYBOARD_TRAILER_MAIN", "").strip().lower() in ("1", "true", "yes", "on")
+)
+if STORYBOARD_TRAILER_MAIN:
+    # 自动开启 trailer 生成（被升格为主路径，不能不生成）
+    STORYBOARD_TRAILER_MODE = True
+    # 关闭单镜 motion（trailer 已经包含所有运镜）
+    WITH_MOTION = False
 if STORYBOARD_GRID_MULTIREF_SEGMENTS:
     STORYBOARD_GRID_MULTIREF_MOTION = True
 if STORYBOARD_GRID_MULTIREF_MOTION or PREVIS_PAGE_MOTION or STORYBOARD_TRAILER_MODE or CHARACTER_TRAILER_MODE or ADSD_STORYBOARD_GRID:
@@ -8940,6 +8952,39 @@ def step65_grid_multiref_motion_qa(script: list[dict]):
 
 # ── 第七步：拼接视频轨 ────────────────────────────────────────────────────────
 def step7_concat(script: list[dict]) -> str:
+    # 故事板 trailer 主路径：直接用 storyboard_trailer.mp4 作为 raw 视频
+    # 用 tpad 把 15s trailer 拉伸到旁白总长度（最后一帧 clone 填充），字幕走原 ASS 烧录
+    if STORYBOARD_TRAILER_MAIN:
+        trailer_path = OUTPUT_DIR / "storyboard_trailer.mp4"
+        if trailer_path.exists() and trailer_path.stat().st_size > 100000:
+            raw_path = str(OUTPUT_DIR / "raw_concat.mp4")
+            try:
+                trailer_dur = ffprobe_duration(str(trailer_path))
+                # 目标时长：所有 scene end 时间的最大值（旁白尾） + 0.5s buffer
+                target_dur = max((s.get("end") or s.get("audio_end") or 0) for s in script) + 0.5
+                pad_dur = max(0.0, target_dur - trailer_dur)
+                if pad_dur > 0.2:
+                    ffmpeg(
+                        "-i", str(trailer_path),
+                        "-vf", f"tpad=stop_mode=clone:stop_duration={pad_dur:.3f}",
+                        "-c:v", "libx264", "-crf", "20", "-preset", "medium",
+                        "-an",
+                        raw_path,
+                        timeout=180,
+                    )
+                    tg(f"🎬 step7: trailer ({trailer_dur:.1f}s) 拉伸至 {target_dur:.1f}s 作 raw 视频")
+                else:
+                    import shutil
+                    shutil.copy(str(trailer_path), raw_path)
+                    tg(f"🎬 step7: trailer ({trailer_dur:.1f}s) 直作 raw 视频")
+                log(f"step7 STORYBOARD_TRAILER_MAIN: raw_concat <- storyboard_trailer (pad={pad_dur:.2f}s)")
+                return raw_path
+            except Exception as e:
+                tg(f"⚠️ trailer 拉伸失败：{str(e)[:120]}，回退到逐镜拼接")
+                log(f"step7 STORYBOARD_TRAILER_MAIN extend failed: {e}")
+        else:
+            tg("⚠️ STORYBOARD_TRAILER_MAIN 开启但 storyboard_trailer.mp4 不存在/过小，回退到逐镜拼接")
+            log("step7 STORYBOARD_TRAILER_MAIN fallback: trailer missing, using per-scene concat")
     concat_txt = OUTPUT_DIR / "concat.txt"
     segment_paths = [str(s["vid_path"]) for s in script]
     audio_flags = [_has_audio_stream(p) for p in segment_paths]
