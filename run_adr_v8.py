@@ -11319,10 +11319,59 @@ def step10_deliver(final_path: str, topic: str, script: list[dict]):
 
 
 # ── 主流程 ───────────────────────────────────────────────────────────────────
+def _print_execution_plan() -> None:
+    """启动时打印本次 run 会激活哪些可选模块 + 预估时间/credits。
+    目的：开 mode flag 时让"无消费方但仍激活的浪费"立刻可见，避免我（PM）忘记 short-circuit。"""
+    fmt = "VDAR 9:16" if IS_VERTICAL else "HDAR 16:9"
+    # (模块名, 是否激活, 预估时间 min, 预估 credits, 说明)
+    plan: list[tuple[str, bool, str, str, str]] = [
+        ("Step1 剧本+视觉规划", True, "1-2", "0", "LLM 链 (Gemini/Claude)"),
+        ("Step2 Podcast TTS 主音轨", not NO_VOICE and not ADS_DIALOGUE_MODE, "1-3", "~30", "weryai podcast，失败降级 OpenAI/Edge TTS"),
+        ("Step2 BGM-only 静音轨", NO_VOICE, "0.1", "0", "ffmpeg 生成静音占位"),
+        ("ADSD 逐句 text-to-audio", ADS_DIALOGUE_MODE, "2-3", "~25", "每 turn 一次 TTS"),
+        ("Step6 character_sheet", CHARACTER_TRAILER_MODE or (ADS_DIALOGUE_MODE and ADSD_LIP_SYNC_EXPERIMENT) or (ADS_REPORTER_MODE and not ADS_DIALOGUE_MODE and ADS_CHARACTER_SHEET_REQUESTED), "2-3", "~60", "GPT Image 2 model sheet"),
+        ("Step6 production_storyboard_page", True, "2-3", "~60", "GPT Image 2"),
+        ("Step6 storyboard_grid", GPT_IMAGE2_STORYBOARD_GRID, "3-5", "~80", "GPT Image 2 多 panel 大图 + 切片"),
+        ("Step6 per-scene 单图 (fallback)", not GPT_IMAGE2_STORYBOARD_GRID, "5-8", "~80", "weryai text-to-image 单张 × N"),
+        ("Step6 motion_bridge_refs", MOTION_BRIDGE_REFS and not ADS_DIALOGUE_MODE and not STORYBOARD_TRAILER_MAIN, "3-5", "~60", "GPT Image 2 每镜转场参考"),
+        ("BGM 主乐", not NO_VOICE, "0.5-3", "~5", "weryai 音乐生成 (LLM 自描述)"),
+        ("Step65 per-scene motion", WITH_MOTION and not ADS_DIALOGUE_MODE, "10-30", "~180", "WERYDANCE × N，每镜 ~15 credits"),
+        ("Step65 storyboard_trailer", STORYBOARD_TRAILER_MODE and not ADS_DIALOGUE_MODE, "7-15", "~105", "WERYDANCE 整张故事板 → trailer.mp4"),
+        ("Step65 grid_multiref_motion", STORYBOARD_GRID_MULTIREF_MOTION and not ADS_DIALOGUE_MODE, "8-15", "~120", "实验性多参考切片"),
+        ("Step65 previs_page_motion", PREVIS_PAGE_MOTION and not ADS_DIALOGUE_MODE, "5-10", "~80", "实验性 previs page"),
+        ("Step65 character_trailer", CHARACTER_TRAILER_MODE, "10-15", "~150", "Character sheet + 干净参考 trailer"),
+        ("Step66 ADSD lip-sync", ADS_DIALOGUE_MODE and ADSD_LIP_SYNC_EXPERIMENT, "10-20", "~150", "WERYDANCE × N turn"),
+        ("Step7 视频拼接", True, "0.2-0.5", "0", "ffmpeg local"),
+        ("Step8 字幕生成 (ASS)", not NO_VOICE or BGM_ONLY_REQUESTED, "0.5-1", "0", "LLM 断句 + ASS 生成"),
+        ("Step9 最终合成", True, "0.5-1", "0", "ffmpeg 烧字幕 + 音轨"),
+        ("Step10 推送 Telegram", True, "0.1-0.3", "0", "上传成片 + 封面"),
+    ]
+    active = [p for p in plan if p[1]]
+    skipped = [p for p in plan if not p[1]]
+    total_min_lo = sum(float(p[2].split("-")[0]) for p in active)
+    total_min_hi = sum(float(p[2].split("-")[-1]) for p in active)
+    total_credits = sum(int(p[3].replace("~", "").strip() or 0) for p in active)
+    lines = ["", "═════ 本次 ADR 执行计划 ═════"]
+    lines.append(f"画幅: {fmt}    主题: {TOPIC[:60]}{'...' if len(TOPIC) > 60 else ''}")
+    lines.append(f"激活模块 {len(active)} 个 | 预估 {total_min_lo:.1f}-{total_min_hi:.1f} min | 预估 ~{total_credits} credits")
+    lines.append("")
+    for name, _on, t_est, c_est, desc in active:
+        lines.append(f"  ✓ {name:<32} {t_est:>6} min  {c_est:>6} credits  -- {desc}")
+    if skipped:
+        lines.append("")
+        lines.append("跳过的可选模块（标志位关闭）：")
+        for name, _on, t_est, c_est, desc in skipped:
+            lines.append(f"  · {name}")
+    lines.append("════════════════════════════")
+    for line in lines:
+        log(line)
+
+
 def main():
     topic = TOPIC
     log(f"开始处理：{topic}")
     log(f"输出目录：{OUTPUT_DIR}")
+    _print_execution_plan()
 
     t_start = time.time()
     timings = {}
