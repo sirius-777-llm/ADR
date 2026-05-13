@@ -3477,6 +3477,27 @@ def _enforce_monotonic(boundaries: list[float], min_gap: float = 0.3) -> list[fl
     return result
 
 
+def _manual_override_segments(script: list[dict]) -> list[dict] | None:
+    if not script or not all(s.get("override_duration") for s in script):
+        return None
+    result: list[dict] = []
+    cursor = 0.0
+    for s in script:
+        has_start_end = s.get("override_audio_start") is not None and s.get("override_audio_end") is not None
+        if has_start_end:
+            start = max(0.0, float(s.get("override_audio_start") or 0.0))
+            end = max(start + 0.1, float(s.get("override_audio_end") or 0.0))
+            dur = end - start
+            cursor = end
+        else:
+            start = cursor
+            dur = max(0.1, float(s.get("override_duration") or 0.1))
+            end = start + dur
+            cursor = end
+        result.append({"start": start, "end": end, "dur": dur})
+    return result
+
+
 def _calc_sentence_boundaries(voice_path: str, script: list[dict]) -> list[dict]:
     """
     三源融合方案：Whisper 语速曲线 + 字符数插值 + silencedetect 物理校准。
@@ -3487,8 +3508,13 @@ def _calc_sentence_boundaries(voice_path: str, script: list[dict]) -> list[dict]
 
     回退：Whisper 不可用时退化为纯字数比例（不做 silencedetect 校准）。
     """
-    total_dur = ffprobe_duration(voice_path)
     n = len(script)
+    manual = _manual_override_segments(script)
+    if manual and len(manual) == n:
+        log(f"使用外部时间戳分配时间轴：{n} 段")
+        return manual
+
+    total_dur = ffprobe_duration(voice_path)
     sentence_chars = [len(s["text"]) for s in script]
     total_script_chars = sum(sentence_chars)
 
@@ -3771,6 +3797,48 @@ def step345_bgm_only_timeline(script: list[dict], bgm_path: str, voice_path: str
     if bgm_dur <= 0:
         raise RuntimeError("BGM-only 时间轴失败：BGM 时长无效")
     n = max(1, len(script))
+    manual = _manual_override_segments(script)
+    if manual and len(manual) == len(script):
+        timeline = []
+        for i, (s, seg) in enumerate(zip(script, manual)):
+            cursor = float(seg["start"])
+            dur = max(1.0, float(seg["dur"]))
+            sub_start = cursor + SUB_DELAY
+            sub_end = cursor + dur + SUB_DELAY
+            s.update({
+                "audio_start": cursor,
+                "sub_start": sub_start,
+                "sub_end": sub_end,
+                "dur": dur,
+                "vid_duration": dur,
+                "img_path": str(OUTPUT_DIR / f"img_{i}.jpg"),
+                "vid_path": str(OUTPUT_DIR / f"seg_{i}.mp4"),
+                "bgm_only": True,
+            })
+            timeline.append({
+                "scene": i + 1,
+                "text": s.get("text", ""),
+                "start": round(cursor, 3),
+                "end": round(cursor + dur, 3),
+                "duration": round(dur, 3),
+                "chars": len(str(s.get("text", ""))),
+                "manual_timecode": s.get("override_time_label"),
+            })
+        (OUTPUT_DIR / "bgm_only_timeline.json").write_text(
+            json.dumps({
+                "policy": "manual_timecode_override",
+                "bgm_path": bgm_path,
+                "bgm_duration": bgm_dur,
+                "target_total": round(max(seg["end"] for seg in manual), 3),
+                "scene_total": round(max(seg["end"] for seg in manual), 3),
+                "timeline": timeline,
+                "created_at": datetime.now().isoformat(timespec="seconds"),
+            }, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        tg(f"✅ BGM-only 时间轴采用外部时间戳：{len(script)} 镜，目标 {max(seg['end'] for seg in manual):.1f}s")
+        return script
+
     cps = float(os.environ.get("ADR_BGM_ONLY_CPS", "2.4"))
     max_total = float(os.environ.get("ADR_BGM_ONLY_MAX_DURATION", "90"))
     min_shot_cfg = float(os.environ.get("ADR_BGM_ONLY_MIN_SHOT", "2.5"))
