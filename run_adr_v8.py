@@ -9096,16 +9096,20 @@ def step7_concat(script: list[dict]) -> str:
                     ) + 0.5
                 pad_dur = max(0.0, target_dur - trailer_dur)
                 if pad_dur > 0.2:
-                    # tpad clone 真实生成填充帧 + fps=24 强制 CFR，避免 nb_frames 异常少导致播放卡
+                    # 循环 trailer 填充到 target_dur（避免 tpad clone 末帧定格）
+                    # -stream_loop -1 + -t 让 trailer 循环到精确目标时长，fps=24 强制 CFR
+                    loops_est = int(target_dur / trailer_dur) + 1
                     ffmpeg(
+                        "-stream_loop", "-1",
                         "-i", str(trailer_path),
-                        "-vf", f"tpad=stop_mode=clone:stop_duration={pad_dur:.3f},fps=24",
+                        "-t", f"{target_dur:.3f}",
+                        "-vf", "fps=24",
                         "-c:v", "libx264", "-crf", "20", "-preset", "medium",
                         "-an",
                         raw_path,
                         timeout=300,
                     )
-                    tg(f"🎬 step7: trailer ({trailer_dur:.1f}s) 拉伸至 {target_dur:.1f}s @24fps CFR")
+                    tg(f"🎬 step7: trailer ({trailer_dur:.1f}s) 循环 ~{loops_est}× 填到 {target_dur:.1f}s @24fps CFR")
                 else:
                     # 即使不需要拉伸也重编码到 CFR，避免源 VFR 引发后续播放问题
                     ffmpeg(
