@@ -7939,7 +7939,10 @@ def _generate_storyboard_trailer_motion(script: list[dict], motion_prompts: list
             _write_storyboard_trailer_qa(qa)
             return qa
         out_path = OUTPUT_DIR / "storyboard_trailer.mp4"
-        ok, info = _poll_video_task_download(task_id, out_path, "storyboard trailer")
+        # storyboard trailer 整张多 panel 大图喂 WERYDANCE，实测 ~13min 才完成
+        # 用 30min（360 iterations × 5s）避免 false-negative timeout
+        trailer_poll_iters = int(os.environ.get("ADR_STORYBOARD_TRAILER_POLL_ITERS", "360"))
+        ok, info = _poll_video_task_download(task_id, out_path, "storyboard trailer", max_iterations=trailer_poll_iters)
         qa.update(info)
         qa["pass"] = bool(ok)
         if ok:
