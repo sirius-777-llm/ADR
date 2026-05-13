@@ -117,6 +117,7 @@ python3 run_adr_v8.py "江南春日风物" v --bgm-only --with-motion
 |---|---:|---|
 | `ADR_GPT_IMAGE2_STORYBOARD` | `1` | 开关故事板 |
 | `ADR_DEFAULT_STORYBOARD_GRID` | `1` | 开关默认 storyboard grid |
+| `ADR_GPT_IMAGE2_STORYBOARD_GRID_BATCH` | `12` | storyboard grid 默认 12 宫格；横屏 4x3、竖屏 3x4，超出自动拆批 |
 | `ADR_STORYBOARD_REFERENCE_MOTION` | `1` | 动态化使用故事板参考 |
 | `ADR_STORYBOARD_ANNOTATED_MOTION` | `0` | 使用 annotated storyboard 喂 WeryDance |
 | `ADR_MOTION_ACTION_STORYBOARD` | `1` | 动作计划故事板 |

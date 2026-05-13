@@ -4601,6 +4601,8 @@ def _storyboard_grid_cols_rows(count: int) -> tuple[int, int]:
             return 2, 3
         if count <= 9:
             return 3, 3
+        if count <= 12:
+            return 3, 4
         return 4, 4
     if count <= 4:
         return 2, 2
@@ -4608,16 +4610,21 @@ def _storyboard_grid_cols_rows(count: int) -> tuple[int, int]:
         return 3, 2
     if count <= 9:
         return 3, 3
+    if count <= 12:
+        return 4, 3
     return 4, 4
 
 
 def _storyboard_grid_prompt(batch_script: list[dict], start: int, total: int, topic: str, cols: int, rows: int, aspect: str) -> str:
     lines = []
+    visual_limit = max(120, int(os.environ.get("ADR_STORYBOARD_GRID_VISUAL_CHARS", "220")))
+    beat_limit = max(40, int(os.environ.get("ADR_STORYBOARD_GRID_BEAT_CHARS", "64")))
+    motion_limit = max(80, int(os.environ.get("ADR_STORYBOARD_GRID_MOTION_CHARS", "180")))
     for local_i, scene in enumerate(batch_script, start=start + 1):
         prompt = re.sub(r"\s+", " ", str(scene.get("prompt") or scene.get("text") or "")).strip()
         text = re.sub(r"\s+", " ", str(scene.get("text") or "")).strip()
-        action = _motion_action_block(scene, 360)
-        lines.append(f"{local_i:02d}. Visual: {prompt[:300]}\n    Beat: {text[:80]}\n    Motion: {action}")
+        action = _motion_action_block(scene, motion_limit)
+        lines.append(f"{local_i:02d}. Visual: {prompt[:visual_limit]}\n    Beat: {text[:beat_limit]}\n    Motion: {action}")
     count = len(batch_script)
     culture_guard = _topic_culture_guard(batch_script[0].get("topic_meta", {}) if batch_script else {})
     return f"""Create one single {aspect} cinematic storyboard grid for a documentary sequence.
@@ -5152,7 +5159,7 @@ def generate_storyboard_grid_gpt_image2(script: list[dict], topic: str) -> bool:
         log(f"GPT Image 2 storyboard grid 跳过：分镜数 {n} 超过上限 {max_n}")
         return False
     aspect = _storyboard_grid_aspect()
-    batch_size = max(1, min(16, int(os.environ.get("ADR_GPT_IMAGE2_STORYBOARD_GRID_BATCH", "16"))))
+    batch_size = max(1, min(16, int(os.environ.get("ADR_GPT_IMAGE2_STORYBOARD_GRID_BATCH", "12"))))
     prompt_limit = _storyboard_grid_prompt_limit()
     poll_max = float(os.environ.get("ADR_GPT_IMAGE2_STORYBOARD_GRID_POLL_MAX", "300"))
     submit_stagger_sec = max(0.0, float(os.environ.get("ADR_GPT_IMAGE2_STORYBOARD_GRID_SUBMIT_STAGGER", "12")))
