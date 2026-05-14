@@ -9109,10 +9109,54 @@ def _adsd_almighty_audio_dub_prompt(scene: dict, safe_retry: bool = False) -> st
 
 
 def _postprocess_lip_sync_segment(src_video: str, scene: dict, target_dur: float) -> bool:
-    """Normalize Werydance silent lip video to ADR segment size and exact timeline duration."""
+    """Normalize Werydance silent lip video to ADR segment size and exact timeline duration.
+
+    HADSD timed 模式下 target_dur 远大于 WERYDANCE 实际产出（slot 包含 silence pad），
+    原 tpad=clone 会冻末帧 5-9s → 人脸僵住。
+    改用当前 panel still + 缓慢 zoom（Ken Burns）做 pad，视觉像 cutaway 而非死帧。
+    """
     vid_path = scene["vid_path"]
     src_dur = ffprobe_duration(src_video)
     pad = max(0.0, target_dur - src_dur)
+    panel_path = scene.get("img_path", "")
+    use_panel_pad = (
+        pad > 0.04
+        and panel_path
+        and os.path.exists(panel_path)
+        and os.environ.get("ADR_ADSD_PAD_WITH_PANEL", "1").strip().lower() not in ("0", "false", "no", "off")
+    )
+    if use_panel_pad:
+        zoompan_frames = max(1, int(pad * 24))
+        # 双输入：[0]werydance video + [1]panel still 循环 pad 秒
+        # Ken Burns: zoom 从 1.0 缓慢推到 1.06，居中
+        filter_complex = (
+            f"[0:v]scale={VIDEO_W}:{VIDEO_H}:force_original_aspect_ratio=increase,"
+            f"crop={VIDEO_W}:{VIDEO_H},setsar=1[werynorm];"
+            f"[1:v]scale={VIDEO_W*2}:{VIDEO_H*2}:force_original_aspect_ratio=increase,"
+            f"crop={VIDEO_W*2}:{VIDEO_H*2},"
+            f"zoompan=z='min(1.0+0.0008*on,1.06)':"
+            f"x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':"
+            f"d={zoompan_frames}:s={VIDEO_W}x{VIDEO_H}:fps=24,"
+            f"setsar=1[panel];"
+            f"[werynorm][panel]concat=n=2:v=1:a=0,"
+            f"trim=duration={target_dur:.3f},setpts=PTS-STARTPTS[out]"
+        )
+        try:
+            ffmpeg(
+                "-i", src_video,
+                "-loop", "1", "-t", f"{pad:.3f}", "-i", panel_path,
+                "-filter_complex", filter_complex,
+                "-map", "[out]",
+                "-an",
+                "-c:v", "libx264", "-crf", "20", "-preset", "medium",
+                "-pix_fmt", "yuv420p",
+                vid_path,
+                timeout=240,
+            )
+            return os.path.exists(vid_path) and os.path.getsize(vid_path) > 10000
+        except Exception as e:
+            log(f"[lip-sync postprocess] panel-pad Ken Burns 失败回退 tpad clone: {e}")
+    # 回退 / 短 pad / 无 panel 路径：原 tpad clone
     vf = (
         f"scale={VIDEO_W}:{VIDEO_H}:force_original_aspect_ratio=increase,"
         f"crop={VIDEO_W}:{VIDEO_H},setsar=1"
@@ -9133,10 +9177,56 @@ def _postprocess_lip_sync_segment(src_video: str, scene: dict, target_dur: float
 
 
 def _postprocess_audio_dub_segment(src_video: str, scene: dict, target_dur: float) -> bool:
-    """Normalize Almighty audio-dub video while preserving generated segment audio for QA sidecars."""
+    """Normalize Almighty audio-dub video while preserving generated segment audio for QA sidecars.
+
+    pad 段视频用 panel still + Ken Burns 替代 tpad clone（解决冻人脸 bug）；
+    pad 段音频仍走 apad 静音填充。
+    """
     vid_path = scene["vid_path"]
     src_dur = ffprobe_duration(src_video)
     pad = max(0.0, target_dur - src_dur)
+    panel_path = scene.get("img_path", "")
+    use_panel_pad = (
+        pad > 0.04
+        and panel_path
+        and os.path.exists(panel_path)
+        and os.environ.get("ADR_ADSD_PAD_WITH_PANEL", "1").strip().lower() not in ("0", "false", "no", "off")
+    )
+    if use_panel_pad:
+        zoompan_frames = max(1, int(pad * 24))
+        # 三个 stream：[0:v] wery video, [0:a] wery audio, [1:v] panel still
+        # 视频：normalize wery + concat panel Ken Burns，trim 到 target_dur
+        # 音频：apad 填静音到 target_dur
+        filter_complex = (
+            f"[0:v]scale={VIDEO_W}:{VIDEO_H}:force_original_aspect_ratio=increase,"
+            f"crop={VIDEO_W}:{VIDEO_H},setsar=1[werynorm];"
+            f"[1:v]scale={VIDEO_W*2}:{VIDEO_H*2}:force_original_aspect_ratio=increase,"
+            f"crop={VIDEO_W*2}:{VIDEO_H*2},"
+            f"zoompan=z='min(1.0+0.0008*on,1.06)':"
+            f"x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':"
+            f"d={zoompan_frames}:s={VIDEO_W}x{VIDEO_H}:fps=24,"
+            f"setsar=1[panel];"
+            f"[werynorm][panel]concat=n=2:v=1:a=0,"
+            f"trim=duration={target_dur:.3f},setpts=PTS-STARTPTS[vout];"
+            f"[0:a]apad=pad_dur={pad:.3f},atrim=duration={target_dur:.3f},asetpts=PTS-STARTPTS[aout]"
+        )
+        try:
+            ffmpeg(
+                "-i", src_video,
+                "-loop", "1", "-t", f"{pad:.3f}", "-i", panel_path,
+                "-filter_complex", filter_complex,
+                "-map", "[vout]",
+                "-map", "[aout]",
+                "-c:v", "libx264", "-crf", "20", "-preset", "medium",
+                "-c:a", "aac", "-b:a", "128k",
+                "-pix_fmt", "yuv420p",
+                vid_path,
+                timeout=240,
+            )
+            return os.path.exists(vid_path) and os.path.getsize(vid_path) > 10000
+        except Exception as e:
+            log(f"[audio-dub postprocess] panel-pad Ken Burns 失败回退 tpad clone: {e}")
+    # 回退 / 短 pad / 无 panel 路径：原 tpad clone
     vf = (
         f"scale={VIDEO_W}:{VIDEO_H}:force_original_aspect_ratio=increase,"
         f"crop={VIDEO_W}:{VIDEO_H},setsar=1"
