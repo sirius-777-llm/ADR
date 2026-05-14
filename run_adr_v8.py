@@ -270,8 +270,8 @@ ADSD_DEFAULT_FEMALE_VOICE_ASSET = os.environ.get("ADR_ADSD_DEFAULT_FEMALE_VOICE_
 # speaker name 含以下关键字时，优先用对应音色库 asset_id
 # 排除项：歌声（BY2/orange4music/JJ Lin）、混音未分离（mettsarchive 原始）、高风险公众人物（Trump/JJ Lin 默认不用）
 ADSD_SPEAKER_KEYWORD_TO_ASSET: list[tuple[list[str], str]] = [
-    # 法学 / 讲师 / 教授 / 旁白人（沉稳叙述）
-    (["法学", "律师", "讲师", "教授", "讲座", "理性", "罗翔", "旁白人", "末日旁白", "解说", "总叙", "总结者"], "external_luo_xiang_xyma_001"),
+    # 法学 / 讲师 / 教授 / 旁白（沉稳叙述）
+    (["法学", "律师", "讲师", "教授", "讲座", "理性", "罗翔", "旁白", "末日旁白", "解说", "总叙", "总结者", "narrator", "Narrator"], "external_luo_xiang_xyma_001"),
     # 知识型访谈 / 经济 / 作家 / 评论
     (["学者", "知识", "评论", "作家", "记者", "访谈", "许知远", "经济学家", "社会学家", "历史学家", "评论员"], "external_xu_zhiyuan_xyma_001"),
     # 科技 / 企业家 / 工程师 / 投资人 / 合伙人
@@ -2603,6 +2603,10 @@ THUMBNAIL_ANCHOR: 封面视觉锚，用 4~6 个短语描述：主体、主色（
                 "visual_subject": dialogue_meta.get("visual_subject", ""),
                 "speaker_id": dialogue_meta.get("speaker_id"),
                 "speaker_name": dialogue_meta.get("speaker_name", ""),
+                # P3：把 voice_asset_id 从 dialogue_meta 透传到 script item
+                # 否则 step66 的 _select_voice_asset_reference 拿不到 explicit asset，
+                # 全部降级到 ADSD_DEFAULT_MALE/FEMALE_VOICE_ASSET
+                "voice_asset_id": dialogue_meta.get("voice_asset_id"),
                 "shot": dialogue_meta.get("shot", ""),
                 "dialogue_shape": dialogue_meta.get("dialogue_shape", ""),
                 "speaker_count": dialogue_meta.get("speaker_count"),
