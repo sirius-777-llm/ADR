@@ -1475,7 +1475,8 @@ def _voice_for_speaker(speaker: str, gender: str | None = None) -> dict:
     elif speaker in ADSD_VOICES:
         voice = ADSD_VOICES[speaker]
     elif "旁白" in speaker or speaker.lower() in ("narrator", "voiceover", "vo"):
-        voice = ADSD_FEMALE_VOICE_POOL[0]
+        # 旁白默认走男声沉稳叙述，避免短视频女声错位（如需女声旁白显式 voice_gender=female 即可）
+        voice = ADSD_MALE_VOICE_POOL[abs(hash(speaker)) % len(ADSD_MALE_VOICE_POOL)]
     elif any(k in speaker for k in ("少年", "青年", "士人", "书生", "学生", "百姓", "船工", "兵士", "亲历者", "见证人")):
         voice = ADSD_VOICES["记者"]
     elif any(k in speaker for k in ("职员", "官员", "朝臣", "僧", "长者", "将领", "书吏", "幕僚", "使者", "父老", "寺")):
