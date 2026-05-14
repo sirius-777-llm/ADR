@@ -304,9 +304,38 @@ ADSD_GENDER_FALLBACK_VOICE_ASSET = {
 }
 
 
+_ACTION_KEYWORDS_ZH = (
+    "剑", "刀", "戟", "矛", "斧", "枪",
+    "斗", "打", "战", "杀", "砍", "劈", "刺", "戳", "撕",
+    "招", "式", "法决", "神通", "灵气", "法力", "真气", "元气", "剑气", "剑光", "刀光",
+    "暴击", "冲撞", "腾空", "凌空", "飞身", "纵跃", "踢", "拳", "掌", "击碎",
+    "爆", "炸", "破", "毁", "崩", "裂", "震",
+)
+
+
+def _is_action_scene(text: str, shot: str = "") -> bool:
+    """检测是否动作场面（武侠/修真/打斗题材）"""
+    combined = str(text or "") + " " + str(shot or "")
+    hits = sum(1 for kw in _ACTION_KEYWORDS_ZH if kw in combined)
+    return hits >= 2  # 至少 2 个动作关键字
+
+
+def _action_motion_fragment() -> str:
+    """动作场面专用 WERYDANCE motion prompt 强化 — 武侠/修真打斗节奏"""
+    return (
+        " High-energy wuxia/xianxia cultivation action sequence. "
+        "Dynamic combat choreography: rapid whip pans, low-angle hero shots, dolly-zoom on impact, selective slow-motion. "
+        "Visible sword/blade trails, qi/spiritual energy bursts in neon ink-wash palette, "
+        "wind-driven garments and hair flying, debris and sparks streaming. "
+        "Strong motion blur on weapon strikes, cinematic depth of field, dramatic backlight, "
+        "particle effects (dust, embers, talismanic glyphs in mid-air). "
+    )
+
+
 def _infer_needs_lip_sync(speaker: str, text: str = "", emotion: str = "") -> bool:
     """规则推断：本 turn 是否需要走 A-roll lip-sync 路径（说话人正脸 + 嘴对音频）。
     旁白/voiceover/解说类 → False (B-roll voice-over，画面全员可动)
+    动作场面（武侠/修真/打斗 ≥2 关键字） → False (B-roll，让 WERYDANCE 自由发挥动作)
     其他 speaker → True (A-roll lip-sync 保留口型同步)
     可被 override 脚本/LLM 显式覆盖。
     """
@@ -315,6 +344,9 @@ def _infer_needs_lip_sync(speaker: str, text: str = "", emotion: str = "") -> bo
         return True
     # 显式 narrator 类型 → B-roll voice-over
     if "旁白" in sp or sp.lower() in ("narrator", "voiceover", "vo", "解说"):
+        return False
+    # 动作场面：text 里 ≥2 个武侠/修真/打斗关键字 → B-roll 让画面优先表达动作
+    if _is_action_scene(text):
         return False
     return True
 
@@ -3660,7 +3692,9 @@ def step2_dialogue_voice(script: list[dict]) -> str:
 
     若需保留旧 timecode-pad 行为：set ADR_HADSD_RESPECT_TIMECODE_LENGTH=1
     """
-    pause = float(os.environ.get("ADR_ADSD_TURN_PAUSE", "0.22"))
+    # HADSD 紧凑模式默认 0：消除 turn 间 silence pad 产生的可见冻帧
+    # 需要每段间自然呼吸感时显式 set ADR_ADSD_TURN_PAUSE=0.22
+    pause = float(os.environ.get("ADR_ADSD_TURN_PAUSE", "0.0"))
     respect_timecode = os.environ.get("ADR_HADSD_RESPECT_TIMECODE_LENGTH", "0").strip().lower() in ("1", "true", "yes", "on")
     has_override_timing = respect_timecode and any(s.get("override_audio_start") is not None for s in script)
     if has_override_timing:
@@ -9120,13 +9154,15 @@ def _adsd_lip_sync_prompt(scene: dict, safe_retry: bool = False) -> str:
 
 def _adsd_broll_motion_prompt(scene: dict, safe_retry: bool = False) -> str:
     """B-roll / voice-over 模式：不传 audio，让 WERYDANCE 走 motion 模式，画面全员可动。
-    用于旁白等不需要说话人正脸 lip-sync 的 turn。"""
+    用于旁白等不需要说话人正脸 lip-sync 的 turn。
+    动作题材（武侠/修真/打斗）自动追加 action prompt 强化镜头。"""
     shot = scene.get("shot", "")
     text = scene.get("text", "")
     pov = (
         " First-person onsite observer POV: viewer stands within the scene, observing as the moment unfolds; no character speaks directly to camera."
         if ADSD_ONSITE_POV_MODE else ""
     )
+    action_boost = _action_motion_fragment() if _is_action_scene(text, shot) else ""
     base = (
         "Cinematic documentary B-roll, voice-over scene. "
         "If a character sheet reference is provided, use it only to preserve character identity across panels; do not render the sheet itself. "
@@ -9134,6 +9170,7 @@ def _adsd_broll_motion_prompt(scene: dict, safe_retry: bool = False) -> str:
         "No character speaks directly to camera; no lip-sync needed; no mouth animation prioritized. "
         "All visible elements may have natural ambient motion: subtle breathing, head turns, garment sway, lantern flicker, water ripple, dust motes, foliage drift. "
         "Cinematic camera movement: slow dolly, push-in, or steady wide shot; depth of field; film grain. "
+        f"{action_boost}"
     )
     if safe_retry:
         return (base +
