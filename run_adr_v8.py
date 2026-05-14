@@ -911,6 +911,82 @@ def req_get(path: str, timeout: int = 15) -> dict:
     return r.json()
 
 
+# ── TG 上传 probe-gap 检测共用 helper ──
+# 用前后两条静默 probe 文本消息的 message_id 跳号，识别 SSL 假阴性（实际上传成功但 client 抛错）。
+# 用于 sendVideo / sendPhoto 等大 payload 上传场景。
+def _tg_probe_send(label: str) -> int | None:
+    if not TG_BOT_TOKEN or not TG_CHAT_ID:
+        return None
+    try:
+        rp = requests.post(
+            f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage",
+            data={
+                "chat_id": TG_CHAT_ID,
+                "text": f"·{label}·",
+                "disable_notification": "true",
+            },
+            timeout=15,
+        )
+        if rp.status_code == 200:
+            return rp.json().get("result", {}).get("message_id")
+    except Exception as e:
+        log(f"TG probe '{label}' 发送失败：{e}")
+    return None
+
+
+def _tg_probe_delete(message_id: int | None) -> None:
+    if not message_id or not TG_BOT_TOKEN or not TG_CHAT_ID:
+        return
+    try:
+        requests.post(
+            f"https://api.telegram.org/bot{TG_BOT_TOKEN}/deleteMessage",
+            data={"chat_id": TG_CHAT_ID, "message_id": message_id},
+            timeout=10,
+        )
+    except Exception:
+        pass
+
+
+def _tg_upload_with_probe_gap(
+    upload_fn,
+    *,
+    probe_label_prefix: str,
+    max_attempts: int = 2,
+    retry_sleep_seconds: float = 5.0,
+) -> dict:
+    """带 probe-gap 假阴性检测的 TG 上传通用 wrapper。
+    upload_fn() 应返回 dict {ok: bool, message_id: int|None, exception: Exception|None}。
+    若 upload_fn 抛异常，自动用前后 probe 跳号检测 chat 是否已收到消息。
+    返回 {ok: bool, source: str, message_id: int|None, attempts: int}
+    """
+    last_exc: Exception | None = None
+    for attempt in range(max_attempts):
+        probe_before = _tg_probe_send(f"{probe_label_prefix}-start-{attempt+1}")
+        try:
+            result = upload_fn()
+            if result.get("ok"):
+                _tg_probe_delete(probe_before)
+                return {"ok": True, "source": "direct", "message_id": result.get("message_id"), "attempts": attempt + 1}
+            last_exc = result.get("exception")
+        except Exception as e:
+            last_exc = e
+        # 异常路径：probe gap 检测
+        time.sleep(3)
+        probe_after = _tg_probe_send(f"{probe_label_prefix}-check-{attempt+1}")
+        if probe_before is not None and probe_after is not None:
+            gap = probe_after - probe_before
+            if gap >= 2:
+                log(f"{probe_label_prefix}: probe-gap={gap} → 上传已落地，本地异常为假阴性")
+                _tg_probe_delete(probe_after)
+                _tg_probe_delete(probe_before)
+                return {"ok": True, "source": "probe_gap_detected", "message_id": None, "attempts": attempt + 1}
+        _tg_probe_delete(probe_after)
+        _tg_probe_delete(probe_before)
+        if attempt < max_attempts - 1:
+            time.sleep(retry_sleep_seconds)
+    return {"ok": False, "source": "all_failed", "message_id": None, "attempts": max_attempts, "last_exception": str(last_exc) if last_exc else None}
+
+
 def poll(task_id: str, label: str = "") -> dict:
     """轮询任务状态直到 succeed 或 fail，返回最终 data 字典。"""
     for i in range(POLL_MAX):
@@ -12163,37 +12239,10 @@ def step10_deliver(final_path: str, topic: str, script: list[dict]):
     short_caption = f"{short_title} — {delivery_tag}"
     video_ok = False
 
-    # ── SSL 假阴性防护：LibreSSL ↔ TG 的 bad-record-mac 让 requests 把"已成功"误判成失败 →
-    # 历史上手动补传造成重复视频。机制：上传前后各发一条静默 probe 文本占位消息，
-    # 上传异常时对比前后 message_id 跳号，若中间被插入一条则视频已落到 chat（无需重传）。
-    def _send_probe(label: str) -> int | None:
-        try:
-            rp = requests.post(
-                f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage",
-                data={
-                    "chat_id": TG_CHAT_ID,
-                    "text": f"·{label}·",  # 简短占位，便于人工识别也便于稍后删除
-                    "disable_notification": "true",
-                },
-                timeout=15,
-            )
-            if rp.status_code == 200:
-                return rp.json().get("result", {}).get("message_id")
-        except Exception as e:
-            log(f"probe '{label}' 发送失败：{e}")
-        return None
-
-    def _delete_probe(message_id: int | None) -> None:
-        if not message_id:
-            return
-        try:
-            requests.post(
-                f"https://api.telegram.org/bot{TG_BOT_TOKEN}/deleteMessage",
-                data={"chat_id": TG_CHAT_ID, "message_id": message_id},
-                timeout=10,
-            )
-        except Exception:
-            pass
+    # ── SSL 假阴性防护：见模块级 _tg_probe_send / _tg_probe_delete ──
+    # 局部 alias，保留原变量名以最小化 diff
+    _send_probe = _tg_probe_send
+    _delete_probe = _tg_probe_delete
 
     # ── 尝试 1：requests（timeout 放大到 600s），前后 probe 跳号检测 ──
     probe_before = _send_probe("up-start")
