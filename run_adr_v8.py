@@ -250,6 +250,66 @@ ADSD_ALMIGHTY_AUDIO_DUB_EXPERIMENT = (
 )
 ADSD_DEFAULT_MALE_VOICE_ASSET = os.environ.get("ADR_ADSD_DEFAULT_MALE_VOICE_ASSET", "external_luo_xiang_xyma_001")
 ADSD_DEFAULT_FEMALE_VOICE_ASSET = os.environ.get("ADR_ADSD_DEFAULT_FEMALE_VOICE_ASSET", "external_by2_e7gn_001")
+
+# ── 音色库智能匹配（P3） ─────────────────────────────────────────
+# speaker name 含以下关键字时，优先用对应音色库 asset_id
+# 排除项：歌声（BY2/orange4music/JJ Lin）、混音未分离（mettsarchive 原始）、高风险公众人物（Trump/JJ Lin 默认不用）
+ADSD_SPEAKER_KEYWORD_TO_ASSET: list[tuple[list[str], str]] = [
+    # 法学 / 讲师 / 教授 / 旁白人（沉稳叙述）
+    (["法学", "律师", "讲师", "教授", "讲座", "理性", "罗翔", "旁白人", "末日旁白", "解说", "总叙", "总结者"], "external_luo_xiang_xyma_001"),
+    # 知识型访谈 / 经济 / 作家 / 评论
+    (["学者", "知识", "评论", "作家", "记者", "访谈", "许知远", "经济学家", "社会学家", "历史学家", "评论员"], "external_xu_zhiyuan_xyma_001"),
+    # 科技 / 企业家 / 工程师 / 投资人 / 合伙人
+    (["工程师", "科学家", "CEO", "投资", "企业家", "硅谷", "技术", "黄仁勋", "Jensen", "合伙人", "创始人", "VC", "GP"], "external_huang_renxun_fzh_001"),
+    # 玄幻 / 古风长者 / 道士 / 牧神记男角
+    (["道士", "玄幻", "宗师", "长者", "修真", "高人", "老人", "前辈", "老者", "绫璟", "道人"], "external_mushenji_lingjing_001"),
+    # 年轻男 / 弟子 / 学生 / 秦牧
+    (["弟子", "学生", "少年", "孩子", "小子", "秦牧"], "external_mushenji_qinmu_001"),
+    # 古装女 / 公主 / 夫人 / 虞渊初雨
+    (["公主", "王后", "嫔", "贵妃", "千金", "夫人", "娘娘", "格格", "虞渊", "初雨"], "external_mushenji_chuyu_001"),
+    # 影视演员 / 戏剧对白
+    (["演员", "戏剧角色", "戏中人", "黄渤"], "external_huang_bo_tiktok_7550564384750210321"),
+    # 台湾国语 / 感情戏男
+    (["台剧", "台湾", "感情戏"], "external_tiktok_comedydramatw_male_001"),
+    # 印尼华侨 / 东南亚口音
+    (["印尼", "华侨", "东南亚"], "external_mettsarchive_indo_chinese_speakerB_001"),
+    # 街访 / 都市女
+    (["街访", "都市女", "路人女", "市民女", "都市感"], "external_tiktok_urban_talk_7618042272130600212"),
+    # 旅游 / 短视频女
+    (["旅游", "向导女", "vlogger"], "external_tiktok_nghithao_0208_7624063339613752594"),
+    # 干货 / 培训女
+    (["电商", "培训", "干货", "讲解师", "运营"], "external_tiktok_ecom_female_001"),
+    # 短视频高能女
+    (["主播", "网红", "活力女"], "external_tiktok_fjl9fl6_7621754156704959765"),
+]
+# gender-only fallback（关键字未命中时）
+ADSD_GENDER_FALLBACK_VOICE_ASSET = {
+    "male": ADSD_DEFAULT_MALE_VOICE_ASSET,
+    "female": "external_tiktok_nghithao_0208_7624063339613752594",  # 不用 BY2 歌声
+}
+
+
+def _voice_asset_id_for_speaker(speaker: str, gender: str | None = None) -> str:
+    """根据 speaker name 关键字命中音色库的 voice_id；命中失败按 gender 走 fallback。"""
+    s = str(speaker or "")
+    g = (gender or "").strip().lower()
+    if not s:
+        return ADSD_GENDER_FALLBACK_VOICE_ASSET.get(g, ADSD_DEFAULT_MALE_VOICE_ASSET)
+    for keywords, asset_id in ADSD_SPEAKER_KEYWORD_TO_ASSET:
+        for kw in keywords:
+            if kw and kw in s:
+                # 还要按 gender 校验：如果命中的 asset gender 不匹配，跳过
+                if g:
+                    try:
+                        data = _load_voice_assets()
+                        asset = next((a for a in data.get("assets", []) if a.get("voice_id") == asset_id), None)
+                        if asset and asset.get("gender") and asset.get("gender") != g:
+                            continue
+                    except Exception:
+                        pass
+                return asset_id
+    # 关键字未命中 → gender fallback
+    return ADSD_GENDER_FALLBACK_VOICE_ASSET.get(g, ADSD_DEFAULT_MALE_VOICE_ASSET)
 DEFAULT_MALE_VOICE_ASSET = os.environ.get("ADR_DEFAULT_MALE_VOICE_ASSET", ADSD_DEFAULT_MALE_VOICE_ASSET)
 DEFAULT_FEMALE_VOICE_ASSET = os.environ.get("ADR_DEFAULT_FEMALE_VOICE_ASSET", ADSD_DEFAULT_FEMALE_VOICE_ASSET)
 DEFAULT_VOICE_ASSET = os.environ.get("ADR_DEFAULT_VOICE_ASSET", "").strip()
@@ -1427,6 +1487,12 @@ def _finalize_adsd_turns(turns: list[dict]) -> list[dict]:
     for turn in turns:
         turn["dialogue_shape"] = shape
         turn["speaker_count"] = speaker_count
+        # P3 音色库智能匹配：未显式设置 voice_asset_id 的 turn 自动按 speaker name 命中音色库
+        if not turn.get("voice_asset_id"):
+            turn["voice_asset_id"] = _voice_asset_id_for_speaker(
+                turn.get("speaker", ""),
+                turn.get("voice_gender") or turn.get("gender"),
+            )
     return turns
 
 
@@ -1462,12 +1528,15 @@ def _parse_adsd_override_turns(raw_lines: list[str], topic: str) -> list[dict]:
         inferred_gender = _adsd_infer_gender_from_speaker(speaker)
         voice = _voice_for_speaker(speaker, inferred_gender or None)
         voice_gender = inferred_gender or _adsd_gender_from_voice(voice) or "male"
+        # P3 音色库智能匹配：speaker name 关键字 → voice_assets.json 注册 asset
+        voice_asset_id = _voice_asset_id_for_speaker(speaker, voice_gender)
         turns.append({
             "dialogue_turn": i + 1,
             "speaker": speaker,
             "voice_gender": voice_gender,
             "speaker_id": voice["voice_id"],
             "speaker_name": voice["voice_name"],
+            "voice_asset_id": voice_asset_id,
             "text": text,
             "shot": f"{speaker}在现场说出这一句，旁人只作倾听或反应",
             "emotion": "neutral",
