@@ -3615,13 +3615,20 @@ def _write_adsd_gender_voice_qa(script: list[dict]) -> dict | None:
 
 def step2_dialogue_voice(script: list[dict]) -> str:
     """ADSD voice core: one TTS per dialogue turn, deterministic timeline.
-    若 script 携带 override_audio_start/end → 按 timecode 间隔自动调整 turn 间 silence pause，
-    最终主音轨总时长 ≈ override 总时长。
+
+    HADSD 默认走"直接 concat 紧凑节奏"：忽略 override timecode 的 silence pad，
+    每 turn 接 0.22s 自然停顿。这样视频总长 = sum(TTS turn dur)，不会出现 6-9s 冻帧/cutaway 等待。
+    timecode 字段仍保留 (override_audio_start/end) 供字幕参考，但不撑总长。
+
+    若需保留旧 timecode-pad 行为：set ADR_HADSD_RESPECT_TIMECODE_LENGTH=1
     """
     pause = float(os.environ.get("ADR_ADSD_TURN_PAUSE", "0.22"))
-    has_override_timing = any(s.get("override_audio_start") is not None for s in script)
+    respect_timecode = os.environ.get("ADR_HADSD_RESPECT_TIMECODE_LENGTH", "0").strip().lower() in ("1", "true", "yes", "on")
+    has_override_timing = respect_timecode and any(s.get("override_audio_start") is not None for s in script)
     if has_override_timing:
-        tg(f"🎭 {ADSD_MODE_NAME} TTS 检测到 override timecode → 按 timecode 自动加 silence pad")
+        tg(f"🎭 {ADSD_MODE_NAME} TTS 按 ADR_HADSD_RESPECT_TIMECODE_LENGTH=1 → 按 timecode silence pad 撑总长")
+    elif any(s.get("override_audio_start") is not None for s in script):
+        tg(f"🎭 {ADSD_MODE_NAME} TTS 检测到 override timecode，但 HADSD 默认走紧凑直接 concat（不撑总长）；如需旧行为 set ADR_HADSD_RESPECT_TIMECODE_LENGTH=1")
     tg(f"🎭 {ADSD_MODE_NAME} TTS 启动：text-to-audio × {len(script)} turn，逐句生成确定性时间轴...")
     timeline = []
     wav_files: list[str] = []
