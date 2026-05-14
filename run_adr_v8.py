@@ -12247,6 +12247,67 @@ def _generate_cover_image(topic: str, short_title: str, script: list[dict]) -> s
     return None
 
 
+# ── 异步封面 + caption（与 step6-9 并发）────────────────────────────────
+# 默认 ~3 min 的封面生成原本卡在 step10 最后串行，改成 step1 完成后立即 kickoff，
+# 跟 step6 storyboard / step66 lip-sync / step7-9 拼接合成并发跑。
+_ASYNC_COVER_LOCK = threading.Lock()
+_ASYNC_COVER_RESULT: dict = {"started": False, "done": False}
+
+
+def _async_kickoff_cover_caption(topic: str, script: list[dict]) -> None:
+    """step1 完成后立即调用。在后台线程内顺序跑 caption LLM + 封面图生成。
+    step10_deliver 时 _await_async_cover_caption() 取结果，省去串行 200+s 等封面。"""
+    def _worker():
+        try:
+            caption, short_title, hashtags = _generate_caption(topic, script)
+            with _ASYNC_COVER_LOCK:
+                _ASYNC_COVER_RESULT["caption"] = caption
+                _ASYNC_COVER_RESULT["short_title"] = short_title
+                _ASYNC_COVER_RESULT["hashtags"] = hashtags
+                _ASYNC_COVER_RESULT["caption_done_ts"] = time.time()
+            cover_path = _generate_cover_image(topic, short_title, script)
+            with _ASYNC_COVER_LOCK:
+                _ASYNC_COVER_RESULT["cover_path"] = cover_path
+                _ASYNC_COVER_RESULT["done"] = True
+                _ASYNC_COVER_RESULT["cover_done_ts"] = time.time()
+        except Exception as e:
+            with _ASYNC_COVER_LOCK:
+                _ASYNC_COVER_RESULT["error"] = str(e)
+                _ASYNC_COVER_RESULT["done"] = True
+            log(f"异步封面+caption worker 异常: {type(e).__name__}: {e}")
+    with _ASYNC_COVER_LOCK:
+        if _ASYNC_COVER_RESULT.get("started"):
+            return
+        _ASYNC_COVER_RESULT["started"] = True
+        _ASYNC_COVER_RESULT["started_ts"] = time.time()
+    threading.Thread(target=_worker, daemon=True).start()
+    log("异步封面+caption worker 已 kick off（与 step6-9 并发）")
+
+
+def _await_async_cover_caption(timeout_seconds: float = 600.0) -> tuple | None:
+    """阻塞等异步 worker 完成。返回 (caption, short_title, hashtags, cover_path) 或 None。"""
+    with _ASYNC_COVER_LOCK:
+        if not _ASYNC_COVER_RESULT.get("started"):
+            return None
+    deadline = time.time() + timeout_seconds
+    while time.time() < deadline:
+        with _ASYNC_COVER_LOCK:
+            if _ASYNC_COVER_RESULT.get("done"):
+                started_ts = _ASYNC_COVER_RESULT.get("started_ts", 0)
+                cover_ts = _ASYNC_COVER_RESULT.get("cover_done_ts", 0)
+                if started_ts and cover_ts:
+                    log(f"step10 复用异步 worker 结果（封面耗时 {cover_ts - started_ts:.1f}s 已与主流程并发）")
+                return (
+                    _ASYNC_COVER_RESULT.get("caption"),
+                    _ASYNC_COVER_RESULT.get("short_title"),
+                    _ASYNC_COVER_RESULT.get("hashtags"),
+                    _ASYNC_COVER_RESULT.get("cover_path"),
+                )
+        time.sleep(1)
+    log("step10 等异步 worker 超时，回退内联生成")
+    return None
+
+
 def step10_deliver(final_path: str, topic: str, script: list[dict]):
     if NO_VOICE:
         bgm_qa = _write_bgm_only_qa(final_path, script)
@@ -12281,7 +12342,13 @@ def step10_deliver(final_path: str, topic: str, script: list[dict]):
             warn_note = f"\n\n提示：\n{warn_lines}" if warn_lines else ""
             tg(f"✅ {ADSD_MODE_NAME} 发布门禁通过：字幕/口型/音画同步 QA OK{warn_note}")
 
-    caption, short_title, hashtags = _generate_caption(topic, script)
+    # 优先取异步 worker 结果（与 step6-9 并发已跑完）；不可用则现场生成
+    _async = _await_async_cover_caption(timeout_seconds=600)
+    _async_cover_path = None
+    if _async:
+        caption, short_title, hashtags, _async_cover_path = _async
+    else:
+        caption, short_title, hashtags = _generate_caption(topic, script)
     tg(f"📝 社媒文案 + 短标题 + 热门标签已生成\n\n📤 正在发送...")
 
     # 1. 短标题（一键复制）
@@ -12396,8 +12463,12 @@ def step10_deliver(final_path: str, topic: str, script: list[dict]):
         "庄重": "红金大字报 · 历史/警示向设计",
         "中性": "信息图风 · 泛知识用户友好",
     }.get(_tone, "主题专属封面")
-    tg(f"🎨 正在生成主题专属封面（{_style_tag}）...")
-    cover_path = _generate_cover_image(topic, short_title, script)
+    if _async_cover_path:
+        tg(f"🎨 主题专属封面已就绪（{_style_tag}） — 异步预生成 ✓")
+        cover_path = _async_cover_path
+    else:
+        tg(f"🎨 正在生成主题专属封面（{_style_tag}）...")
+        cover_path = _generate_cover_image(topic, short_title, script)
 
     def _upload_cover_photo(send_path: str, caption: str) -> dict:
         """单次 sendPhoto 调用，包成 _tg_upload_with_probe_gap 期望的 result 格式。"""
@@ -12632,6 +12703,8 @@ def main():
 
     try:
         t = time.time(); script, spk_id, spk_name = step1_script(topic);       timings["剧本+制片人准则+画面提示词+音色"] = time.time() - t
+        # 异步 kickoff：caption LLM + 封面图（GPT Image 2 ~180s）跟 step6/66/7/8/9 并发跑
+        _async_kickoff_cover_caption(topic, script)
         bgm_path = None
         if NO_VOICE:
             t = time.time()
