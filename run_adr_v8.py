@@ -377,7 +377,12 @@ WERYDANCE_CAPTIONS = (
     not NO_VOICE
     and "--with-ass-subtitles" not in sys.argv
     and "--no-werydance-captions" not in sys.argv
-    and os.environ.get("ADR_WERYDANCE_CAPTIONS", "1").strip().lower() not in ("0", "false", "no", "off")
+    # 默认关闭：WERYDANCE 偶尔不按 prompt 烧字幕，导致这些 turn 既不在 WERYDANCE caption 也不在 ASS 兜底，字幕真空
+    # 需要时显式 set ADR_WERYDANCE_CAPTIONS=1 或加 --werydance-captions
+    and (
+        "--werydance-captions" in sys.argv
+        or os.environ.get("ADR_WERYDANCE_CAPTIONS", "0").strip().lower() in ("1", "true", "yes", "on")
+    )
 )
 WERYDANCE_CAPTION_MAX_CHARS = int(os.environ.get("ADR_WERYDANCE_CAPTION_MAX_CHARS", "24"))
 ADSD_ONSITE_POV_MODE = (
@@ -9626,6 +9631,12 @@ def _lip_sync_one_scene(idx: int, scene: dict, target_dur: float, aspect_ratio: 
         voice_asset_ref = None
         source_audio = None
     caption_info = _werydance_caption_request(scene)
+    # B-roll 路径 prompt 不要求 WERYDANCE 烧字幕，必须强制走 ASS 兜底，否则字幕真空
+    if not needs_lip:
+        caption_info = dict(caption_info)
+        caption_info["requested"] = False
+        caption_info["ass_fallback_required"] = True
+        caption_info["reason"] = "b_roll_motion_mode_use_ass"
     scene["_almighty_reference_audio"] = source_audio
     scene["_almighty_reference_audio_role"] = (
         "voice_asset_timbre_reference" if voice_asset_ref
