@@ -2746,16 +2746,173 @@ _TEXT_TO_AUDIO_DEFAULT_VOICE = {
 }
 
 
+def _build_silence_mp3(duration_s: float, out_path: str, sample_rate: int = 44100) -> str:
+    """生成指定时长的静音 mp3 段，用于拼接到 master_voice 中。"""
+    duration_s = max(0.0, float(duration_s))
+    ffmpeg(
+        "-f", "lavfi",
+        "-i", f"anullsrc=channel_layout=mono:sample_rate={sample_rate}",
+        "-t", f"{duration_s:.3f}",
+        "-acodec", "libmp3lame", "-b:a", "128k",
+        out_path,
+    )
+    return out_path
+
+
+def _audio_duration_seconds(audio_path: str) -> float:
+    try:
+        out = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+             "-of", "default=nw=1:nokey=1", audio_path],
+            capture_output=True, text=True, timeout=15,
+        ).stdout.strip()
+        return float(out) if out else 0.0
+    except Exception:
+        return 0.0
+
+
+def _text_to_audio_master_voice_timed(script: list[dict], voice_id: int, speed: str, vol: str) -> str | None:
+    """override timing 模式：每段独立 TTS + 用静音段补齐到 timecode 目标位置，
+    让最终 master_voice 总时长 ≈ override 总时长，每段对位 timecode。
+
+    QA：落盘 master_voice_timed_qa.json，方便人工对照"
+    """
+    fmt_topic = OUTPUT_DIR.name
+    seg_files: list[tuple[str, float, float]] = []   # (path, kind=tts/silence, dur)
+    qa_records: list[dict] = []
+    cumulative = 0.0  # 拼接后游标
+    for idx, s in enumerate(script):
+        text_raw = (s.get("text") or "").strip()
+        target_start = float(s.get("override_audio_start") or 0.0)
+        target_end = float(s.get("override_audio_end") or 0.0)
+        target_dur = max(0.1, target_end - target_start)
+        # 先补齐到 target_start
+        pad_before = max(0.0, target_start - cumulative)
+        if pad_before > 0.05:
+            sp = str(OUTPUT_DIR / f"tts_silence_pre_{idx:02d}.mp3")
+            _build_silence_mp3(pad_before, sp)
+            seg_files.append((sp, "silence", pad_before))
+            cumulative += pad_before
+        # TTS this section
+        if not text_raw:
+            # 空文本 → 用静音填满 target_dur
+            sp = str(OUTPUT_DIR / f"tts_silence_only_{idx:02d}.mp3")
+            _build_silence_mp3(target_dur, sp)
+            seg_files.append((sp, "silence", target_dur))
+            cumulative += target_dur
+            qa_records.append({"line": idx + 1, "tts_dur": 0.0, "target_dur": target_dur,
+                               "pad_before": pad_before, "pad_after": 0.0,
+                               "kind": "empty_text_silence_only"})
+            continue
+        sanitized = _sanitize_for_external_api(text_raw)
+        if sanitized and sanitized[-1] not in "。！？.!?；;":
+            sanitized = sanitized + "。"
+        try:
+            r = req_post("/generation/text-to-audio", {
+                "text": sanitized,
+                "voice_id": voice_id,
+                "speed": speed,
+                "vol": vol,
+                "trace_id": f"adr-{fmt_topic}-timed-{idx+1:02d}",
+            }, timeout=30)
+            task_id = r.get("data", {}).get("task_id") or (r.get("data", {}).get("task_ids") or [None])[0]
+            if not task_id:
+                log(f"timed TTS 第 {idx+1} 段无 task_id: {json.dumps(r, ensure_ascii=False)[:200]}")
+                return None
+            data = poll_task_status(task_id, f"timed TTS {idx+1}", max_wait=180)
+            audios = data.get("audios") or []
+            if not audios:
+                log(f"timed TTS 第 {idx+1} 段无 audios")
+                return None
+            tts_path = str(OUTPUT_DIR / f"tts_line_{idx:02d}.mp3")
+            urllib.request.urlretrieve(audios[0], tts_path)
+        except Exception as e:
+            log(f"timed TTS 第 {idx+1} 段失败：{e}")
+            return None
+        tts_dur = _audio_duration_seconds(tts_path)
+        seg_files.append((tts_path, "tts", tts_dur))
+        cumulative += tts_dur
+        # 补齐到 target_end
+        pad_after = max(0.0, target_end - cumulative)
+        if pad_after > 0.05:
+            sp = str(OUTPUT_DIR / f"tts_silence_post_{idx:02d}.mp3")
+            _build_silence_mp3(pad_after, sp)
+            seg_files.append((sp, "silence", pad_after))
+            cumulative += pad_after
+        qa_records.append({
+            "line": idx + 1,
+            "target_start": target_start,
+            "target_end": target_end,
+            "target_dur": round(target_dur, 3),
+            "tts_dur": round(tts_dur, 3),
+            "pad_before": round(pad_before, 3),
+            "pad_after": round(pad_after, 3),
+            "tts_exceeds_target": tts_dur > target_dur + 0.5,
+            "cumulative_after_segment": round(cumulative, 3),
+        })
+
+    if not seg_files:
+        return None
+    concat_list = OUTPUT_DIR / "tts_timed_concat.txt"
+    with open(concat_list, "w") as f:
+        for p, _kind, _dur in seg_files:
+            f.write(f"file '{p}'\n")
+    voice_path = str(OUTPUT_DIR / "master_voice.mp3")
+    # 静音 mp3 + TTS mp3 编码参数可能不同，用 re-encode 而不是 copy
+    ffmpeg("-f", "concat", "-safe", "0", "-i", str(concat_list),
+           "-c:a", "libmp3lame", "-b:a", "128k", voice_path)
+    final_dur = _audio_duration_seconds(voice_path)
+    total_target = float(script[-1].get("override_audio_end") or cumulative)
+    qa = {
+        "mode": "text_to_audio_timed_with_silence_padding",
+        "policy": "respect_override_timecodes_pad_silence_to_match",
+        "voice_id": voice_id,
+        "speed": speed,
+        "vol": vol,
+        "total_lines": len(script),
+        "tts_segment_count": sum(1 for _, k, _ in seg_files if k == "tts"),
+        "silence_segment_count": sum(1 for _, k, _ in seg_files if k == "silence"),
+        "final_master_voice_duration": round(final_dur, 3),
+        "override_total_target_duration": round(total_target, 3),
+        "duration_delta_vs_target": round(final_dur - total_target, 3),
+        "tts_overruns_count": sum(1 for r in qa_records if r.get("tts_exceeds_target")),
+        "per_line": qa_records,
+        "manual_visual_checks_required": [
+            "each_line_audio_aligns_with_timecode",
+            "no_tts_clipping_at_section_boundaries",
+            "silence_pads_dont_feel_too_long_in_between",
+        ],
+        "created_at": datetime.now().isoformat(timespec="seconds"),
+    }
+    try:
+        (OUTPUT_DIR / "master_voice_timed_qa.json").write_text(
+            json.dumps(qa, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception as e:
+        log(f"master_voice_timed_qa.json 写入失败: {e}")
+    overruns = qa["tts_overruns_count"]
+    tg(f"🎙 timed TTS 完成：{qa['tts_segment_count']} 段 + {qa['silence_segment_count']} 静音 "
+       f"→ {qa['final_master_voice_duration']}s（target {qa['override_total_target_duration']}s）"
+       + (f"\n⚠️ {overruns} 段 TTS 超出 timecode 目标，节奏会被挤" if overruns else ""))
+    return voice_path
+
+
 def _text_to_audio_master_voice(script: list[dict]) -> str | None:
     """主路径：用 /generation/text-to-audio TTS，拼接成主音轨。
     优先策略：脚本总字符 ≤ 500 时一次性整段送，保留 TTS 引擎自然语义停顿；
     超长则按句号边界 smart-split 成多个 ≤ 500 字符 chunk。
+    若 script 携带 override_audio_start/end → 切换 timed 模式，逐句 TTS + 静音补齐到 timecode。
     成功返回 master_voice.mp3 路径；失败返回 None 让调用方降级到 Podcast。"""
     fmt_key = "v" if IS_VERTICAL else "h"
     default_voice = _TEXT_TO_AUDIO_DEFAULT_VOICE[fmt_key]
     voice_id = int(os.environ.get("ADR_TTS_VOICE_ID", default_voice))
     speed = os.environ.get("ADR_TTS_SPEED", "1.0")
     vol = os.environ.get("ADR_TTS_VOL", "4.0")
+
+    # override timing 优先：注入脚本带 0:00-X:XX 时间码 → 走 timed 模式，
+    # 每段独立 TTS + 静音补齐 timecode 目标位置，最终时长 ≈ override 总时长
+    if any(s.get("override_audio_start") is not None for s in script):
+        tg(f"🎙 检测到 override timecode（{len(script)} 段），TTS 切换 timed 模式")
+        return _text_to_audio_master_voice_timed(script, voice_id, speed, vol)
 
     # 拼接所有台词，句末加中文句号确保 TTS 识别停顿
     parts: list[str] = []
@@ -3293,14 +3450,34 @@ def _write_adsd_gender_voice_qa(script: list[dict]) -> dict | None:
 
 
 def step2_dialogue_voice(script: list[dict]) -> str:
-    """ADSD voice core: one TTS per dialogue turn, deterministic timeline."""
+    """ADSD voice core: one TTS per dialogue turn, deterministic timeline.
+    若 script 携带 override_audio_start/end → 按 timecode 间隔自动调整 turn 间 silence pause，
+    最终主音轨总时长 ≈ override 总时长。
+    """
     pause = float(os.environ.get("ADR_ADSD_TURN_PAUSE", "0.22"))
+    has_override_timing = any(s.get("override_audio_start") is not None for s in script)
+    if has_override_timing:
+        tg(f"🎭 {ADSD_MODE_NAME} TTS 检测到 override timecode → 按 timecode 自动加 silence pad")
     tg(f"🎭 {ADSD_MODE_NAME} TTS 启动：text-to-audio × {len(script)} turn，逐句生成确定性时间轴...")
     timeline = []
     wav_files: list[str] = []
     cursor = 0.0
+    # 若首段 override_audio_start > 0，开头加 silence pad
+    if has_override_timing:
+        first_target = float(script[0].get("override_audio_start") or 0.0)
+        if first_target > 0.05:
+            head_sil = str(OUTPUT_DIR / "silence_head_override.wav")
+            ffmpeg("-f", "lavfi", "-i", "anullsrc=r=44100:cl=mono",
+                   "-t", f"{first_target:.3f}", "-c:a", "pcm_s16le", head_sil, timeout=30)
+            wav_files.append(head_sil)
+            cursor += first_target
+    timing_qa: list[dict] = []
     for i, turn in enumerate(script):
         wav_path, dur, meta = _tts_turn_to_audio(turn, i)
+        # override timing 模式下：本 turn 录到 dialogue_audio 之后，下一段 silence 的长度由 timecode 决定
+        target_start = turn.get("override_audio_start")
+        target_end = turn.get("override_audio_end")
+        target_dur = (float(target_end) - float(target_start)) if (target_start is not None and target_end is not None) else None
         turn.update({
             "dialogue_mode": True,
             "dialogue_audio": wav_path,
@@ -3335,22 +3512,81 @@ def step2_dialogue_voice(script: list[dict]) -> str:
             "tts_cost_credits": meta.get("cost_credits"),
         })
         wav_files.append(wav_path)
+        # 计算本 turn 之后的 silence 长度
         if i < len(script) - 1:
+            if has_override_timing:
+                next_target = script[i + 1].get("override_audio_start")
+                if next_target is not None:
+                    gap = max(pause, float(next_target) - (cursor + dur))
+                else:
+                    gap = pause
+            else:
+                gap = pause
             silence = str(OUTPUT_DIR / f"silence_{i+1:02d}.wav")
             ffmpeg(
                 "-f", "lavfi", "-i", "anullsrc=r=44100:cl=mono",
-                "-t", str(pause),
+                "-t", f"{gap:.3f}",
                 "-c:a", "pcm_s16le",
                 silence,
                 timeout=30,
             )
             wav_files.append(silence)
-            cursor += dur + pause
+            cursor += dur + gap
         else:
-            cursor += dur
+            # 最后一 turn：若有 timecode，补齐到 override_audio_end
+            if has_override_timing and target_end is not None:
+                tail_gap = max(0.0, float(target_end) - (cursor + dur))
+                if tail_gap > 0.05:
+                    tail_sil = str(OUTPUT_DIR / "silence_tail_override.wav")
+                    ffmpeg("-f", "lavfi", "-i", "anullsrc=r=44100:cl=mono",
+                           "-t", f"{tail_gap:.3f}", "-c:a", "pcm_s16le", tail_sil, timeout=30)
+                    wav_files.append(tail_sil)
+                    cursor += dur + tail_gap
+                else:
+                    cursor += dur
+            else:
+                cursor += dur
+        if has_override_timing:
+            timing_qa.append({
+                "turn": i + 1,
+                "speaker": turn.get("speaker"),
+                "target_start": target_start,
+                "target_end": target_end,
+                "target_dur": round(target_dur, 3) if target_dur is not None else None,
+                "tts_dur": round(dur, 3),
+                "actual_start": round(turn["audio_start"], 3),
+                "actual_end": round(turn["audio_end"], 3),
+                "tts_exceeds_target": (target_dur is not None and dur > target_dur + 0.5),
+            })
         log(f"ADSD turn {i+1}: {turn.get('speaker')} {dur:.3f}s [{turn['audio_start']:.3f}-{turn['audio_end']:.3f}]")
     timeline_path = OUTPUT_DIR / "turn_timeline.json"
     timeline_path.write_text(json.dumps(timeline, ensure_ascii=False, indent=2), encoding="utf-8")
+    if has_override_timing:
+        try:
+            qa = {
+                "mode": "adsd_per_turn_silence_pad_to_override_timecode",
+                "policy": "respect_override_timecodes_via_inter_turn_silence",
+                "total_turns": len(script),
+                "tts_overruns_count": sum(1 for r in timing_qa if r.get("tts_exceeds_target")),
+                "final_master_audio_duration": round(cursor, 3),
+                "override_total_target_duration": round(float(script[-1].get("override_audio_end") or cursor), 3),
+                "duration_delta_vs_target": round(cursor - float(script[-1].get("override_audio_end") or cursor), 3),
+                "per_turn": timing_qa,
+                "manual_visual_checks_required": [
+                    "each_turn_audio_aligns_with_timecode",
+                    "silence_gaps_dont_feel_artificial",
+                    "lip_sync_video_extends_to_match_audio_length",
+                ],
+                "created_at": datetime.now().isoformat(timespec="seconds"),
+            }
+            (OUTPUT_DIR / "adsd_timed_master_qa.json").write_text(
+                json.dumps(qa, ensure_ascii=False, indent=2), encoding="utf-8")
+            overruns = qa["tts_overruns_count"]
+            tg(f"🎭 ADSD timed master 完成：{qa['total_turns']} turn → {qa['final_master_audio_duration']}s "
+               f"(target {qa['override_total_target_duration']}s)"
+               + (f"\n⚠️ {overruns} turn TTS 超出 timecode" if overruns else ""))
+        except Exception as e:
+            log(f"adsd_timed_master_qa.json 写入失败: {e}")
     concat_txt = OUTPUT_DIR / "dialogue_wav_concat.txt"
     with open(concat_txt, "w", encoding="utf-8") as f:
         for p in wav_files:
