@@ -11682,7 +11682,40 @@ def step10_deliver(final_path: str, topic: str, script: list[dict]):
     short_caption = f"{short_title} — {delivery_tag}"
     video_ok = False
 
-    # ── 尝试 1：requests（timeout 放大到 600s）──
+    # ── SSL 假阴性防护：LibreSSL ↔ TG 的 bad-record-mac 让 requests 把"已成功"误判成失败 →
+    # 历史上手动补传造成重复视频。机制：上传前后各发一条静默 probe 文本占位消息，
+    # 上传异常时对比前后 message_id 跳号，若中间被插入一条则视频已落到 chat（无需重传）。
+    def _send_probe(label: str) -> int | None:
+        try:
+            rp = requests.post(
+                f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage",
+                data={
+                    "chat_id": TG_CHAT_ID,
+                    "text": f"·{label}·",  # 简短占位，便于人工识别也便于稍后删除
+                    "disable_notification": "true",
+                },
+                timeout=15,
+            )
+            if rp.status_code == 200:
+                return rp.json().get("result", {}).get("message_id")
+        except Exception as e:
+            log(f"probe '{label}' 发送失败：{e}")
+        return None
+
+    def _delete_probe(message_id: int | None) -> None:
+        if not message_id:
+            return
+        try:
+            requests.post(
+                f"https://api.telegram.org/bot{TG_BOT_TOKEN}/deleteMessage",
+                data={"chat_id": TG_CHAT_ID, "message_id": message_id},
+                timeout=10,
+            )
+        except Exception:
+            pass
+
+    # ── 尝试 1：requests（timeout 放大到 600s），前后 probe 跳号检测 ──
+    probe_before = _send_probe("up-start")
     for attempt in range(2):
         try:
             with open(final_path, "rb") as f:
@@ -11700,13 +11733,34 @@ def step10_deliver(final_path: str, topic: str, script: list[dict]):
                 log(f"requests 上传失败（{r.status_code}），第 {attempt+1} 次")
         except Exception as e:
             log(f"requests 上传异常（第 {attempt+1} 次）：{type(e).__name__}: {e}")
+            # 关键：客户端 SSL 异常 ≠ 服务器端失败。用 probe 跳号检测真实结果
+            time.sleep(3)
+            probe_after = _send_probe("up-check")
+            if probe_before is not None and probe_after is not None:
+                gap = probe_after - probe_before
+                if gap >= 2:
+                    log(f"probe 跳号检测：message_id 间隔 {gap} → 视频已落到 chat，本地 SSL 异常为假阴性，跳过重传")
+                    tg("ℹ️ 上传已成功（SSL 假阴性已自动识别，避免重复推送）")
+                    video_ok = True
+                    _delete_probe(probe_after)
+                    _delete_probe(probe_before)
+                    break
+                else:
+                    log(f"probe 跳号检测：间隔 {gap} → 视频未到 chat，准备重传")
+                    _delete_probe(probe_after)
+                    # 重传前刷新 probe_before 为最后一次 probe
+                    probe_before = _send_probe("up-retry")
+            else:
+                log("probe 跳号检测不可用（probe 发送失败），按原逻辑重试")
         if attempt < 1:
             time.sleep(5)
+    _delete_probe(probe_before)
 
-    # ── 尝试 2：curl fallback（更稳定，不受 httpx/urllib3 限制）──
+    # ── 尝试 2：curl fallback（更稳定，不受 httpx/urllib3 限制），同样跳号检测 ──
     if not video_ok:
-        tg("⚠️ requests 上传失败，切换 curl 重试...")
+        tg("⚠️ requests 上传未确认成功，切换 curl 重试...")
         for attempt in range(3):
+            probe_before = _send_probe(f"curl-start-{attempt+1}")
             try:
                 import subprocess as _sp
                 curl_cmd = [
@@ -11723,18 +11777,34 @@ def step10_deliver(final_path: str, topic: str, script: list[dict]):
                 result = _sp.run(curl_cmd, capture_output=True, text=True, timeout=660)
                 if result.returncode == 0 and '"ok":true' in result.stdout:
                     video_ok = True
+                    _delete_probe(probe_before)
                     break
                 else:
                     log(f"curl 上传失败（第 {attempt+1} 次），stdout: {result.stdout[:200]}")
+                    # 跳号检测
+                    time.sleep(3)
+                    probe_after = _send_probe(f"curl-check-{attempt+1}")
+                    if probe_before is not None and probe_after is not None:
+                        gap = probe_after - probe_before
+                        if gap >= 2:
+                            log(f"curl probe 跳号检测：间隔 {gap} → 视频已落到 chat，跳过后续重传")
+                            tg("ℹ️ 上传已成功（curl 阶段 SSL 假阴性自动识别）")
+                            video_ok = True
+                            _delete_probe(probe_after)
+                            _delete_probe(probe_before)
+                            break
+                        else:
+                            _delete_probe(probe_after)
             except Exception as e:
                 log(f"curl 异常（第 {attempt+1} 次）：{type(e).__name__}: {e}")
+            _delete_probe(probe_before)
             if attempt < 2:
                 time.sleep(10)
 
     if video_ok:
         tg("✅ 全流程完成！")
     else:
-        tg(f"❌ 视频上传全部失败（requests+curl），文件在：{final_path}\n社媒文案已发送")
+        tg(f"❌ 视频上传全部失败（含跳号检测均未确认），文件在：{final_path}\n社媒文案已发送")
 
 
 # ── 主流程 ───────────────────────────────────────────────────────────────────
