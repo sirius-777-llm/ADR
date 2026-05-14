@@ -8987,10 +8987,24 @@ def _lip_sync_one_scene(idx: int, scene: dict, target_dur: float, aspect_ratio: 
                 sheet_url = _upload_to_weryai(str(sheet_path))
             except Exception as e:
                 log(f"[lip-sync {idx}] character sheet upload skipped: {e}")
+        # 同 speaker 的其他 panel 作为跨 turn 一致性 reference（最多 2 张）
+        # _alt_speaker_panels 由 step66_adsd_lip_sync 在线程外预先计算并塞进 scene
+        alt_panel_urls: list[str] = []
+        for alt_path in scene.get("_alt_speaker_panels", [])[:2]:
+            if not (alt_path and os.path.exists(alt_path)):
+                continue
+            try:
+                alt_panel_urls.append(_upload_to_weryai(alt_path))
+            except Exception as e:
+                log(f"[lip-sync {idx}] alt-speaker panel upload skipped: {e}")
         audio_url = _upload_to_weryai(source_audio)
-        ref_images = [image_url]
+        # 顺序约定: [character_sheet(身份锚)?, alt_panel(同speaker场景示例)..., image_url(当前帧)]
+        # WERYDANCE 把最后一张视为渲染目标，前面的作 identity / consistency 提示
+        ref_images: list[str] = []
         if sheet_url:
-            ref_images = [sheet_url, image_url]
+            ref_images.append(sheet_url)
+        ref_images.extend(alt_panel_urls)
+        ref_images.append(image_url)
         # duration 计算：TTS 时长可能因 prosody 波动偏短，导致 WERYDANCE 被强制加速朗读 (~2x)
         # 用 ceil(字数/6) 做最小值兜底（6 字/秒是中文播报舒适上限）
         # 最终 cap 在 WERYDANCE 硬上限 15s
@@ -9054,6 +9068,8 @@ def _lip_sync_one_scene(idx: int, scene: dict, target_dur: float, aspect_ratio: 
                 "audio_dub_experiment": ADSD_ALMIGHTY_AUDIO_DUB_EXPERIMENT,
                 "image_url": image_url,
                 "character_sheet_url": sheet_url,
+                "alt_speaker_panel_urls": alt_panel_urls,
+                "alt_speaker_panel_count": len(alt_panel_urls),
                 "reference_image_count": len(ref_images),
                 "audio_url": audio_url,
                 "reference_audio_role": scene.get("_almighty_reference_audio_role"),
@@ -9122,6 +9138,37 @@ def step66_adsd_lip_sync(script: list[dict]):
     mode_note = "audio-dub 音色直配" if ADSD_ALMIGHTY_AUDIO_DUB_EXPERIMENT else "静音口型同步"
     tg(f"👄 {ADSD_MODE_NAME} 口型同步启动：WERYDANCE_2_0 Almighty Reference × {n} turn（{mode_note}）")
     target_durs = [_lip_sync_slot_duration(script, i) for i in range(n)]
+    # 跨 turn 一致性：为每个 turn 预先准备同 speaker 的其它 panel 路径列表，传入 _lip_sync_one_scene 作 multi-ref
+    # WERYDANCE 看到同一角色在多个场景的镜头，能更稳地维持脸型/服装/造型，减少跨 turn 漂移
+    _speaker_to_panel_paths: dict[str, list[str]] = {}
+    for _i, _s in enumerate(script):
+        _sp = (_s.get("speaker") or "").strip()
+        _p = _s.get("img_path")
+        if _sp and _p and os.path.exists(_p):
+            _speaker_to_panel_paths.setdefault(_sp, []).append(_p)
+    _alt_attach_log: list[dict] = []
+    for _i, _s in enumerate(script):
+        _sp = (_s.get("speaker") or "").strip()
+        _p = _s.get("img_path")
+        _alts = [pp for pp in _speaker_to_panel_paths.get(_sp, []) if pp and pp != _p]
+        _s["_alt_speaker_panels"] = _alts[:2]
+        _alt_attach_log.append({
+            "turn": _i + 1,
+            "speaker": _sp,
+            "alt_panel_count": len(_s["_alt_speaker_panels"]),
+            "alt_panel_paths": _s["_alt_speaker_panels"],
+        })
+    try:
+        (OUTPUT_DIR / "adsd_lipsync_multiref_attach_qa.json").write_text(
+            json.dumps({"per_turn": _alt_attach_log,
+                        "policy": "same_speaker_alt_panels_up_to_2_inserted_between_character_sheet_and_current_panel",
+                        "created_at": datetime.now().isoformat(timespec='seconds')},
+                       ensure_ascii=False, indent=2),
+            encoding="utf-8")
+    except Exception as e:
+        log(f"adsd_lipsync_multiref_attach_qa.json 写入失败: {e}")
+    _attach_total = sum(r["alt_panel_count"] for r in _alt_attach_log)
+    tg(f"🧪 ADSD lip-sync multi-ref attach: {_attach_total}/{n*2} alt-panel slot 已挂载 (同 speaker 跨 turn 一致性)")
     results: dict[int, bool] = {}
     records: list[dict] = []
     # weryai 并发上限 20，贴顶以便长 ADR (>10 turn) 不会排队跑成串行
@@ -9146,12 +9193,17 @@ def step66_adsd_lip_sync(script: list[dict]):
     embedded_audio_ready = generated_audio_cnt == n and generated_audio_cnt > 0
     werydance_caption_cnt = sum(1 for r in records if r.get("pass") and r.get("werydance_captions_requested") and not r.get("ass_fallback_required"))
     sheet_path = OUTPUT_DIR / "character_sheet.png"
+    multiref_alt_attach_total = sum(r.get("alt_panel_count", 0) for r in _alt_attach_log)
     qa = {
         "mode": ADSD_MODE_NAME,
         "interface": "almighty-reference-to-video+video-lips-change-fallback" if ADSD_LIPS_CHANGE_REPAIR else "almighty-reference-to-video",
         "model": "WERYDANCE_2_0",
         "character_sheet_reference": str(sheet_path) if sheet_path.exists() else None,
         "character_sheet_reference_exists": sheet_path.exists() and sheet_path.stat().st_size > 10000,
+        "multiref_alt_speaker_panels_enabled": True,
+        "multiref_alt_speaker_panels_attached_total": multiref_alt_attach_total,
+        "multiref_alt_speaker_panels_per_turn_cap": 2,
+        "multiref_attach_log": "adsd_lipsync_multiref_attach_qa.json",
         "lips_change_repair_enabled": ADSD_LIPS_CHANGE_REPAIR,
         "lips_change_all_enabled": ADSD_LIPS_CHANGE_ALL,
         "almighty_audio_dub_experiment": ADSD_ALMIGHTY_AUDIO_DUB_EXPERIMENT,
