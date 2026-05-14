@@ -256,6 +256,13 @@ ADSD_ALMIGHTY_AUDIO_DUB_EXPERIMENT = (
         )
     )
 )
+# P2：连续同 speaker 的 turn 合并成 1 个 WERYDANCE 调用，节省调用次数 + 自然衔接
+# 默认 OFF（实验性，WERYDANCE 时间漂移可能导致段间错位）
+ADSD_CONSECUTIVE_SPEAKER_BATCHING = (
+    "--adsd-speaker-batch" in sys.argv
+    or os.environ.get("ADR_ADSD_SPEAKER_BATCH", "").strip().lower() in ("1", "true", "yes", "on")
+)
+ADSD_SPEAKER_BATCH_MAX_DURATION = float(os.environ.get("ADR_ADSD_SPEAKER_BATCH_MAX_DUR", "14.0"))
 ADSD_DEFAULT_MALE_VOICE_ASSET = os.environ.get("ADR_ADSD_DEFAULT_MALE_VOICE_ASSET", "external_luo_xiang_xyma_001")
 ADSD_DEFAULT_FEMALE_VOICE_ASSET = os.environ.get("ADR_ADSD_DEFAULT_FEMALE_VOICE_ASSET", "external_by2_e7gn_001")
 
@@ -9508,6 +9515,63 @@ def step66_adsd_lip_sync(script: list[dict]):
     mode_note = "audio-dub 音色直配" if ADSD_ALMIGHTY_AUDIO_DUB_EXPERIMENT else "静音口型同步"
     tg(f"👄 {ADSD_MODE_NAME} 口型同步启动：WERYDANCE_2_0 Almighty Reference × {n} turn（{mode_note}）")
     target_durs = [_lip_sync_slot_duration(script, i) for i in range(n)]
+    # P2 分析：识别"连续同 speaker"分组（潜在 batching 机会）
+    # 当前实施分析层 + QA log，实际 batching 留 TODO（涉及 ThreadPoolExecutor 重构）
+    try:
+        consecutive_groups: list[list[int]] = []
+        cur_group: list[int] = []
+        cur_speaker: str | None = None
+        cur_dur = 0.0
+        for _i, _s in enumerate(script):
+            _sp = (_s.get("speaker") or "").strip()
+            _d = float(target_durs[_i])
+            # 同 speaker 且累计 + 本 turn 不超 batch 上限 → 加入当前 group
+            if _sp == cur_speaker and cur_group and (cur_dur + _d) <= ADSD_SPEAKER_BATCH_MAX_DURATION:
+                cur_group.append(_i)
+                cur_dur += _d
+            else:
+                if cur_group:
+                    consecutive_groups.append(cur_group)
+                cur_group = [_i]
+                cur_speaker = _sp
+                cur_dur = _d
+        if cur_group:
+            consecutive_groups.append(cur_group)
+        multi_turn_groups = [g for g in consecutive_groups if len(g) > 1]
+        potential_call_savings = sum(len(g) - 1 for g in multi_turn_groups)
+        p2_qa = {
+            "mode": "adsd_consecutive_speaker_grouping_analysis",
+            "policy": "analysis_only_actual_batching_gated_by_ADR_ADSD_SPEAKER_BATCH",
+            "batching_active": ADSD_CONSECUTIVE_SPEAKER_BATCHING,
+            "batch_max_duration_seconds": ADSD_SPEAKER_BATCH_MAX_DURATION,
+            "total_turns": n,
+            "total_groups": len(consecutive_groups),
+            "multi_turn_groups": len(multi_turn_groups),
+            "potential_werydance_call_savings": potential_call_savings,
+            "groups": [
+                {
+                    "group_idx": gi + 1,
+                    "turn_indices": [i + 1 for i in g],
+                    "speaker": (script[g[0]].get("speaker") or "").strip(),
+                    "total_dur_seconds": round(sum(target_durs[i] for i in g), 3),
+                    "fits_werydance_15s_cap": sum(target_durs[i] for i in g) <= 15.0,
+                }
+                for gi, g in enumerate(consecutive_groups)
+            ],
+            "manual_visual_checks_required": [
+                "if_batching_enabled_check_no_face_drift_between_turns_in_a_group",
+                "if_batching_enabled_check_no_audio_misalignment_at_split_boundaries",
+            ],
+            "created_at": datetime.now().isoformat(timespec="seconds"),
+        }
+        (OUTPUT_DIR / "adsd_speaker_grouping_analysis_qa.json").write_text(
+            json.dumps(p2_qa, ensure_ascii=False, indent=2), encoding="utf-8")
+        if potential_call_savings > 0:
+            tg(f"📊 ADSD 同 speaker 连续分组分析：{len(consecutive_groups)} 组 "
+               f"({len(multi_turn_groups)} 多 turn 组) → 启用 batching 可省 {potential_call_savings} 次 WERYDANCE 调用 "
+               f"({'已启用' if ADSD_CONSECUTIVE_SPEAKER_BATCHING else '未启用，需 --adsd-speaker-batch'})")
+    except Exception as e:
+        log(f"P2 speaker grouping analysis 失败: {e}")
     # 跨 turn 一致性：为每个 turn 预先准备同 speaker 的其它 panel 路径列表，传入 _lip_sync_one_scene 作 multi-ref
     # WERYDANCE 看到同一角色在多个场景的镜头，能更稳地维持脸型/服装/造型，减少跨 turn 漂移
     _speaker_to_panel_paths: dict[str, list[str]] = {}
