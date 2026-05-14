@@ -12174,24 +12174,36 @@ def step10_deliver(final_path: str, topic: str, script: list[dict]):
     }.get(_tone, "主题专属封面")
     tg(f"🎨 正在生成主题专属封面（{_style_tag}）...")
     cover_path = _generate_cover_image(topic, short_title, script)
+
+    def _upload_cover_photo(send_path: str, caption: str) -> dict:
+        """单次 sendPhoto 调用，包成 _tg_upload_with_probe_gap 期望的 result 格式。"""
+        def _do_post() -> dict:
+            try:
+                with open(send_path, "rb") as img_f:
+                    rp = requests.post(
+                        f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendPhoto",
+                        data={"chat_id": TG_CHAT_ID, "caption": caption},
+                        files={"photo": img_f},
+                        timeout=30,
+                    )
+                if rp.status_code == 200:
+                    return {"ok": True, "message_id": rp.json().get("result", {}).get("message_id")}
+                return {"ok": False, "exception": RuntimeError(f"sendPhoto HTTP {rp.status_code}")}
+            except Exception as e:
+                return {"ok": False, "exception": e}
+        return _tg_upload_with_probe_gap(_do_post, probe_label_prefix="cover", max_attempts=2)
+
     if cover_path:
-        try:
-            cover_send_path = _prepare_tg_photo(cover_path)
-            with open(cover_send_path, "rb") as img_f:
-                requests.post(
-                    f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendPhoto",
-                    data={
-                        "chat_id": TG_CHAT_ID,
-                        "caption": (
-                            f"🖼 专属封面（建议叠标题：{short_title}）\n"
-                            f"{_style_tag}"
-                        ),
-                    },
-                    files={"photo": img_f},
-                    timeout=30,
-                )
-        except Exception as e:
-            log(f"专属封面发送失败: {e}")
+        cover_send_path = _prepare_tg_photo(cover_path)
+        cover_caption = (
+            f"🖼 专属封面（建议叠标题：{short_title}）\n"
+            f"{_style_tag}"
+        )
+        cover_result = _upload_cover_photo(cover_send_path, cover_caption)
+        if not cover_result.get("ok"):
+            log(f"专属封面发送失败 attempts={cover_result.get('attempts')}: {cover_result.get('last_exception')}")
+        elif cover_result.get("source") == "probe_gap_detected":
+            log("专属封面 SSL 假阴性识别成功，跳过重复推送")
     else:
         # 封面兜底：只有接口明确 failed 才叫失败；timeout 只是后台未及时完成。
         if COVER_LAST_REASON == "timeout":
@@ -12201,15 +12213,11 @@ def step10_deliver(final_path: str, topic: str, script: list[dict]):
         fallback = str(OUTPUT_DIR / "img_0.jpg")
         try:
             fallback_send_path = _prepare_tg_photo(fallback)
-            with open(fallback_send_path, "rb") as img_f:
-                requests.post(
-                    f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendPhoto",
-                    data={"chat_id": TG_CHAT_ID, "caption": "🖼 封面（兜底 · 首张分镜）"},
-                    files={"photo": img_f},
-                    timeout=30,
-                )
+            fb_result = _upload_cover_photo(fallback_send_path, "🖼 封面（兜底 · 首张分镜）")
+            if not fb_result.get("ok"):
+                log(f"兜底封面发送失败: {fb_result.get('last_exception')}")
         except Exception as e:
-            log(f"兜底封面发送失败: {e}")
+            log(f"兜底封面准备失败: {e}")
 
     # 4. 上传视频（先 requests，失败 fallback curl）
     # ★ 自动压缩兜底：Telegram Bot API sendVideo 限 50MB；超 48MB 自动 ffmpeg 重编码一份 lite 版
@@ -12307,6 +12315,7 @@ def step10_deliver(final_path: str, topic: str, script: list[dict]):
                 result = _sp.run(curl_cmd, capture_output=True, text=True, timeout=660)
                 if result.returncode == 0 and '"ok":true' in result.stdout:
                     video_ok = True
+                    log(f"curl 上传成功（第 {attempt+1} 次）")
                     _delete_probe(probe_before)
                     break
                 else:
@@ -12332,8 +12341,10 @@ def step10_deliver(final_path: str, topic: str, script: list[dict]):
                 time.sleep(10)
 
     if video_ok:
+        log("step10 deliver 完成：视频上传成功")
         tg("✅ 全流程完成！")
     else:
+        log(f"step10 deliver 失败：视频上传全部失败，文件保留在 {final_path}")
         tg(f"❌ 视频上传全部失败（含跳号检测均未确认），文件在：{final_path}\n社媒文案已发送")
 
 
