@@ -186,6 +186,14 @@ STORYBOARD_GRID_MULTIREF_SEGMENTS = (
     "--use-grid-multiref-segments" in sys.argv
     and "--no-grid-multiref-segments" not in sys.argv
 )
+# P1：把 grid_multiref（多 panel 一次出整组）从 sidecar QA 升级为主路径
+# 启用后 step7 用 grid_multiref_combined.mp4 当 raw 视频（同 trailer-main 套路）
+STORYBOARD_GRID_MULTIREF_MAIN = (
+    "--grid-multiref-main" in sys.argv
+    or os.environ.get("ADR_STORYBOARD_GRID_MULTIREF_MAIN", "").strip().lower() in ("1", "true", "yes", "on")
+)
+if STORYBOARD_GRID_MULTIREF_MAIN:
+    STORYBOARD_GRID_MULTIREF_MOTION = True  # 主路径必须先生 sidecar
 PREVIS_PAGE_MOTION = (
     "--with-previs-page-motion" in sys.argv
     or os.environ.get("ADR_PREVIS_PAGE_MOTION", "").strip().lower() in ("1", "true", "yes", "on")
@@ -8842,7 +8850,64 @@ def _generate_grid_multiref_motion_segments(script: list[dict], motion_prompts: 
         tg(f"✅ Grid multi-ref motion QA 完成：{success_count}/{len(qa['records'])} 组通过")
     else:
         tg(f"⚠️ Grid multi-ref motion QA 未全通过：{success_count}/{len(qa['records'])} 组")
+    # P1：若开主路径模式且全部组通过 → 把 N 组 group 视频 concat 成 grid_multiref_combined.mp4，
+    # step7 会拿来当 raw_concat（同 trailer-main 套路）
+    if STORYBOARD_GRID_MULTIREF_MAIN and qa.get("pass"):
+        try:
+            combined_path = _grid_multiref_concat_groups(qa["records"])
+            if combined_path:
+                qa["combined_path"] = combined_path
+                qa["combined_duration"] = round(ffprobe_duration(combined_path), 3)
+                _write_grid_multiref_motion_qa(qa)
+                tg(f"🎬 Grid multi-ref main: {success_count} 组 → grid_multiref_combined.mp4 ({qa['combined_duration']}s)")
+            else:
+                tg("⚠️ Grid multi-ref main concat 失败，step7 将回退逐镜拼接")
+        except Exception as e:
+            log(f"grid_multiref concat 异常：{e}")
+            tg(f"⚠️ Grid multi-ref main concat 异常：{str(e)[:120]}")
     return qa
+
+
+def _grid_multiref_concat_groups(records: list[dict]) -> str | None:
+    """把所有 pass 的 grid_multiref group video 顺序 concat 成一段连续视频。
+    供 step7 在 STORYBOARD_GRID_MULTIREF_MAIN 主路径模式下用作 raw_concat 源。"""
+    if not records:
+        return None
+    paths: list[str] = []
+    for rec in sorted(records, key=lambda r: int(r.get("scene_start") or 0)):
+        if not rec.get("pass"):
+            return None  # 一旦中间有失败组 → 整段不可用
+        p = rec.get("path")
+        if not p or not os.path.exists(p):
+            return None
+        paths.append(p)
+    if not paths:
+        return None
+    out_path = str(OUTPUT_DIR / "grid_multiref_combined.mp4")
+    concat_list = OUTPUT_DIR / "grid_multiref_concat.txt"
+    with open(concat_list, "w", encoding="utf-8") as f:
+        for p in paths:
+            f.write(f"file '{p}'\n")
+    # 统一 fps + 编码再 concat，避免不同组帧率/码率差异导致 concat demuxer 拒绝
+    normalized: list[str] = []
+    for i, p in enumerate(paths):
+        np_path = str(OUTPUT_DIR / f"grid_multiref_norm_{i:02d}.mp4")
+        ffmpeg(
+            "-i", p,
+            "-vf", "fps=24",
+            "-c:v", "libx264", "-crf", "20", "-preset", "medium",
+            "-an",
+            np_path,
+            timeout=180,
+        )
+        normalized.append(np_path)
+    norm_list = OUTPUT_DIR / "grid_multiref_concat_norm.txt"
+    with open(norm_list, "w", encoding="utf-8") as f:
+        for p in normalized:
+            f.write(f"file '{p}'\n")
+    ffmpeg("-f", "concat", "-safe", "0", "-i", str(norm_list),
+           "-c", "copy", out_path, timeout=120)
+    return out_path
 
 
 def _lip_sync_slot_duration(script: list[dict], idx: int) -> float:
@@ -9662,6 +9727,53 @@ def step65_grid_multiref_motion_qa(script: list[dict]):
 
 # ── 第七步：拼接视频轨 ────────────────────────────────────────────────────────
 def step7_concat(script: list[dict]) -> str:
+    # P1：grid_multiref 主路径：N 组 group videos concat 成 grid_multiref_combined.mp4 → raw_concat
+    # 同 trailer-main 套路：循环到 master_voice 时长，24fps CFR
+    if STORYBOARD_GRID_MULTIREF_MAIN:
+        combined_path = OUTPUT_DIR / "grid_multiref_combined.mp4"
+        if combined_path.exists() and combined_path.stat().st_size > 100000:
+            raw_path = str(OUTPUT_DIR / "raw_concat.mp4")
+            try:
+                src_dur = ffprobe_duration(str(combined_path))
+                voice_path = OUTPUT_DIR / "master_voice.mp3"
+                if voice_path.exists() and voice_path.stat().st_size > 10000:
+                    target_dur = ffprobe_duration(str(voice_path)) + 0.5
+                else:
+                    target_dur = max(
+                        (s.get("audio_start", 0) + s.get("vid_duration", s.get("dur", 0))) for s in script
+                    ) + 0.5
+                pad_dur = max(0.0, target_dur - src_dur)
+                if pad_dur > 0.2:
+                    loops_est = int(target_dur / src_dur) + 1
+                    ffmpeg(
+                        "-stream_loop", "-1",
+                        "-i", str(combined_path),
+                        "-t", f"{target_dur:.3f}",
+                        "-vf", "fps=24",
+                        "-c:v", "libx264", "-crf", "20", "-preset", "medium",
+                        "-an",
+                        raw_path,
+                        timeout=300,
+                    )
+                    tg(f"🎬 step7 grid_multiref_main: combined ({src_dur:.1f}s) 循环 ~{loops_est}× 填到 {target_dur:.1f}s @24fps CFR")
+                else:
+                    ffmpeg(
+                        "-i", str(combined_path),
+                        "-vf", "fps=24",
+                        "-c:v", "libx264", "-crf", "20", "-preset", "medium",
+                        "-an",
+                        raw_path,
+                        timeout=180,
+                    )
+                    tg(f"🎬 step7 grid_multiref_main: combined ({src_dur:.1f}s) 直作 raw 视频 (CFR 24fps)")
+                log(f"step7 STORYBOARD_GRID_MULTIREF_MAIN: raw_concat <- grid_multiref_combined (target={target_dur:.2f}s, pad={pad_dur:.2f}s)")
+                return raw_path
+            except Exception as e:
+                tg(f"⚠️ grid_multiref combined 拉伸失败：{str(e)[:120]}，回退到下一路径")
+                log(f"step7 STORYBOARD_GRID_MULTIREF_MAIN extend failed: {e}")
+        else:
+            tg("⚠️ STORYBOARD_GRID_MULTIREF_MAIN 开启但 grid_multiref_combined.mp4 不存在/过小，回退到下一路径")
+
     # 故事板 trailer 主路径：直接用 storyboard_trailer.mp4 作为 raw 视频
     # 用 tpad+fps 把 trailer 拉伸到旁白长度并强制 24fps CFR（关键：避免后端通过拉 PTS 凑长度导致播放卡顿）
     if STORYBOARD_TRAILER_MAIN:
