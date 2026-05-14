@@ -8933,37 +8933,73 @@ def _generate_grid_multiref_motion_segments(script: list[dict], motion_prompts: 
         tg(f"✅ Grid multi-ref motion QA 完成：{success_count}/{len(qa['records'])} 组通过")
     else:
         tg(f"⚠️ Grid multi-ref motion QA 未全通过：{success_count}/{len(qa['records'])} 组")
-    # P1：若开主路径模式且全部组通过 → 把 N 组 group 视频 concat 成 grid_multiref_combined.mp4，
-    # step7 会拿来当 raw_concat（同 trailer-main 套路）
-    if STORYBOARD_GRID_MULTIREF_MAIN and qa.get("pass"):
-        try:
-            combined_path = _grid_multiref_concat_groups(qa["records"])
-            if combined_path:
-                qa["combined_path"] = combined_path
-                qa["combined_duration"] = round(ffprobe_duration(combined_path), 3)
-                _write_grid_multiref_motion_qa(qa)
-                tg(f"🎬 Grid multi-ref main: {success_count} 组 → grid_multiref_combined.mp4 ({qa['combined_duration']}s)")
-            else:
-                tg("⚠️ Grid multi-ref main concat 失败，step7 将回退逐镜拼接")
-        except Exception as e:
-            log(f"grid_multiref concat 异常：{e}")
-            tg(f"⚠️ Grid multi-ref main concat 异常：{str(e)[:120]}")
+    # P1：若开主路径模式 → concat 成功组成 grid_multiref_combined.mp4，step7 会用作 raw_concat
+    # 容错策略：要求 ≥ MIN_PASS_RATIO 通过（默认 0.75），不要求全 pass
+    # （poll_timeout 等 transient 失败常见，3/4 通过应允许进入 main 路径）
+    if STORYBOARD_GRID_MULTIREF_MAIN:
+        total = len(qa["records"])
+        min_ratio = float(os.environ.get("ADR_GRID_MULTIREF_MAIN_MIN_PASS_RATIO", "0.75"))
+        pass_ratio = (success_count / total) if total > 0 else 0.0
+        if pass_ratio >= min_ratio and success_count >= 2:
+            try:
+                combined_path = _grid_multiref_concat_groups_partial(qa["records"])
+                if combined_path:
+                    qa["combined_path"] = combined_path
+                    qa["combined_duration"] = round(ffprobe_duration(combined_path), 3)
+                    qa["combined_groups_used"] = success_count
+                    qa["combined_groups_skipped"] = total - success_count
+                    qa["combined_pass_ratio"] = round(pass_ratio, 3)
+                    _write_grid_multiref_motion_qa(qa)
+                    tg(f"🎬 Grid multi-ref main: {success_count}/{total} 组 → grid_multiref_combined.mp4 "
+                       f"({qa['combined_duration']}s, 跳过 {total - success_count} 失败组)")
+                else:
+                    tg("⚠️ Grid multi-ref main concat 失败，step7 将回退逐镜拼接")
+            except Exception as e:
+                log(f"grid_multiref concat 异常：{e}")
+                tg(f"⚠️ Grid multi-ref main concat 异常：{str(e)[:120]}")
+        else:
+            tg(f"⚠️ Grid multi-ref main 跳过 concat：通过率 {pass_ratio:.0%} < 阈值 {min_ratio:.0%} "
+               f"(或仅 {success_count} 组通过)，step7 回退逐镜拼接")
     return qa
 
 
 def _grid_multiref_concat_groups(records: list[dict]) -> str | None:
-    """把所有 pass 的 grid_multiref group video 顺序 concat 成一段连续视频。
-    供 step7 在 STORYBOARD_GRID_MULTIREF_MAIN 主路径模式下用作 raw_concat 源。"""
+    """严格模式：全 pass 才返回 combined。保留兼容性。"""
     if not records:
         return None
     paths: list[str] = []
     for rec in sorted(records, key=lambda r: int(r.get("scene_start") or 0)):
         if not rec.get("pass"):
-            return None  # 一旦中间有失败组 → 整段不可用
+            return None
         p = rec.get("path")
         if not p or not os.path.exists(p):
             return None
         paths.append(p)
+    if not paths:
+        return None
+    return _grid_multiref_concat_paths(paths)
+
+
+def _grid_multiref_concat_groups_partial(records: list[dict]) -> str | None:
+    """宽松模式：只 concat pass 的 group，跳过失败的。
+    保留场景顺序：scene_start 排序后只挑 pass 的；失败 group 直接跳过（视频帧上是 jump cut）。"""
+    if not records:
+        return None
+    paths: list[str] = []
+    for rec in sorted(records, key=lambda r: int(r.get("scene_start") or 0)):
+        if not rec.get("pass"):
+            continue
+        p = rec.get("path")
+        if not p or not os.path.exists(p):
+            continue
+        paths.append(p)
+    if not paths:
+        return None
+    return _grid_multiref_concat_paths(paths)
+
+
+def _grid_multiref_concat_paths(paths: list[str]) -> str | None:
+    """统一 fps + 编码再 concat，避免不同组帧率/码率差异。"""
     if not paths:
         return None
     out_path = str(OUTPUT_DIR / "grid_multiref_combined.mp4")
