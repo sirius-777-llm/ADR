@@ -304,6 +304,21 @@ ADSD_GENDER_FALLBACK_VOICE_ASSET = {
 }
 
 
+def _infer_needs_lip_sync(speaker: str, text: str = "", emotion: str = "") -> bool:
+    """规则推断：本 turn 是否需要走 A-roll lip-sync 路径（说话人正脸 + 嘴对音频）。
+    旁白/voiceover/解说类 → False (B-roll voice-over，画面全员可动)
+    其他 speaker → True (A-roll lip-sync 保留口型同步)
+    可被 override 脚本/LLM 显式覆盖。
+    """
+    sp = str(speaker or "").strip()
+    if not sp:
+        return True
+    # 显式 narrator 类型 → B-roll voice-over
+    if "旁白" in sp or sp.lower() in ("narrator", "voiceover", "vo", "解说"):
+        return False
+    return True
+
+
 def _voice_asset_id_for_speaker(speaker: str, gender: str | None = None) -> str:
     """根据 speaker name 关键字命中音色库的 voice_id；命中失败按 gender 走 fallback。"""
     s = str(speaker or "")
@@ -1585,6 +1600,13 @@ def _finalize_adsd_turns(turns: list[dict]) -> list[dict]:
                 turn.get("speaker", ""),
                 turn.get("voice_gender") or turn.get("gender"),
             )
+        # A-roll / B-roll 自动判定：旁白类默认 B-roll voice-over，其他默认 A-roll lip-sync
+        if "needs_lip_sync" not in turn:
+            turn["needs_lip_sync"] = _infer_needs_lip_sync(
+                turn.get("speaker", ""),
+                turn.get("text", ""),
+                turn.get("emotion", ""),
+            )
     return turns
 
 
@@ -1622,6 +1644,13 @@ def _parse_adsd_override_turns(raw_lines: list[str], topic: str) -> list[dict]:
         voice_gender = inferred_gender or _adsd_gender_from_voice(voice) or "male"
         # P3 音色库智能匹配：speaker name 关键字 → voice_assets.json 注册 asset
         voice_asset_id = _voice_asset_id_for_speaker(speaker, voice_gender)
+        needs_lip_sync = _infer_needs_lip_sync(speaker, text)
+        # 旁白类自动 B-roll；shot 描述也改成动态镜头而非"现场说话"
+        shot_desc = (
+            f"{speaker}在现场说出这一句，旁人只作倾听或反应"
+            if needs_lip_sync
+            else f"voice-over：画面展示与「{text[:40]}」相关的场景，镜头自由运动，无需出现说话人正脸"
+        )
         turns.append({
             "dialogue_turn": i + 1,
             "speaker": speaker,
@@ -1629,8 +1658,9 @@ def _parse_adsd_override_turns(raw_lines: list[str], topic: str) -> list[dict]:
             "speaker_id": voice["voice_id"],
             "speaker_name": voice["voice_name"],
             "voice_asset_id": voice_asset_id,
+            "needs_lip_sync": needs_lip_sync,
             "text": text,
-            "shot": f"{speaker}在现场说出这一句，旁人只作倾听或反应",
+            "shot": shot_desc,
             "emotion": "neutral",
             "injected_script": True,
         })
@@ -2608,6 +2638,8 @@ THUMBNAIL_ANCHOR: 封面视觉锚，用 4~6 个短语描述：主体、主色（
                 # 否则 step66 的 _select_voice_asset_reference 拿不到 explicit asset，
                 # 全部降级到 ADSD_DEFAULT_MALE/FEMALE_VOICE_ASSET
                 "voice_asset_id": dialogue_meta.get("voice_asset_id"),
+                # A-roll / B-roll 判定：True = WERYDANCE lip-sync，False = motion mode 自由动效
+                "needs_lip_sync": dialogue_meta.get("needs_lip_sync", True),
                 "shot": dialogue_meta.get("shot", ""),
                 "dialogue_shape": dialogue_meta.get("dialogue_shape", ""),
                 "speaker_count": dialogue_meta.get("speaker_count"),
@@ -9081,6 +9113,35 @@ def _adsd_lip_sync_prompt(scene: dict, safe_retry: bool = False) -> str:
     )[:2000]
 
 
+def _adsd_broll_motion_prompt(scene: dict, safe_retry: bool = False) -> str:
+    """B-roll / voice-over 模式：不传 audio，让 WERYDANCE 走 motion 模式，画面全员可动。
+    用于旁白等不需要说话人正脸 lip-sync 的 turn。"""
+    shot = scene.get("shot", "")
+    text = scene.get("text", "")
+    pov = (
+        " First-person onsite observer POV: viewer stands within the scene, observing as the moment unfolds; no character speaks directly to camera."
+        if ADSD_ONSITE_POV_MODE else ""
+    )
+    base = (
+        "Cinematic documentary B-roll, voice-over scene. "
+        "If a character sheet reference is provided, use it only to preserve character identity across panels; do not render the sheet itself. "
+        f"{_adsd_gender_lock_phrase(scene.get('voice_gender'))} "
+        "No character speaks directly to camera; no lip-sync needed; no mouth animation prioritized. "
+        "All visible elements may have natural ambient motion: subtle breathing, head turns, garment sway, lantern flicker, water ripple, dust motes, foliage drift. "
+        "Cinematic camera movement: slow dolly, push-in, or steady wide shot; depth of field; film grain. "
+    )
+    if safe_retry:
+        return (base +
+            f"Scene unfolds naturally without dialogue.{pov} "
+            "No speaker name labels, no logos, no watermark, no branded style references."
+        )[:2000]
+    return (base +
+        f"Scene action: {shot or text[:120]}.{pov} "
+        "Keep the same face and period clothing across panels; immersive for its topic era. "
+        "No speaker labels, no logos, no watermark, no branded style references."
+    )[:2000]
+
+
 def _adsd_almighty_audio_dub_prompt(scene: dict, safe_retry: bool = False) -> str:
     """Experimental: let Almighty Reference generate spoken audio from prompt text using uploaded audio as voice reference."""
     speaker = scene.get("speaker") or "speaker"
@@ -9553,15 +9614,25 @@ def _lip_sync_poll_download_and_process(idx: int, task_id: str, scene: dict, tar
 
 
 def _lip_sync_one_scene(idx: int, scene: dict, target_dur: float, aspect_ratio: str) -> tuple[int, bool, dict]:
+    # A-roll vs B-roll：旁白/voiceover 走 B-roll motion 模式，无 audio 锁主体；其他 speaker 走 A-roll lip-sync
+    needs_lip = bool(scene.get("needs_lip_sync", True))
     turn_audio = scene.get("dialogue_audio_mp3") or scene.get("dialogue_audio")
-    if not turn_audio or not os.path.exists(turn_audio):
+    if needs_lip and (not turn_audio or not os.path.exists(turn_audio)):
         return idx, False, {"turn": idx + 1, "pass": False, "reason": "missing_turn_audio"}
-    voice_asset_ref = _select_voice_asset_reference(scene)
-    source_audio = voice_asset_ref["path"] if voice_asset_ref else turn_audio
+    if needs_lip:
+        voice_asset_ref = _select_voice_asset_reference(scene)
+        source_audio = voice_asset_ref["path"] if voice_asset_ref else turn_audio
+    else:
+        voice_asset_ref = None
+        source_audio = None
     caption_info = _werydance_caption_request(scene)
     scene["_almighty_reference_audio"] = source_audio
-    scene["_almighty_reference_audio_role"] = "voice_asset_timbre_reference" if voice_asset_ref else "turn_dialogue_audio"
+    scene["_almighty_reference_audio_role"] = (
+        "voice_asset_timbre_reference" if voice_asset_ref
+        else ("turn_dialogue_audio" if needs_lip else "broll_no_audio")
+    )
     scene["_almighty_voice_asset_reference"] = voice_asset_ref
+    scene["_b_roll_mode"] = not needs_lip
     manual_repair_turns = _load_lips_change_requested_turns()
     repair_requested = ADSD_LIPS_CHANGE_REPAIR and ((idx + 1) in manual_repair_turns)
     repair_all = ADSD_LIPS_CHANGE_REPAIR and ADSD_LIPS_CHANGE_ALL
@@ -9588,7 +9659,7 @@ def _lip_sync_one_scene(idx: int, scene: dict, target_dur: float, aspect_ratio: 
                 alt_panel_urls.append(_upload_to_weryai(alt_path))
             except Exception as e:
                 log(f"[lip-sync {idx}] alt-speaker panel upload skipped: {e}")
-        audio_url = _upload_to_weryai(source_audio)
+        audio_url = _upload_to_weryai(source_audio) if (needs_lip and source_audio) else None
         # 顺序约定: [character_sheet(身份锚)?, alt_panel(同speaker场景示例)..., image_url(当前帧)]
         # WERYDANCE 把最后一张视为渲染目标，前面的作 identity / consistency 提示
         ref_images: list[str] = []
@@ -9603,7 +9674,14 @@ def _lip_sync_one_scene(idx: int, scene: dict, target_dur: float, aspect_ratio: 
         _text = str(scene.get("text") or "")
         _char_min = math.ceil(len(_text) / 6.0) if _text else 0
         api_dur = int(round(min(15, max(5, _char_min, _tts_dur))))
-        if ADSD_ALMIGHTY_AUDIO_DUB_EXPERIMENT:
+        if not needs_lip:
+            # B-roll motion 模式：不传 audio，prompt 不锁主体，全员可动
+            variants = [
+                ("broll_motion", "WERYDANCE_2_0", _adsd_broll_motion_prompt(scene, safe_retry=False), "false"),
+                ("broll_motion_safe", "WERYDANCE_2_0", _adsd_broll_motion_prompt(scene, safe_retry=True), "false"),
+                ("broll_motion_fast", "WERYDANCE_2_0_FAST", _adsd_broll_motion_prompt(scene, safe_retry=True), "false"),
+            ]
+        elif ADSD_ALMIGHTY_AUDIO_DUB_EXPERIMENT:
             variants = [
                 ("audio_dub_primary", "WERYDANCE_2_0", _adsd_almighty_audio_dub_prompt(scene, safe_retry=False), "true"),
                 ("audio_dub_safe", "WERYDANCE_2_0_FAST", _adsd_almighty_audio_dub_prompt(scene, safe_retry=True), "true"),
@@ -9623,10 +9701,9 @@ def _lip_sync_one_scene(idx: int, scene: dict, target_dur: float, aspect_ratio: 
             for submit_attempt in range(3):
                 try:
                     _wait_motion_submit_slot(f"lip-sync {idx+1}")
-                    r = req_post("/generation/almighty-reference-to-video", {
+                    payload = {
                         "model": model,
                         "images": ref_images,
-                        "audios": [audio_url],
                         "prompt": prompt,
                         "negative_prompt": _werydance_negative_prompt(scene),
                         "duration": api_dur,
@@ -9634,7 +9711,11 @@ def _lip_sync_one_scene(idx: int, scene: dict, target_dur: float, aspect_ratio: 
                         "resolution": "720p",
                         "generate_audio": generate_audio,
                         "video_number": 1,
-                    }, timeout=30)
+                    }
+                    # B-roll 模式不传 audios；A-roll 才传
+                    if audio_url:
+                        payload["audios"] = [audio_url]
+                    r = req_post("/generation/almighty-reference-to-video", payload, timeout=30)
                     task_id = r.get("data", {}).get("task_id") or (r.get("data", {}).get("task_ids") or [None])[0]
                     if task_id:
                         break
@@ -9817,6 +9898,11 @@ def step66_adsd_lip_sync(script: list[dict]):
         log(f"adsd_lipsync_multiref_attach_qa.json 写入失败: {e}")
     _attach_total = sum(r["alt_panel_count"] for r in _alt_attach_log)
     tg(f"🧪 ADSD lip-sync multi-ref attach: {_attach_total}/{n*2} alt-panel slot 已挂载 (同 speaker 跨 turn 一致性)")
+    # A-roll / B-roll 分布
+    a_roll = sum(1 for _s in script if _s.get("needs_lip_sync", True))
+    b_roll = n - a_roll
+    if b_roll > 0:
+        tg(f"🎬 A-roll / B-roll 分布：{a_roll} 个 lip-sync 镜头 + {b_roll} 个 motion 镜头（B-roll 全员可动，audio 走主轨）")
     results: dict[int, bool] = {}
     records: list[dict] = []
     # weryai 并发上限 20，贴顶以便长 ADR (>10 turn) 不会排队跑成串行
