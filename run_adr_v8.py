@@ -356,6 +356,53 @@ def _action_motion_fragment() -> str:
     )
 
 
+_EMOTION_KEYWORDS = {
+    "weary": ["累", "翻不了身", "不容失败", "压得", "喘不过气", "苦累", "操劳", "心力交瘁", "卷"],
+    "tense": ["焦虑", "无处可逃", "挖坑", "淘汰", "紧迫", "抢", "厮杀", "崩溃", "卡死", "陷阱"],
+    "wry": ["神仙", "煤灰", "牛马", "西瓜皮", "赚到了", "毫不起眼", "傻", "脚踩", "歪打正着", "凡尔赛"],
+    "warm": ["拥抱", "奇迹", "赡养", "感性和身体", "温暖", "亲人", "陪伴", "守护", "回家", "拥抱日常"],
+    "solemn": ["剥掉", "巨大的坑", "深渊", "代价", "残酷真相", "毁灭", "黑暗", "末日"],
+    "contemplative": ["其实", "实际上", "本质上", "为什么", "或许", "我们都在", "复杂", "并不是"],
+    "encouraging": ["可以", "不要怕", "相信", "勇敢", "迈出", "你能", "你已经"],
+    "playful": ["哈哈", "嘿嘿", "搞笑", "调侃"],
+}
+
+_EMOTION_EXPRESSION_PHRASE = {
+    "neutral": "natural observational face, soft eyes, light breath",
+    "tense": "tense, slight brow furrow, jaw tight, urgent narrowed gaze, shallow breath",
+    "solemn": "solemn, lowered brow, heavy eyes, slow deep breath, restrained posture",
+    "explanatory": "engaged explanatory face, alive eyes, occasional gestural emphasis, lecturer presence",
+    "warm": "warm gentle smile, soft glowing eyes, slight head tilt, comforting body posture",
+    "weary": "tired droop, half-closed eyelids, slumped shoulders, audible sigh, defeated body angle",
+    "wry": "wry half-smile, raised eyebrow, slight head shake, self-aware knowing look",
+    "playful": "playful eye sparkle, mischievous half-smile, light shoulder shrug, animated gestures",
+    "contemplative": "thoughtful inward gaze, slow blink, gentle drift, fingers near chin or temple",
+    "encouraging": "uplifted brow, encouraging smile, warm direct eye contact, open hands",
+}
+
+
+def _infer_emotion_from_text(text: str, speaker: str = "") -> str:
+    """关键字命中推断情绪；未命中按 speaker 类型给默认。
+    避免 override 路径所有 turn 永远 neutral 导致 GPT Image 2 画严肃脸。"""
+    s = str(text or "")
+    sp = str(speaker or "")
+    scores = {emo: sum(1 for kw in kws if kw in s) for emo, kws in _EMOTION_KEYWORDS.items()}
+    if scores:
+        top_emo = max(scores, key=lambda k: scores[k])
+        if scores.get(top_emo, 0) > 0:
+            return top_emo
+    if "旁白" in sp or sp.lower() in ("narrator", "voiceover", "vo"):
+        return "contemplative"
+    return "neutral"
+
+
+def _emotion_expression_phrase(emotion: str) -> str:
+    return _EMOTION_EXPRESSION_PHRASE.get(
+        str(emotion or "").strip().lower(),
+        _EMOTION_EXPRESSION_PHRASE["neutral"],
+    )
+
+
 def _infer_needs_lip_sync(speaker: str, text: str = "", emotion: str = "") -> bool:
     """规则推断：本 turn 是否需要走 A-roll lip-sync 路径（说话人正脸 + 嘴对音频）。
     旁白/voiceover/解说类 → False (B-roll voice-over，画面全员可动)
@@ -1714,6 +1761,7 @@ def _parse_adsd_override_turns(raw_lines: list[str], topic: str) -> list[dict]:
             if needs_lip_sync
             else f"voice-over：画面展示与「{text[:40]}」相关的场景，镜头自由运动，无需出现说话人正脸"
         )
+        inferred_emotion = _infer_emotion_from_text(text, speaker)
         turns.append({
             "dialogue_turn": i + 1,
             "speaker": speaker,
@@ -1724,7 +1772,7 @@ def _parse_adsd_override_turns(raw_lines: list[str], topic: str) -> list[dict]:
             "needs_lip_sync": needs_lip_sync,
             "text": text,
             "shot": shot_desc,
-            "emotion": "neutral",
+            "emotion": inferred_emotion,
             "injected_script": True,
         })
     return _finalize_adsd_turns(turns)
@@ -9303,25 +9351,28 @@ def _adsd_lip_sync_prompt(scene: dict, safe_retry: bool = False) -> str:
         "close enough to see the face and mouth, with framing chosen by topic-era immersion."
         if ADSD_ONSITE_POV_MODE else ""
     )
+    expr = _emotion_expression_phrase(scene.get("emotion"))
     if safe_retry:
         return (
-            "Neutral period dialogue scene. "
+            "Period dialogue scene with authentic emotional expression. "
             "If a character sheet reference is provided, use it only to preserve the active speaker identity; do not render the sheet itself. "
             f"{_adsd_gender_lock_phrase(scene.get('voice_gender'))} "
             f"Active speaker is the {role}; any other onsite characters listen silently. "
             "The active speaker follows the provided Chinese audio reference with natural mouth movement. "
-            f"Visible mouth, stable face, subtle head motion, realistic lighting.{pov} "
+            f"Expression: {expr}. "
+            f"Visible mouth with mood-matching face (NOT a frozen documentary mask), natural micro head movement.{pov} "
             f"Keep the scene immersive for its topic era.{_werydance_caption_instruction(scene)} "
             "No speaker name labels, no logos, no watermark, no branded style references."
         )
     shot = scene.get("shot", "")
     return (
-        "Historically grounded period dialogue scene. "
+        "Historically grounded period dialogue scene with authentic emotional expression. "
         "If a character sheet reference is provided, use it only to preserve the active speaker identity; do not render the sheet itself. "
         f"{_adsd_gender_lock_phrase(scene.get('voice_gender'))} "
         f"Active speaker is the {role}; any other people only listen or react. Do not display the speaker name. "
         "Use the uploaded Chinese audio reference as the only dialogue source. "
-        f"Mouth movement must synchronize with the audio reference; keep the mouth visible with natural jaw movement.{pov} "
+        f"Mouth movement must synchronize with the audio reference; keep mouth visible with natural jaw motion.{pov} "
+        f"Active speaker expression: {expr}. Avoid generic neutral documentary mask — let mood read on the face. "
         f"Scene action: {shot}. "
         "Camera style: handheld documentary realism — subtle organic shake, slight breathing in framing, natural lens micro-drift, gentle parallax. "
         "Lighting: practical real-world lighting with motivated shadows; mild film grain; subtle lens vignette. "
@@ -9342,11 +9393,13 @@ def _adsd_broll_motion_prompt(scene: dict, safe_retry: bool = False) -> str:
         if ADSD_ONSITE_POV_MODE else ""
     )
     action_boost = _action_motion_fragment() if _is_action_scene(text, shot) else ""
+    expr = _emotion_expression_phrase(scene.get("emotion"))
     base = (
-        "Cinematic documentary B-roll, voice-over scene — real-world cinematography style. "
+        "Cinematic documentary B-roll, voice-over scene — real-world cinematography style with authentic emotional expression. "
         "If a character sheet reference is provided, use it only to preserve character identity across panels; do not render the sheet itself. "
         f"{_adsd_gender_lock_phrase(scene.get('voice_gender'))} "
         "No character speaks directly to camera; no lip-sync needed; no mouth animation prioritized. "
+        f"Character expression and body language matching mood: {expr}. Avoid blank serious face — let mood read in eyes, brow, posture. "
         "Camera style: handheld documentary realism with organic shake and breathing framing; or smooth gimbal dolly when emphasizing motion direction. "
         "Subjects move with full-body engagement: walking, gesturing, working, reacting — NOT subtle micro-twitches alone. "
         "Lighting: practical real-world sources with motivated shadows; film grain; mild lens vignette; depth of field. "
