@@ -1910,7 +1910,13 @@ def _generate_adsd_dialogue_turns(topic: str, num_turns: int, tone: str, style_g
         text = str(item.get("text", "")).strip()
         shot = str(item.get("shot", "")).strip()
         emotion = str(item.get("emotion", "neutral")).strip().lower()
-        if emotion not in ("neutral", "tense", "solemn", "explanatory"):
+        # 白名单扩展到 10 种（_EMOTION_EXPRESSION_PHRASE 同步）：
+        # neutral / tense / solemn / explanatory（原）
+        # + warm / weary / wry / playful / contemplative / encouraging（新）
+        if emotion not in (
+            "neutral", "tense", "solemn", "explanatory",
+            "warm", "weary", "wry", "playful", "contemplative", "encouraging",
+        ):
             emotion = "neutral"
 
         # voice_gender：LLM 强约束（兼容旧字段名 gender）；缺失/非法则空，由 _voice_for_speaker 兜底推断
