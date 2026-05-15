@@ -320,17 +320,19 @@ def _is_action_scene(text: str, shot: str = "") -> bool:
     return hits >= 2  # 至少 2 个动作关键字
 
 
-def _wuxia_action_panel_prompt(text: str, shot: str = "", visual_subject: str = "") -> str:
+def _wuxia_action_panel_prompt(text: str, shot: str = "", visual_subject: str = "", voice_gender: str = "") -> str:
     """生成武侠/修真动作场面的 storyboard 出图 prompt — 让 GPT Image 2 渲染真实打斗画面而非对话场景。
     替换 姜文 LLM 的通用纪录片 prompt，使下游 WERYDANCE 拿到的底图本身就是动作 panel。"""
     text_clip = re.sub(r"\s+", " ", str(text or "")).strip()[:80]
     shot_clip = re.sub(r"\s+", " ", str(shot or "")).strip()[:80]
     subject = re.sub(r"\s+", " ", str(visual_subject or "")).strip()[:80]
+    gender_lock = _adsd_gender_lock_phrase(voice_gender)  # 满足 gender_voice_qa 检查
     return (
         "Wide cinematic wuxia/xianxia combat panel at peak-tension freeze frame. "
         f"Narration says: 「{text_clip}」 — render the action described, NOT characters talking about it. "
         f"{('Active subject: ' + subject + '. ') if subject else ''}"
         f"{('Shot direction: ' + shot_clip + '. ') if shot_clip else ''}"
+        f"{gender_lock} "
         "Visible sword/blade trails caught mid-swing, qi/spiritual-energy bursts in jade-cyan neon ink-wash palette, "
         "robes and long hair caught mid-flight by impact wind, debris/sparks/talismanic glyphs floating in mid-air, "
         "low-angle hero shot or dramatic over-the-shoulder framing, "
@@ -484,7 +486,9 @@ ADSD_MODE_NAME = ("VADSD" if IS_VERTICAL else "HADSD") if ADS_DIALOGUE_MODE else
 ADSD_VOICES = {
     "记者": {"voice_id": 67, "voice_name": "Refreshing Young Man"},
     "职员": {"voice_id": 69, "voice_name": "Reliable Executive"},
-    "旁白": {"voice_id": 76, "voice_name": "News Anchor"},
+    # 旁白 默认走男声沉稳叙述（Lyrical Voice），避免短视频女声 News Anchor 跟纪录片基调错位
+    # 用户明示要女声旁白时显式传 voice_gender=female 即可
+    "旁白": {"voice_id": 68, "voice_name": "Lyrical Voice"},
 }
 
 # 男声池：未知/英文/自创品牌角色名按名字 hash 在此池轮换，避免全部走女声 News Anchor
@@ -2730,6 +2734,7 @@ THUMBNAIL_ANCHOR: Air Force One stairs, black leather jacket figure, glowing chi
                 dialogue_meta.get("text", ""),
                 dialogue_meta.get("shot", ""),
                 dialogue_meta.get("visual_subject", ""),
+                voice_gender=dialogue_meta.get("voice_gender") or _dlg_gender,
             )
             log(f"动作 panel 替换 prompt: turn {i+1} 「{dialogue_meta.get('text','')[:30]}...」 → 武侠 combat panel")
         item = {
@@ -3687,6 +3692,9 @@ def _write_adsd_speaker_focus_qa(script: list[dict], motion_results: dict[int, b
             prompt = scene.get("prompt", "")
             speaker = scene.get("speaker", "")
             contract = scene.get("speaker_visual_contract", "")
+            # B-roll motion 路径不需要 active speaker / lip-sync prompt 锁定
+            # 包含：旁白 voice-over 和 action 场面 panel override
+            is_b_roll = not bool(scene.get("needs_lip_sync", True))
             scenes.append({
                 "turn": i + 1,
                 "speaker": speaker,
@@ -3695,6 +3703,7 @@ def _write_adsd_speaker_focus_qa(script: list[dict], motion_results: dict[int, b
                 "audio_start": scene.get("audio_start"),
                 "audio_end": scene.get("audio_end"),
                 "duration": scene.get("dur"),
+                "is_b_roll": is_b_roll,
                 "speaker_contract_exists": bool(contract),
                 "prompt_has_active_speaker": "Active speaker is" in prompt,
                 "prompt_names_speaker_role": bool(speaker) and (speaker in prompt or "historical onsite character" in prompt),
@@ -3705,10 +3714,11 @@ def _write_adsd_speaker_focus_qa(script: list[dict], motion_results: dict[int, b
             s for s in scenes
             if not s["speaker"]
             or not s["speaker_contract_exists"]
-            or not s["prompt_has_active_speaker"]
-            or not s["onsite_pov_prompt"]
             or s["audio_start"] is None
             or s["audio_end"] is None
+            # A-roll lip-sync 才要求 active speaker / onsite POV；B-roll 不检查
+            or (not s["is_b_roll"] and not s["prompt_has_active_speaker"])
+            or (not s["is_b_roll"] and not s["onsite_pov_prompt"])
         ]
         payload = {
             "mode": ADSD_MODE_NAME,
