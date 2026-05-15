@@ -9891,25 +9891,29 @@ def _lip_sync_one_scene(idx: int, scene: dict, target_dur: float, aspect_ratio: 
         _text = str(scene.get("text") or "")
         _char_min = math.ceil(len(_text) / 6.0) if _text else 0
         api_dur = int(round(min(15, max(5, _char_min, _tts_dur))))
+        fast_fallback_enabled = os.environ.get("ADR_WERYDANCE_FAST_FALLBACK", "1").strip().lower() not in ("0", "false", "no", "off")
         if not needs_lip:
             # B-roll motion 模式：不传 audio，prompt 不锁主体，全员可动
             variants = [
                 ("broll_motion", "WERYDANCE_2_0", _adsd_broll_motion_prompt(scene, safe_retry=False), "false"),
                 ("broll_motion_safe", "WERYDANCE_2_0", _adsd_broll_motion_prompt(scene, safe_retry=True), "false"),
-                ("broll_motion_fast", "WERYDANCE_2_0_FAST", _adsd_broll_motion_prompt(scene, safe_retry=True), "false"),
             ]
+            if fast_fallback_enabled:
+                variants.append(("broll_motion_fast", "WERYDANCE_2_0_FAST", _adsd_broll_motion_prompt(scene, safe_retry=True), "false"))
         elif ADSD_ALMIGHTY_AUDIO_DUB_EXPERIMENT:
             variants = [
                 ("audio_dub_primary", "WERYDANCE_2_0", _adsd_almighty_audio_dub_prompt(scene, safe_retry=False), "true"),
-                ("audio_dub_safe", "WERYDANCE_2_0_FAST", _adsd_almighty_audio_dub_prompt(scene, safe_retry=True), "true"),
                 ("silent_lips_fallback", "WERYDANCE_2_0", _adsd_lip_sync_prompt(scene, safe_retry=True), "false"),
             ]
+            if fast_fallback_enabled:
+                variants.insert(1, ("audio_dub_safe", "WERYDANCE_2_0_FAST", _adsd_almighty_audio_dub_prompt(scene, safe_retry=True), "true"))
         else:
             variants = [
                 ("primary", "WERYDANCE_2_0", _adsd_lip_sync_prompt(scene, safe_retry=False), "false"),
                 ("safe_prompt", "WERYDANCE_2_0", _adsd_lip_sync_prompt(scene, safe_retry=True), "false"),
-                ("fast_safe_prompt", "WERYDANCE_2_0_FAST", _adsd_lip_sync_prompt(scene, safe_retry=True), "false"),
             ]
+            if fast_fallback_enabled:
+                variants.append(("fast_safe_prompt", "WERYDANCE_2_0_FAST", _adsd_lip_sync_prompt(scene, safe_retry=True), "false"))
         attempts: list[dict] = []
         for variant_name, model, prompt, generate_audio in variants:
             r = None
