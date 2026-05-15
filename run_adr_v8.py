@@ -2104,7 +2104,6 @@ def step1_script(topic: str) -> list[dict]:
         log(f"外部脚本注入预设分镜数：{num_lines}")
     else:
         try:
-            import json
             plan_raw = chat("GEMINI_3_1_FLASH_LITE", "你是纪录片分镜规划师。", plan_prompt)
             fence = re.search(r'```(?:\w*)\s*\n?([\s\S]*?)```', plan_raw)
             plan_clean = fence.group(1).strip() if fence else plan_raw.strip()
@@ -2574,8 +2573,26 @@ THUMBNAIL_ANCHOR: Air Force One stairs, black leather jacket figure, glowing chi
         emotions = ["紧张", "压抑", "辉煌", "紧张", "压抑", "释然"]
         visuals = []
         for i, line in enumerate(lines):
+            dialogue_meta = dialogue_turns[i] if ADS_DIALOGUE_MODE and i < len(dialogue_turns) else {}
+            speaker = str(dialogue_meta.get("speaker", "")).strip()
+            needs_lip_sync = bool(dialogue_meta.get("needs_lip_sync", False))
             motif = motif_pool[i % len(motif_pool)]
-            if any(k in line for k in ("黄仁勋", "老黄", "英伟达")):
+            if needs_lip_sync and any(k in speaker for k in ("黄仁勋", "Jensen")):
+                motif = (
+                    "cinematic A-roll of Jensen Huang-like Asian male technology CEO in black leather jacket, "
+                    "three-quarter close-up, active speaking mouth, small hand gesture, GPU demo screen behind him"
+                )
+            elif needs_lip_sync and any(k in speaker for k in ("特朗普", "川普", "Trump")):
+                motif = (
+                    "cinematic A-roll of older blond American president-like politician in navy suit and red tie, "
+                    "three-quarter close-up, active speaking mouth, assertive hand gesture, White House press corridor behind him"
+                )
+            elif needs_lip_sync and speaker:
+                motif = (
+                    f"cinematic A-roll of {speaker} speaking on location, three-quarter close-up, "
+                    "active mouth, expressive hand gesture, listeners blurred behind"
+                )
+            elif any(k in line for k in ("黄仁勋", "老黄", "英伟达")):
                 motif = "black leather jacket technology CEO silhouette beside a glowing GPU chip"
             elif any(k in line for k in ("空军1号", "飞机", "机舱")):
                 motif = "Air Force One boarding stairs, executive traveler with backpack, night runway lights"
@@ -2593,6 +2610,11 @@ THUMBNAIL_ANCHOR: Air Force One stairs, black leather jacket figure, glowing chi
                 "chiaroscuro single-key lighting, motion-ready B-roll, "
                 f"{motif}, no TV studio, no onsite reporter, no talking-head anchor, no ancient costume"
             )
+            if dialogue_meta:
+                prompt += (
+                    f", semantic context from the spoken line: 「{str(line)[:90]}」, "
+                    "use this only to choose visuals, do not render subtitles or visible text"
+                )
             visuals.append({"emotion": emotions[i % len(emotions)], "prompt": prompt})
         log(f"外部脚本注入：使用确定性财经科技分镜 prompt，共 {len(visuals)} 个")
     else:
