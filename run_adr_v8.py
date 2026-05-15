@@ -9323,6 +9323,9 @@ def _adsd_lip_sync_prompt(scene: dict, safe_retry: bool = False) -> str:
         "Use the uploaded Chinese audio reference as the only dialogue source. "
         f"Mouth movement must synchronize with the audio reference; keep the mouth visible with natural jaw movement.{pov} "
         f"Scene action: {shot}. "
+        "Camera style: handheld documentary realism — subtle organic shake, slight breathing in framing, natural lens micro-drift, gentle parallax. "
+        "Lighting: practical real-world lighting with motivated shadows; mild film grain; subtle lens vignette. "
+        "Avoid synthetic-looking smooth interpolation; let small imperfections (eye blinks, micro head adjustments, breath movement, cloth ripple) read as real-world capture. "
         "Keep the same face and period clothing, keep framing immersive for its topic era. "
         f"{_werydance_caption_instruction(scene)} No speaker labels, logos, or watermarks."
     )[:2000]
@@ -9340,12 +9343,15 @@ def _adsd_broll_motion_prompt(scene: dict, safe_retry: bool = False) -> str:
     )
     action_boost = _action_motion_fragment() if _is_action_scene(text, shot) else ""
     base = (
-        "Cinematic documentary B-roll, voice-over scene. "
+        "Cinematic documentary B-roll, voice-over scene — real-world cinematography style. "
         "If a character sheet reference is provided, use it only to preserve character identity across panels; do not render the sheet itself. "
         f"{_adsd_gender_lock_phrase(scene.get('voice_gender'))} "
         "No character speaks directly to camera; no lip-sync needed; no mouth animation prioritized. "
-        "All visible elements may have natural ambient motion: subtle breathing, head turns, garment sway, lantern flicker, water ripple, dust motes, foliage drift. "
-        "Cinematic camera movement: slow dolly, push-in, or steady wide shot; depth of field; film grain. "
+        "Camera style: handheld documentary realism with organic shake and breathing framing; or smooth gimbal dolly when emphasizing motion direction. "
+        "Subjects move with full-body engagement: walking, gesturing, working, reacting — NOT subtle micro-twitches alone. "
+        "Lighting: practical real-world sources with motivated shadows; film grain; mild lens vignette; depth of field. "
+        "All visible elements (characters, objects, environment) carry kinetic life: garment ripple, hair flow, ambient particles, foliage drift, water ripple. "
+        "Avoid synthetic smooth interpolation — let small imperfections read as real capture. "
         f"{action_boost}"
     )
     if safe_retry:
@@ -10803,9 +10809,14 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
             total_gaps = max(0, len(segments) - 1) * SUB_GAP
             content_dur = max(duration - total_gaps, duration * 0.5)
             cursor = t_start
-            for seg in segments:
+            # 跨 turn 边界保护：紧凑模式 pause=0 时本 turn 末尾 segment 跟下 turn 首段会贴死
+            # 末段 seg_end 收 SUB_GAP，确保跨 turn 也有 SUB_GAP 间隙
+            has_next_turn = (idx + 1) < len(script)
+            for seg_i, seg in enumerate(segments):
                 seg_dur = max(content_dur * len(seg.replace(r"\N", "")) / total_chars, 0.8)
-                seg_end = min(cursor + seg_dur, t_end)
+                is_last_seg = (seg_i == len(segments) - 1)
+                cap_end = (t_end - SUB_GAP) if (is_last_seg and has_next_turn) else t_end
+                seg_end = min(cursor + seg_dur, cap_end)
                 if seg.strip():
                     f.write(
                         f"Dialogue: 0,{ass_time(cursor)},{ass_time(seg_end)},"
