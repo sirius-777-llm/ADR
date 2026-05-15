@@ -21,6 +21,11 @@ push_backup() {
     return $rc
 }
 
+# 主文件改动后自动重生 INDEX.md（如果生成器在）
+if [ -f tools/generate_index.py ] && [ -n "$(git diff --name-only -- run_adr_v8.py)" ]; then
+    /opt/homebrew/bin/python3 tools/generate_index.py >/dev/null 2>&1 || true
+fi
+
 CHANGES=$(git diff --name-only -- '*.py' '*.md' '*.skill' '*.sh' 'skill/' 'openclaw-skill/')
 UNTRACKED=$(git ls-files --others --exclude-standard -- '*.py' '*.md' '*.skill' '*.sh')
 
