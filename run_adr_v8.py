@@ -9872,9 +9872,11 @@ def _lip_sync_one_scene(idx: int, scene: dict, target_dur: float, aspect_ratio: 
         return idx, ok, info
     try:
         image_url = _upload_to_weryai(scene["img_path"])
+        broll_use_sheet = os.environ.get("ADR_ADSD_BROLL_USE_CHARACTER_SHEET", "0").strip().lower() in ("1", "true", "yes", "on")
+        broll_use_alt_panels = os.environ.get("ADR_ADSD_BROLL_ALT_PANELS", "0").strip().lower() in ("1", "true", "yes", "on")
         sheet_path = OUTPUT_DIR / "character_sheet.png"
         sheet_url = None
-        if sheet_path.exists() and sheet_path.stat().st_size > 10000:
+        if (needs_lip or broll_use_sheet) and sheet_path.exists() and sheet_path.stat().st_size > 10000:
             try:
                 sheet_url = _upload_to_weryai(str(sheet_path))
             except Exception as e:
@@ -9882,7 +9884,7 @@ def _lip_sync_one_scene(idx: int, scene: dict, target_dur: float, aspect_ratio: 
         # 同 speaker 的其他 panel 作为跨 turn 一致性 reference（最多 2 张）
         # _alt_speaker_panels 由 step66_adsd_lip_sync 在线程外预先计算并塞进 scene
         alt_panel_urls: list[str] = []
-        for alt_path in scene.get("_alt_speaker_panels", [])[:2]:
+        for alt_path in (scene.get("_alt_speaker_panels", [])[:2] if (needs_lip or broll_use_alt_panels) else []):
             if not (alt_path and os.path.exists(alt_path)):
                 continue
             try:
