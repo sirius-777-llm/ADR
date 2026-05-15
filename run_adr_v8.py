@@ -320,6 +320,26 @@ def _is_action_scene(text: str, shot: str = "") -> bool:
     return hits >= 2  # 至少 2 个动作关键字
 
 
+def _wuxia_action_panel_prompt(text: str, shot: str = "", visual_subject: str = "") -> str:
+    """生成武侠/修真动作场面的 storyboard 出图 prompt — 让 GPT Image 2 渲染真实打斗画面而非对话场景。
+    替换 姜文 LLM 的通用纪录片 prompt，使下游 WERYDANCE 拿到的底图本身就是动作 panel。"""
+    text_clip = re.sub(r"\s+", " ", str(text or "")).strip()[:80]
+    shot_clip = re.sub(r"\s+", " ", str(shot or "")).strip()[:80]
+    subject = re.sub(r"\s+", " ", str(visual_subject or "")).strip()[:80]
+    return (
+        "Wide cinematic wuxia/xianxia combat panel at peak-tension freeze frame. "
+        f"Narration says: 「{text_clip}」 — render the action described, NOT characters talking about it. "
+        f"{('Active subject: ' + subject + '. ') if subject else ''}"
+        f"{('Shot direction: ' + shot_clip + '. ') if shot_clip else ''}"
+        "Visible sword/blade trails caught mid-swing, qi/spiritual-energy bursts in jade-cyan neon ink-wash palette, "
+        "robes and long hair caught mid-flight by impact wind, debris/sparks/talismanic glyphs floating in mid-air, "
+        "low-angle hero shot or dramatic over-the-shoulder framing, "
+        "dynamic motion blur on weapons and limbs, deep film grain, dramatic rim backlight. "
+        "Strictly forbidden: characters standing still and speaking, talking heads, calm portrait, "
+        "speech bubbles, captions, subtitles, watermarks, modern clothing, contemporary urban backgrounds."
+    )
+
+
 def _action_motion_fragment() -> str:
     """动作场面专用 WERYDANCE motion prompt 强化 — 武侠/修真打斗节奏"""
     return (
@@ -2630,6 +2650,20 @@ THUMBNAIL_ANCHOR: 封面视觉锚，用 4~6 个短语描述：主体、主色（
                 ". Motion-ready shot design: avoid static talking-head or podium repetition; include one visible kinetic element "
                 "such as walking, hand operation, machinery, crowd reaction, screen interaction, fabric, smoke, dust, or a moving camera path"
             )
+        # 武侠/修真动作场面：B-roll 且 text 命中 ≥2 个 action keyword → 替换 prompt 为专用 combat panel
+        # 让 GPT Image 2 出真打斗画面（剑光/灵气/凌空）而不是"两人交谈"通用纪录片调
+        if (
+            ADS_DIALOGUE_MODE
+            and dialogue_meta
+            and not dialogue_meta.get("needs_lip_sync", True)
+            and _is_action_scene(dialogue_meta.get("text", ""), dialogue_meta.get("shot", ""))
+        ):
+            prompt = _wuxia_action_panel_prompt(
+                dialogue_meta.get("text", ""),
+                dialogue_meta.get("shot", ""),
+                dialogue_meta.get("visual_subject", ""),
+            )
+            log(f"动作 panel 替换 prompt: turn {i+1} 「{dialogue_meta.get('text','')[:30]}...」 → 武侠 combat panel")
         item = {
             "text": line,
             "emotion": emotion,
