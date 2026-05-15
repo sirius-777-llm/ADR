@@ -5537,6 +5537,46 @@ def _character_sheet_prompt(script: list[dict], topic: str, aspect: str) -> str:
             speakers.append(speaker)
         beats.append(f"{i:02d}. {visual[:280]}")
     if ADS_DIALOGUE_MODE:
+        if any(s.get("injected_script") for s in script):
+            on_camera = []
+            for scene in script:
+                sp = str(scene.get("speaker") or "").strip()
+                if sp and scene.get("needs_lip_sync", True) and sp not in on_camera:
+                    on_camera.append(sp)
+            if not on_camera:
+                on_camera = [s for s in speakers if s and "旁白" not in s][:4] or speakers[:4]
+
+            def _short_role(sp: str) -> str:
+                if any(k in sp for k in ("黄仁勋", "Jensen")):
+                    return "Asian male tech CEO, black leather jacket, short gray hair, rimless glasses, confident restrained expression, GPU keynote props."
+                if any(k in sp for k in ("特朗普", "川普", "Trump")):
+                    return "older blond American president-like politician, navy suit, white shirt, red tie, assertive hand gesture, White House corridor props."
+                if "旁白" in sp:
+                    return "male voice-over only; use B-roll visuals, no recurring on-camera narrator face."
+                return "distinct documentary speaker, period-accurate face, costume, hair, props, neutral talking expression."
+
+            role_block = "\n".join(f"- {sp}: {_short_role(sp)}" for sp in on_camera[:4])
+            short_beats = []
+            for i, scene in enumerate(script[:6], start=1):
+                beat = re.sub(r"\s+", " ", str(scene.get("text") or "")).strip()
+                short_beats.append(f"{i:02d}. {beat[:70]}")
+            return f"""Create one single {aspect} concise dialogue cast model sheet.
+Topic: US-China chip negotiation documentary.
+
+Use this as identity reference for WeryDance lip-sync only.
+Draw clean reusable speaker references, not a poster and not a storyboard.
+
+Speakers:
+{role_block}
+
+Layout:
+- One row per on-camera speaker.
+- Front view, 3/4 view, side view, neutral talking expression.
+- Large clear face, consistent costume, reusable props, coherent modern geopolitical documentary style.
+- No subtitles, no dialogue text, no watermarks, no comic panels.
+
+Context beats:
+{chr(10).join(short_beats)}"""
         role_lines = []
         for speaker in speakers[:8]:
             first = next((s for s in script if s.get("speaker") == speaker), {})
