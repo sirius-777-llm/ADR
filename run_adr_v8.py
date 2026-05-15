@@ -270,6 +270,8 @@ ADSD_DEFAULT_FEMALE_VOICE_ASSET = os.environ.get("ADR_ADSD_DEFAULT_FEMALE_VOICE_
 # speaker name 含以下关键字时，优先用对应音色库 asset_id
 # 排除项：歌声（BY2/orange4music/JJ Lin）、混音未分离（mettsarchive 原始）、高风险公众人物（Trump/JJ Lin 默认不用）
 ADSD_SPEAKER_KEYWORD_TO_ASSET: list[tuple[list[str], str]] = [
+    # 公众人物音色：仅在脚本显式标注 Trump/特朗普/川普 speaker 时命中；默认不会自动使用
+    (["Trump", "Donald Trump", "特朗普", "川普"], "external_trump_tiktok_001"),
     # 法学 / 讲师 / 教授 / 旁白（沉稳叙述）
     (["法学", "律师", "讲师", "教授", "讲座", "理性", "罗翔", "旁白", "末日旁白", "解说", "总叙", "总结者", "narrator", "Narrator"], "external_luo_xiang_xyma_001"),
     # 知识型访谈 / 经济 / 作家 / 评论
@@ -12471,33 +12473,54 @@ def _await_async_cover_caption(timeout_seconds: float = 600.0) -> tuple | None:
 def step10_deliver(final_path: str, topic: str, script: list[dict]):
     if NO_VOICE:
         bgm_qa = _write_bgm_only_qa(final_path, script)
+        hard_block = os.environ.get("ADR_ADSD_QA_HARD_BLOCK", "0").strip().lower() in ("1", "true", "yes", "on")
         if not bgm_qa.get("pass"):
             issues = "\n".join(f"• {x}" for x in bgm_qa.get("issues", [])[:8])
-            tg(
-                "🛑 ADR/ADS BGM-only 发布已阻断：QA 未通过\n\n"
-                f"{issues}\n\n"
-                f"成片已保留在本地：{final_path}\n"
-                f"QA：{OUTPUT_DIR / 'bgm_only_qa.json'}"
-            )
-            log(f"BGM-only QA blocked: {bgm_qa.get('issues')}")
-            return
-        warn_lines = "\n".join(f"• {x}" for x in bgm_qa.get("warnings", [])[:5])
-        warn_note = f"\n\n提示：\n{warn_lines}" if warn_lines else ""
-        tg(f"✅ ADR/ADS BGM-only 发布门禁通过：BGM 音轨/时长/字幕节奏 QA OK{warn_note}")
+            if hard_block:
+                tg(
+                    "🛑 ADR/ADS BGM-only 发布已阻断（ADR_ADSD_QA_HARD_BLOCK=1）：QA 未通过\n\n"
+                    f"{issues}\n\n"
+                    f"成片保留在本地：{final_path}\n"
+                    f"QA：{OUTPUT_DIR / 'bgm_only_qa.json'}"
+                )
+                log(f"BGM-only QA hard-blocked: {bgm_qa.get('issues')}")
+                return
+            else:
+                tg(
+                    "⚠️ ADR/ADS BGM-only QA 未通过（继续推送，仅作提醒）：\n\n"
+                    f"{issues}\n\n"
+                    f"详细 QA：{OUTPUT_DIR / 'bgm_only_qa.json'}"
+                )
+                log(f"BGM-only QA warning (not blocked): {bgm_qa.get('issues')}")
+        else:
+            warn_lines = "\n".join(f"• {x}" for x in bgm_qa.get("warnings", [])[:5])
+            warn_note = f"\n\n提示：\n{warn_lines}" if warn_lines else ""
+            tg(f"✅ ADR/ADS BGM-only 发布门禁通过：BGM 音轨/时长/字幕节奏 QA OK{warn_note}")
 
     if ADS_DIALOGUE_MODE:
         delivery_qa = _write_adsd_delivery_qa(final_path)
+        # QA 改为"提醒"而非"阻断" — 大哥要求继续推送即使 QA 不全过，问题以警告呈现
+        # 需要重新启用阻断时 set ADR_ADSD_QA_HARD_BLOCK=1
+        hard_block = os.environ.get("ADR_ADSD_QA_HARD_BLOCK", "0").strip().lower() in ("1", "true", "yes", "on")
         if delivery_qa and not delivery_qa.get("pass"):
             issues = "\n".join(f"• {x}" for x in delivery_qa.get("issues", [])[:8])
-            tg(
-                f"🛑 {ADSD_MODE_NAME} 发布已阻断：QA 未通过\n\n"
-                f"{issues}\n\n"
-                f"成片已保留在本地：{final_path}\n"
-                f"QA：{OUTPUT_DIR / 'delivery_qa.json'}"
-            )
-            log(f"{ADSD_MODE_NAME} delivery QA blocked: {delivery_qa.get('issues')}")
-            return
-        if delivery_qa:
+            if hard_block:
+                tg(
+                    f"🛑 {ADSD_MODE_NAME} 发布已阻断（ADR_ADSD_QA_HARD_BLOCK=1）：QA 未通过\n\n"
+                    f"{issues}\n\n"
+                    f"成片保留在本地：{final_path}\n"
+                    f"QA：{OUTPUT_DIR / 'delivery_qa.json'}"
+                )
+                log(f"{ADSD_MODE_NAME} delivery QA hard-blocked: {delivery_qa.get('issues')}")
+                return
+            else:
+                tg(
+                    f"⚠️ {ADSD_MODE_NAME} QA 未全通过（继续推送，仅作提醒）：\n\n"
+                    f"{issues}\n\n"
+                    f"详细 QA：{OUTPUT_DIR / 'delivery_qa.json'}"
+                )
+                log(f"{ADSD_MODE_NAME} delivery QA warning (not blocked): {delivery_qa.get('issues')}")
+        elif delivery_qa:
             warn_lines = "\n".join(f"• {x}" for x in delivery_qa.get("warnings", [])[:5])
             warn_note = f"\n\n提示：\n{warn_lines}" if warn_lines else ""
             tg(f"✅ {ADSD_MODE_NAME} 发布门禁通过：字幕/口型/音画同步 QA OK{warn_note}")
