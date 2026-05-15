@@ -32,6 +32,27 @@ import sys as _sys
 _sp = '/opt/homebrew/lib/python3.14/site-packages'
 if _sp not in _sys.path:
     _sys.path.insert(0, _sp)
+# 项目根目录加入 sys.path，让 adr_data 包可以被 import
+_project_root = str(Path(__file__).resolve().parent)
+if _project_root not in _sys.path:
+    _sys.path.insert(0, _project_root)
+
+# 抽离的纯数据常量（Phase 2 重构）— 保持原变量名兼容现有代码
+from adr_data.action_keywords import ACTION_KEYWORDS_ZH as _ACTION_KEYWORDS_ZH  # noqa: E402
+from adr_data.emotion import (  # noqa: E402
+    EMOTION_KEYWORDS as _EMOTION_KEYWORDS,
+    EMOTION_EXPRESSION_PHRASE as _EMOTION_EXPRESSION_PHRASE,
+    SUPPORTED_EMOTIONS as _SUPPORTED_EMOTIONS,
+)
+from adr_data.voices import (  # noqa: E402
+    ADSD_VOICES,
+    ADSD_MALE_VOICE_POOL,
+    ADSD_FEMALE_VOICE_POOL,
+    ADSD_MALE_VOICE_IDS,
+    ADSD_FEMALE_VOICE_IDS,
+    ADSD_VOICE_GENDER_BY_ID,
+    ADSD_SPEAKER_KEYWORD_TO_ASSET,
+)
 
 def get_almanac_data(topic: str) -> str | None:
     """从 topic 提取日期，用 lunar-python 获取完整老黄历数据，返回结构化文本。
@@ -267,38 +288,7 @@ ADSD_DEFAULT_MALE_VOICE_ASSET = os.environ.get("ADR_ADSD_DEFAULT_MALE_VOICE_ASSE
 ADSD_DEFAULT_FEMALE_VOICE_ASSET = os.environ.get("ADR_ADSD_DEFAULT_FEMALE_VOICE_ASSET", "external_by2_e7gn_001")
 
 # ── 音色库智能匹配（P3） ─────────────────────────────────────────
-# speaker name 含以下关键字时，优先用对应音色库 asset_id
-# 排除项：歌声（BY2/orange4music/JJ Lin）、混音未分离（mettsarchive 原始）、高风险公众人物（Trump/JJ Lin 默认不用）
-ADSD_SPEAKER_KEYWORD_TO_ASSET: list[tuple[list[str], str]] = [
-    # 公众人物音色：仅在脚本显式标注 Trump/特朗普/川普 speaker 时命中；默认不会自动使用
-    (["Trump", "Donald Trump", "特朗普", "川普"], "external_trump_tiktok_001"),
-    # 法学 / 讲师 / 教授 / 旁白（沉稳叙述）
-    (["法学", "律师", "讲师", "教授", "讲座", "理性", "罗翔", "旁白", "末日旁白", "解说", "总叙", "总结者", "narrator", "Narrator"], "external_luo_xiang_xyma_001"),
-    # 知识型访谈 / 经济 / 作家 / 评论
-    (["学者", "知识", "评论", "作家", "记者", "访谈", "许知远", "经济学家", "社会学家", "历史学家", "评论员"], "external_xu_zhiyuan_xyma_001"),
-    # 科技 / 企业家 / 工程师 / 投资人 / 合伙人
-    (["工程师", "科学家", "CEO", "投资", "企业家", "硅谷", "技术", "黄仁勋", "Jensen", "合伙人", "创始人", "VC", "GP"], "external_huang_renxun_fzh_001"),
-    # 玄幻 / 古风长者 / 道士 / 牧神记男角 / 村长 / 修仙宗主
-    (["道士", "玄幻", "宗师", "长者", "修真", "高人", "老人", "前辈", "老者", "绫璟", "道人", "村长", "教主", "宗主"], "external_mushenji_lingjing_001"),
-    # 年轻男 / 弟子 / 学生 / 秦牧
-    (["弟子", "学生", "少年", "孩子", "小子", "秦牧"], "external_mushenji_qinmu_001"),
-    # 古装女 / 公主 / 夫人 / 虞渊初雨
-    (["公主", "王后", "嫔", "贵妃", "千金", "夫人", "娘娘", "格格", "虞渊", "初雨"], "external_mushenji_chuyu_001"),
-    # 影视演员 / 戏剧对白 / 民间老头 / 江湖匠人
-    (["演员", "戏剧角色", "戏中人", "黄渤", "药师", "医师", "郎中", "铁匠", "屠夫", "船工"], "external_huang_bo_tiktok_7550564384750210321"),
-    # 台湾国语 / 感情戏男
-    (["台剧", "台湾", "感情戏"], "external_tiktok_comedydramatw_male_001"),
-    # 印尼华侨 / 东南亚口音
-    (["印尼", "华侨", "东南亚"], "external_mettsarchive_indo_chinese_speakerB_001"),
-    # 街访 / 都市女
-    (["街访", "都市女", "路人女", "市民女", "都市感"], "external_tiktok_urban_talk_7618042272130600212"),
-    # 旅游 / 短视频女
-    (["旅游", "向导女", "vlogger"], "external_tiktok_nghithao_0208_7624063339613752594"),
-    # 干货 / 培训女
-    (["电商", "培训", "干货", "讲解师", "运营"], "external_tiktok_ecom_female_001"),
-    # 短视频高能女
-    (["主播", "网红", "活力女"], "external_tiktok_fjl9fl6_7621754156704959765"),
-]
+# 数据已抽到 adr_data/voices.py 的 ADSD_SPEAKER_KEYWORD_TO_ASSET（顶部已 import）
 # gender-only fallback（关键字未命中时）
 ADSD_GENDER_FALLBACK_VOICE_ASSET = {
     "male": ADSD_DEFAULT_MALE_VOICE_ASSET,
@@ -306,13 +296,7 @@ ADSD_GENDER_FALLBACK_VOICE_ASSET = {
 }
 
 
-_ACTION_KEYWORDS_ZH = (
-    "剑", "刀", "戟", "矛", "斧", "枪",
-    "斗", "打", "战", "杀", "砍", "劈", "刺", "戳", "撕",
-    "招", "式", "法决", "神通", "灵气", "法力", "真气", "元气", "剑气", "剑光", "刀光",
-    "暴击", "冲撞", "腾空", "凌空", "飞身", "纵跃", "踢", "拳", "掌", "击碎",
-    "爆", "炸", "破", "毁", "崩", "裂", "震",
-)
+# _ACTION_KEYWORDS_ZH 已抽到 adr_data/action_keywords.py（顶部已 import）
 
 
 def _is_action_scene(text: str, shot: str = "") -> bool:
@@ -356,29 +340,7 @@ def _action_motion_fragment() -> str:
     )
 
 
-_EMOTION_KEYWORDS = {
-    "weary": ["累", "翻不了身", "不容失败", "压得", "喘不过气", "苦累", "操劳", "心力交瘁", "卷"],
-    "tense": ["焦虑", "无处可逃", "挖坑", "淘汰", "紧迫", "抢", "厮杀", "崩溃", "卡死", "陷阱"],
-    "wry": ["神仙", "煤灰", "牛马", "西瓜皮", "赚到了", "毫不起眼", "傻", "脚踩", "歪打正着", "凡尔赛"],
-    "warm": ["拥抱", "奇迹", "赡养", "感性和身体", "温暖", "亲人", "陪伴", "守护", "回家", "拥抱日常"],
-    "solemn": ["剥掉", "巨大的坑", "深渊", "代价", "残酷真相", "毁灭", "黑暗", "末日"],
-    "contemplative": ["其实", "实际上", "本质上", "为什么", "或许", "我们都在", "复杂", "并不是"],
-    "encouraging": ["可以", "不要怕", "相信", "勇敢", "迈出", "你能", "你已经"],
-    "playful": ["哈哈", "嘿嘿", "搞笑", "调侃"],
-}
-
-_EMOTION_EXPRESSION_PHRASE = {
-    "neutral": "natural observational face, soft eyes, light breath",
-    "tense": "tense, slight brow furrow, jaw tight, urgent narrowed gaze, shallow breath",
-    "solemn": "solemn, lowered brow, heavy eyes, slow deep breath, restrained posture",
-    "explanatory": "engaged explanatory face, alive eyes, occasional gestural emphasis, lecturer presence",
-    "warm": "warm gentle smile, soft glowing eyes, slight head tilt, comforting body posture",
-    "weary": "tired droop, half-closed eyelids, slumped shoulders, audible sigh, defeated body angle",
-    "wry": "wry half-smile, raised eyebrow, slight head shake, self-aware knowing look",
-    "playful": "playful eye sparkle, mischievous half-smile, light shoulder shrug, animated gestures",
-    "contemplative": "thoughtful inward gaze, slow blink, gentle drift, fingers near chin or temple",
-    "encouraging": "uplifted brow, encouraging smile, warm direct eye contact, open hands",
-}
+# _EMOTION_KEYWORDS + _EMOTION_EXPRESSION_PHRASE 已抽到 adr_data/emotion.py（顶部已 import）
 
 
 def _infer_emotion_from_text(text: str, speaker: str = "") -> str:
@@ -532,39 +494,8 @@ ADS_RETENTION_MODE = (
 
 ADSD_MODE_NAME = ("VADSD" if IS_VERTICAL else "HADSD") if ADS_DIALOGUE_MODE else ""
 
-ADSD_VOICES = {
-    "记者": {"voice_id": 67, "voice_name": "Refreshing Young Man"},
-    "职员": {"voice_id": 69, "voice_name": "Reliable Executive"},
-    # 旁白 默认走男声沉稳叙述（Lyrical Voice），避免短视频女声 News Anchor 跟纪录片基调错位
-    # 用户明示要女声旁白时显式传 voice_gender=female 即可
-    "旁白": {"voice_id": 68, "voice_name": "Lyrical Voice"},
-}
-
-# 男声池：未知/英文/自创品牌角色名按名字 hash 在此池轮换，避免全部走女声 News Anchor
-# weryai 中文男声完整目录（66-70）
-ADSD_MALE_VOICE_POOL = [
-    {"voice_id": 66, "voice_name": "Pure-hearted Boy"},
-    {"voice_id": 67, "voice_name": "Refreshing Young Man"},
-    {"voice_id": 68, "voice_name": "Lyrical Voice"},
-    {"voice_id": 69, "voice_name": "Reliable Executive"},
-    {"voice_id": 70, "voice_name": "Stubborn Friend"},
-]
-
-# 女声池：旁白 + 中文女性角色词命中时使用
-# weryai 中文女声完整目录（76-80）
-ADSD_FEMALE_VOICE_POOL = [
-    {"voice_id": 76, "voice_name": "News Anchor"},
-    {"voice_id": 77, "voice_name": "Intellectual Girl"},
-    {"voice_id": 78, "voice_name": "Gentle Senior"},
-    {"voice_id": 79, "voice_name": "Kind-hearted Antie"},
-    {"voice_id": 80, "voice_name": "Arrogant Miss"},
-]
-ADSD_MALE_VOICE_IDS = {int(v["voice_id"]) for v in ADSD_MALE_VOICE_POOL}
-ADSD_FEMALE_VOICE_IDS = {int(v["voice_id"]) for v in ADSD_FEMALE_VOICE_POOL}
-ADSD_VOICE_GENDER_BY_ID = {
-    **{vid: "male" for vid in ADSD_MALE_VOICE_IDS},
-    **{vid: "female" for vid in ADSD_FEMALE_VOICE_IDS},
-}
+# ADSD_VOICES / ADSD_MALE_VOICE_POOL / ADSD_FEMALE_VOICE_POOL 等
+# 已抽到 adr_data/voices.py（顶部已 import）
 
 # 同一 ADR 进程内角色名 → voice 持久映射，确保同一角色跨 turn 用同一声音
 _ADSD_SPEAKER_VOICE_CACHE: dict[str, dict] = {}
@@ -1910,13 +1841,8 @@ def _generate_adsd_dialogue_turns(topic: str, num_turns: int, tone: str, style_g
         text = str(item.get("text", "")).strip()
         shot = str(item.get("shot", "")).strip()
         emotion = str(item.get("emotion", "neutral")).strip().lower()
-        # 白名单扩展到 10 种（_EMOTION_EXPRESSION_PHRASE 同步）：
-        # neutral / tense / solemn / explanatory（原）
-        # + warm / weary / wry / playful / contemplative / encouraging（新）
-        if emotion not in (
-            "neutral", "tense", "solemn", "explanatory",
-            "warm", "weary", "wry", "playful", "contemplative", "encouraging",
-        ):
+        # 白名单见 adr_data/emotion.py SUPPORTED_EMOTIONS（与 EMOTION_EXPRESSION_PHRASE 同步）
+        if emotion not in _SUPPORTED_EMOTIONS:
             emotion = "neutral"
 
         # voice_gender：LLM 强约束（兼容旧字段名 gender）；缺失/非法则空，由 _voice_for_speaker 兜底推断
