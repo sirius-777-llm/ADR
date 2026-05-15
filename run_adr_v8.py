@@ -2014,6 +2014,20 @@ def step1_script(topic: str) -> list[dict]:
     tg(f"🎬 ADR V8 启动\n主题：{topic}\n格式：{fmt_label}\n\n斯皮尔伯格正在撰写台词...")
     log(f"开始处理：{topic} [{fmt_label}]")
 
+    # 外部脚本注入场景下，分镜数量已由用户脚本决定；提前探测可跳过
+    # "动态分镜数" LLM 调用，避免长稿/分段任务在无意义规划阶段卡住。
+    _OVERRIDE_FILE = Path("/tmp/adr_script_override.txt")
+    _early_override_lines: list[str] = []
+    _early_override_timings: list[dict | None] = []
+    if _OVERRIDE_FILE.exists() and _OVERRIDE_FILE.stat().st_size > 0:
+        try:
+            _early_override_lines, _early_override_timings = _parse_override_script_text(
+                _OVERRIDE_FILE.read_text(encoding="utf-8")
+            )
+            log(f"外部脚本预检测：{len(_early_override_lines)} 句，跳过动态分镜数 LLM 规划")
+        except Exception as e:
+            log(f"外部脚本预检测失败，继续常规规划：{e}")
+
     # 检测老黄历主题并注入数据
     almanac_data = get_almanac_data(topic)
     if almanac_data:
@@ -2079,17 +2093,21 @@ def step1_script(topic: str) -> list[dict]:
 
 请输出 JSON 格式：{{"count": 数字, "reason": "一句话理由"}}
 只输出 JSON，不加任何其他内容。"""
-    try:
-        import json
-        plan_raw = chat("GEMINI_3_1_FLASH_LITE", "你是纪录片分镜规划师。", plan_prompt)
-        fence = re.search(r'```(?:\w*)\s*\n?([\s\S]*?)```', plan_raw)
-        plan_clean = fence.group(1).strip() if fence else plan_raw.strip()
-        plan = json.loads(re.search(r'\{[\s\S]+\}', plan_clean).group())
-        num_lines = max(6, min(18, int(plan["count"])))
-        log(f"LLM 规划分镜数：{num_lines}（理由：{plan.get('reason', '')}）")
-    except:
-        num_lines = 18 if almanac_data else 9
-        log(f"LLM 规划失败，使用默认分镜数：{num_lines}")
+    if _early_override_lines:
+        num_lines = len(_early_override_lines)
+        log(f"外部脚本注入预设分镜数：{num_lines}")
+    else:
+        try:
+            import json
+            plan_raw = chat("GEMINI_3_1_FLASH_LITE", "你是纪录片分镜规划师。", plan_prompt)
+            fence = re.search(r'```(?:\w*)\s*\n?([\s\S]*?)```', plan_raw)
+            plan_clean = fence.group(1).strip() if fence else plan_raw.strip()
+            plan = json.loads(re.search(r'\{[\s\S]+\}', plan_clean).group())
+            num_lines = max(6, min(18, int(plan["count"])))
+            log(f"LLM 规划分镜数：{num_lines}（理由：{plan.get('reason', '')}）")
+        except:
+            num_lines = 18 if almanac_data else 9
+            log(f"LLM 规划失败，使用默认分镜数：{num_lines}")
 
     current_year = __import__("datetime").datetime.now().year
 
@@ -2220,7 +2238,6 @@ def step1_script(topic: str) -> list[dict]:
         log(f"黄历校验关键词（{len(almanac_checkpoints)}个）：{almanac_checkpoints}")
 
     # ── 外部脚本注入（可选开关）──────────────────────────────────
-    _OVERRIDE_FILE = Path("/tmp/adr_script_override.txt")
     _script_injected = False
     _override_timings: list[dict | None] = []
     dialogue_turns: list[dict] = []
@@ -2331,7 +2348,20 @@ THUMBNAIL_ANCHOR: 封面视觉锚，用 4~6 个短语描述：主体、主色（
 
 只输出上述 9 项结构化内容，每项用全大写 key + 冒号开头，不加解释、不加 markdown。"""
 
-    historical_context = chat("CLAUDE_4_6_OPUS", "你是总制片人，全能把关人，只输出严格结构化英文准则。", producer_prompt)
+    if _script_injected:
+        historical_context = f"""AUDIENCE_AND_VALUES: informed general audience, clear geopolitical and business explanation, avoid studio reporter framing or propaganda poster cliches.
+STYLE_KEY: contemporary geopolitical documentary, dynamic business B-roll, cinematic data visualization, restrained editorial tension.
+PALETTE: deep navy, muted steel gray, semiconductor gold accents.
+LIGHTING_AND_CAMERA: controlled newsroom-free documentary lighting, tracking shots, close-ups of documents and screens, wide institutional exteriors.
+SUBJECT_DETAILS: contemporary US-China technology and business scenes, Air Force One exterior details, semiconductor wafers, executive travel, negotiation tables, financial charts.
+VISUAL_CONTINUITY: fixed visual world of 2020s Washington and global tech supply chains; recurring anchors: black leather jacket tech CEO silhouette, aircraft boarding stairs, chip wafer macro, conference-room table, market chart overlays; no talking-head studio.
+TABOOS: no onsite reporter, no TV studio anchor, no ancient costume, no generic Chinese palace, no fake flags or offensive caricature, no distorted text.
+TITLE_HOOK: high-stakes business reversal and chip negotiation signal.
+THUMBNAIL_ANCHOR: Air Force One stairs, black leather jacket figure, glowing chip wafer, tense blue-gray palette, bold title-safe empty space.
+"""
+        log("外部脚本注入：使用确定性 Producer Brief，跳过重模型制片准则生成")
+    else:
+        historical_context = chat("CLAUDE_4_6_OPUS", "你是总制片人，全能把关人，只输出严格结构化英文准则。", producer_prompt)
     tg(f"✅ 制片人准则就绪（已定调子 + 事实考证 + 价值观把关）\n\n姜文正在据此标注情绪 + 生成画面提示词...")
 
     # 老黄历主题：给每句台词标注板块名，让姜文生成针对性画面
@@ -2522,46 +2552,84 @@ THUMBNAIL_ANCHOR: 封面视觉锚，用 4~6 个短语描述：主体、主色（
     # 姜文导演用 Claude 4.6 Opus（顶级推理 + 多约束遵守）
     # ★ max_tokens=3072（22 个 50 词 prompt ≈ 2200 tokens 输出，留余量但不让 Opus 推理太久撞 gateway 504）
     # ★ Opus 写"40-60 词短 prompt"——降低单次输出 tokens → gateway 推理时间内完成
-    raw_json = chat(
-        "CLAUDE_4_6_OPUS",
-        "你是精通各类电影镜头语言的导演。每个画面必须指定景别+机位+光影+视觉母题，严禁默认居中中景平庸画面。★ 输出限制：每条英文 prompt 严格 40-60 词（更长会撞 WeryAI gateway 504 timeout）。★ 绝对禁令：你输出的英文 prompt 里禁止出现任何具体导演/画家/艺术家姓名（Akira Kurosawa / Zhang Yimou / Ang Lee / Wong Kar-wai / Christopher Nolan / Caravaggio / Rembrandt / Sergio Leone 等都禁止），改用纯描述词。OpenAI GPT Image 2 对人名风格模仿触发版权 filter 强制拒绝。只输出 JSON。",
-        jiangwen_prompt,
-        max_tokens=3072,
-        timeout=300,
-    )
-    # 直接定位 JSON 数组边界：第一个 [ 到最后一个 ]
-    arr_start = raw_json.find('[')
-    arr_end = raw_json.rfind(']')
-    if arr_start == -1:
-        raise RuntimeError(f"姜文输出解析失败（无 [）: {raw_json[:200]}")
-    if arr_end == -1 or arr_end <= arr_start:
-        # JSON 被截断（max_tokens 不够），尝试补全：截到最后一个完整 }，补 ]
-        last_brace = raw_json.rfind('}')
-        if last_brace > arr_start:
-            repaired = raw_json[arr_start:last_brace + 1] + ']'
-            log(f"JSON 被截断，尝试修复（补 ]）")
-        else:
-            raise RuntimeError(f"姜文输出解析失败（无 ]）: {raw_json[:200]}")
+    if _script_injected:
+        motif_pool = [
+            "macro glowing semiconductor wafer on a dark table",
+            "Air Force One boarding stairs at night with tense silhouettes",
+            "executive black leather jacket figure walking through airport security",
+            "Washington negotiation room with folders, flags cropped abstractly, market charts",
+            "Wall Street terminal screens showing semiconductor supply-chain graphs",
+            "chip factory cleanroom with robotic arms moving wafers",
+            "Boeing aircraft storage line under cloudy industrial sky",
+            "Midwest farm grain elevator and commodity price dashboard",
+            "corporate blacklist document stamped on glass table",
+            "wide geopolitical map with trade routes and data overlays",
+        ]
+        emotions = ["紧张", "压抑", "辉煌", "紧张", "压抑", "释然"]
+        visuals = []
+        for i, line in enumerate(lines):
+            motif = motif_pool[i % len(motif_pool)]
+            if any(k in line for k in ("黄仁勋", "老黄", "英伟达")):
+                motif = "black leather jacket technology CEO silhouette beside a glowing GPU chip"
+            elif any(k in line for k in ("空军1号", "飞机", "机舱")):
+                motif = "Air Force One boarding stairs, executive traveler with backpack, night runway lights"
+            elif any(k in line for k in ("财报", "市场份额", "高通", "美光", "苹果")):
+                motif = "financial dashboard, semiconductor revenue chart, chip wafer macro foreground"
+            elif any(k in line for k in ("波音", "737")):
+                motif = "grounded Boeing-style narrow-body jets, hangar shadows, anxious aerospace executives"
+            elif any(k in line for k in ("农业", "大豆", "玉米", "农场")):
+                motif = "Midwest soybean and corn fields with commodity futures chart overlay"
+            prompt = (
+                "contemporary geopolitical business documentary photography, deep navy and steel gray palette, "
+                "semiconductor gold accents, 4k photorealistic detail, "
+                f"{'extreme close-up' if i < 2 else 'wide shot' if i >= len(lines)-2 else 'medium shot'}, "
+                f"{'low-angle tense' if i % 3 == 0 else 'high-angle analytical' if i % 3 == 1 else 'profile side view'}, "
+                "chiaroscuro single-key lighting, motion-ready B-roll, "
+                f"{motif}, no TV studio, no onsite reporter, no talking-head anchor, no ancient costume"
+            )
+            visuals.append({"emotion": emotions[i % len(emotions)], "prompt": prompt})
+        log(f"外部脚本注入：使用确定性财经科技分镜 prompt，共 {len(visuals)} 个")
     else:
-        repaired = raw_json[arr_start:arr_end + 1]
-    try:
-        visuals = json.loads(repaired)[:num_lines]
-    except json.JSONDecodeError:
-        # JSON 内部截断（对象写到一半），逐步回退到最后一个完整对象
-        fixed = repaired
-        while fixed and fixed != '[':
-            last_brace = fixed.rfind('}')
-            if last_brace <= 0:
-                break
-            fixed = fixed[:last_brace + 1] + ']'
-            try:
-                visuals = json.loads(fixed)[:num_lines]
-                log(f"JSON 修复成功（回退到 {len(visuals)} 个完整对象）")
-                break
-            except json.JSONDecodeError:
-                fixed = fixed[:last_brace]  # 继续回退
+        raw_json = chat(
+            "CLAUDE_4_6_OPUS",
+            "你是精通各类电影镜头语言的导演。每个画面必须指定景别+机位+光影+视觉母题，严禁默认居中中景平庸画面。★ 输出限制：每条英文 prompt 严格 40-60 词（更长会撞 WeryAI gateway 504 timeout）。★ 绝对禁令：你输出的英文 prompt 里禁止出现任何具体导演/画家/艺术家姓名（Akira Kurosawa / Zhang Yimou / Ang Lee / Wong Kar-wai / Christopher Nolan / Caravaggio / Rembrandt / Sergio Leone 等都禁止），改用纯描述词。OpenAI GPT Image 2 对人名风格模仿触发版权 filter 强制拒绝。只输出 JSON。",
+            jiangwen_prompt,
+            max_tokens=3072,
+            timeout=300,
+        )
+        # 直接定位 JSON 数组边界：第一个 [ 到最后一个 ]
+        arr_start = raw_json.find('[')
+        arr_end = raw_json.rfind(']')
+        if arr_start == -1:
+            raise RuntimeError(f"姜文输出解析失败（无 [）: {raw_json[:200]}")
+        if arr_end == -1 or arr_end <= arr_start:
+            # JSON 被截断（max_tokens 不够），尝试补全：截到最后一个完整 }，补 ]
+            last_brace = raw_json.rfind('}')
+            if last_brace > arr_start:
+                repaired = raw_json[arr_start:last_brace + 1] + ']'
+                log(f"JSON 被截断，尝试修复（补 ]）")
+            else:
+                raise RuntimeError(f"姜文输出解析失败（无 ]）: {raw_json[:200]}")
         else:
-            raise RuntimeError(f"姜文输出 JSON 无法修复: {raw_json[:200]}")
+            repaired = raw_json[arr_start:arr_end + 1]
+        try:
+            visuals = json.loads(repaired)[:num_lines]
+        except json.JSONDecodeError:
+            # JSON 内部截断（对象写到一半），逐步回退到最后一个完整对象
+            fixed = repaired
+            while fixed and fixed != '[':
+                last_brace = fixed.rfind('}')
+                if last_brace <= 0:
+                    break
+                fixed = fixed[:last_brace + 1] + ']'
+                try:
+                    visuals = json.loads(fixed)[:num_lines]
+                    log(f"JSON 修复成功（回退到 {len(visuals)} 个完整对象）")
+                    break
+                except json.JSONDecodeError:
+                    fixed = fixed[:last_brace]  # 继续回退
+            else:
+                raise RuntimeError(f"姜文输出 JSON 无法修复: {raw_json[:200]}")
     # 视觉描述不足时用默认值填充（兜底也随题材走，避免历史 cliché 污染黄历/现代题材）
     if almanac_data:
         fb_emotion = "平和"
