@@ -486,6 +486,21 @@ ADS_REPORTER_MODE = (
 if ADS_REPORTER_MODE:
     WITH_MOTION = True
 
+# ADS/HADS/VADS 动态主路径：故事板是动作/叙事编舞蓝图，优先整组 clean refs 直喂 WeryDance。
+# 逐镜 image-to-video / text-to-video 只做兜底。ADSD 口型模式仍保持独立，避免破坏口型同步。
+ADS_STORYBOARD_FLOW_DEFAULT = (
+    WITH_MOTION
+    and not ADS_DIALOGUE_MODE
+    and GPT_IMAGE2_STORYBOARD_GRID
+    and "--no-storyboard-flow-main" not in sys.argv
+    and os.environ.get("ADR_STORYBOARD_FLOW_MAIN", "1").strip().lower() not in ("0", "false", "no", "off")
+)
+if ADS_STORYBOARD_FLOW_DEFAULT:
+    STORYBOARD_GRID_MULTIREF_MOTION = True
+    STORYBOARD_GRID_MULTIREF_MAIN = True
+    os.environ.setdefault("ADR_STORYBOARD_GRID_MULTIREF_GROUP", "12")
+    os.environ.setdefault("ADR_GRID_MULTIREF_MAIN_MIN_PASS_RATIO", "0.75")
+
 ADS_RETENTION_MODE = (
     "--no-ads-retention" not in sys.argv
     and "--no-retention" not in sys.argv
@@ -8121,19 +8136,36 @@ def _grid_multiref_segment_max_stretch() -> float:
 
 def _grid_multiref_prompt(group: list[dict], start_idx: int, motion_prompts: list[str]) -> str:
     lines = []
+    action_mode = False
     for offset, scene in enumerate(group):
         idx = start_idx + offset
         visual = _short_board_text(scene.get("prompt") or scene.get("text"), 180)
         motion = _short_board_text(motion_prompts[idx] if idx < len(motion_prompts) else "", 120)
+        if _is_action_scene(scene.get("text", ""), scene.get("prompt", "")):
+            action_mode = True
         lines.append(f"{offset + 1}. Scene {idx + 1}: {visual} Camera: {motion}")
+    if action_mode:
+        style = (
+            "Create one coherent high-energy cinematic action video that treats the uploaded references as a "
+            "choreography board. Follow the images in order as key poses and action beats: preparation, acceleration, "
+            "impact, reaction, recovery, and final pose. Preserve the same hero identity, costume, weapon/prop logic, "
+            "environment, lighting, color palette, and screen direction across all beats. Add strong physical motion: "
+            "full-body weight shift, footwork, torso rotation, arm follow-through, cloth snap, debris, sparks, smoke, "
+            "shockwaves, rain or dust interaction, fast push-in, whip pan, orbit, slow-motion impact, and clear end pose. "
+            "No idle posing, no frozen tableau, no slideshow, no gentle-only motion."
+        )
+    else:
+        style = (
+            "Create one coherent cinematic video that moves through these shots in order, preserving character "
+            "identity, costume, period setting, lighting, color palette, and scene geography. Animate plausible motion: "
+            "camera push, handheld drift, cloth, paper, rain, crowd, smoke, and natural human movements."
+        )
     return (
         "Use the uploaded clean storyboard reference images as a sequential shot plan. "
-        "Each uploaded image is one shot, in the same order as the images array. "
-        "Create one coherent cinematic documentary video that moves through these shots in order, "
-        "preserving character identity, costume, period setting, lighting, color palette, and scene geography. "
-        "Animate only plausible motion: slow camera push, gentle handheld drift, cloth, paper, rain, crowd, smoke, "
-        "and natural human micro-movements. Do not render the storyboard grid, panel borders, shot numbers, labels, "
-        "captions, subtitles, arrows, director notes, UI text, watermarks, logos, or any burned-in text. "
+        "Each uploaded image is one shot or key action pose, in the same order as the images array. "
+        f"{style} "
+        "Do not render the storyboard grid, panel borders, shot numbers, labels, captions, subtitles, arrows, "
+        "director notes, UI text, watermarks, logos, or any burned-in text. "
         f"Shot plan: {' '.join(lines)}"
     )[:2000]
 
@@ -9076,7 +9108,7 @@ def _generate_grid_multiref_motion_segments(script: list[dict], motion_prompts: 
         "group_size": _grid_multiref_group_size(),
         "total_refs": len(refs),
         "records": [],
-        "policy": "sidecar_motion_qa_only_not_used_for_final_concat",
+        "policy": "main_path_when_STORYBOARD_GRID_MULTIREF_MAIN_else_sidecar_qa",
         "manual_visual_checks_required": [
             "shot_order_matches_reference_order",
             "no_shot_numbers_or_arrows",
@@ -9182,7 +9214,7 @@ def _generate_grid_multiref_motion_segments(script: list[dict], motion_prompts: 
         total = len(qa["records"])
         min_ratio = float(os.environ.get("ADR_GRID_MULTIREF_MAIN_MIN_PASS_RATIO", "0.75"))
         pass_ratio = (success_count / total) if total > 0 else 0.0
-        if pass_ratio >= min_ratio and success_count >= 2:
+        if pass_ratio >= min_ratio and success_count >= 1:
             try:
                 combined_path = _grid_multiref_concat_groups_partial(qa["records"])
                 if combined_path:
