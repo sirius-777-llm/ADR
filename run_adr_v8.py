@@ -4898,7 +4898,10 @@ def _scene_motion_action_plan(scene: dict, idx: int) -> dict:
     def has(*words: str) -> bool:
         return any(w in src or w.lower() in lowered for w in words)
 
-    if has("剑", "刀", "战", "军", "冲", "杀", "追", "火", "爆", "危", "怒", "纷争", "恩怨"):
+    if _is_action_scene(text, visual) or has(
+        "剑", "刀", "战", "军", "冲", "杀", "追", "火", "爆", "危", "怒", "纷争", "恩怨",
+        "龙", "龙影", "巨龙", "龙吟", "掌劲", "气浪", "冲击波", "龟裂", "光墙", "风暴",
+    ):
         action = "the figure snaps into a decisive martial or confrontational gesture, fabric and dust reacting as tension rises"
         camera = "handheld push-in, short whip-pan into a low-angle parallax slide, then rack focus to the weapon or hand"
         speed = "fast"
@@ -7740,7 +7743,7 @@ def _try_motion_reference_video(idx: int, scene: dict, motion_prompt: str, aspec
     Returns (handled, ok). handled=True means a reference-video task was submitted or conclusively attempted;
     handled=False lets the caller use the legacy text-to-video path without treating this as a failure.
     """
-    if ADS_DIALOGUE_MODE or not STORYBOARD_REFERENCE_MOTION:
+    if (ADS_DIALOGUE_MODE and ADSD_LIP_SYNC_EXPERIMENT) or not STORYBOARD_REFERENCE_MOTION:
         return False, False
     img_path = scene.get("img_path")
     if not img_path or not os.path.exists(img_path):
@@ -8089,7 +8092,7 @@ def _grid_multiref_group_size() -> int:
         raw = int(os.environ.get("ADR_STORYBOARD_GRID_MULTIREF_GROUP", "4"))
     except Exception:
         raw = 4
-    return max(2, min(4, raw))
+    return max(2, min(12, raw))
 
 
 def _grid_multiref_duration(group: list[dict]) -> int:
@@ -9056,7 +9059,7 @@ def _generate_grid_multiref_motion_segments(script: list[dict], motion_prompts: 
     It intentionally does not replace seg_N.mp4 because one multi-reference video spans
     multiple narration beats and needs separate timing policy before entering the main cut.
     """
-    if not STORYBOARD_GRID_MULTIREF_MOTION or ADS_DIALOGUE_MODE:
+    if not STORYBOARD_GRID_MULTIREF_MOTION or (ADS_DIALOGUE_MODE and ADSD_LIP_SYNC_EXPERIMENT):
         return None
     refs = [
         (i, scene)
