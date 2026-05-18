@@ -306,6 +306,35 @@ def _is_action_scene(text: str, shot: str = "") -> bool:
     return hits >= 2  # 至少 2 个动作关键字
 
 
+def _needs_storyboard_flow_character_sheet(script: list[dict] | None, topic: str = "") -> bool:
+    """GPT Image 2 character sheet auto gate for storyboard-flow WeryDance.
+
+    Use it when the video model needs a reusable identity anchor: action scenes,
+    recurring people/creatures/robots, or explicit identity-consistency wording.
+    """
+    if os.environ.get("ADR_STORYBOARD_FLOW_CHARACTER_SHEET", "1").strip().lower() in ("0", "false", "no", "off"):
+        return False
+    if ADS_DIALOGUE_MODE:
+        return False
+    if ADS_CHARACTER_SHEET_REQUESTED or CHARACTER_TRAILER_MODE:
+        return True
+    script = script or []
+    if any(_is_action_scene(s.get("text", ""), s.get("prompt", "")) for s in script):
+        return True
+    blob = " ".join(
+        [topic]
+        + [str(s.get("text") or "") for s in script[:12]]
+        + [str(s.get("prompt") or "") for s in script[:12]]
+    )
+    identity_keywords = (
+        "人物一致", "角色一致", "人物参考", "角色参考", "主角", "主人公", "角色", "人物",
+        "武者", "侠客", "剑客", "机器人", "动物", "鸵鸟", "龙", "怪兽", "英雄",
+        "黄仁勋", "Jensen", "特朗普", "川普", "Trump", "黄渤", "罗翔", "许知远",
+        "CEO", "总统", "记者", "男主", "女主", "儿童", "孩子",
+    )
+    return any(k in blob for k in identity_keywords)
+
+
 def _wuxia_action_panel_prompt(text: str, shot: str = "", visual_subject: str = "", voice_gender: str = "") -> str:
     """生成武侠/修真动作场面的 storyboard 出图 prompt — 让 GPT Image 2 渲染真实打斗画面而非对话场景。
     替换 姜文 LLM 的通用纪录片 prompt，使下游 WERYDANCE 拿到的底图本身就是动作 panel。"""
@@ -5635,6 +5664,10 @@ def _write_character_sheet_qa(payload: dict) -> None:
 
 def generate_character_sheet_gpt_image2(script: list[dict], topic: str) -> dict | None:
     """Sidecar: GPT Image 2 model sheet for identity-locked character trailer shots."""
+    flow_character_sheet = (
+        STORYBOARD_GRID_MULTIREF_MAIN
+        and _needs_storyboard_flow_character_sheet(script, topic)
+    )
     adsd_character_sheet = (
         ADS_DIALOGUE_MODE
         and ADSD_LIP_SYNC_EXPERIMENT
@@ -5645,7 +5678,7 @@ def generate_character_sheet_gpt_image2(script: list[dict], topic: str) -> dict 
         and not ADS_DIALOGUE_MODE
         and ADS_CHARACTER_SHEET_REQUESTED
     )
-    if not (CHARACTER_TRAILER_MODE or adsd_character_sheet or ads_character_sheet):
+    if not (CHARACTER_TRAILER_MODE or flow_character_sheet or adsd_character_sheet or ads_character_sheet):
         return None
     external = os.environ.get("ADR_CHARACTER_SHEET", "").strip()
     qa = {
@@ -5654,7 +5687,7 @@ def generate_character_sheet_gpt_image2(script: list[dict], topic: str) -> dict 
         "model": "GPT_IMAGE_2",
         "path": str(OUTPUT_DIR / "character_sheet.png"),
         "pass": False,
-        "policy": "identity_reference_for_character_trailer_or_adsd_lip_sync_not_clean_panel_crop",
+        "policy": "identity_reference_for_storyboard_flow_or_character_trailer_or_adsd_lip_sync_not_clean_panel_crop",
         "manual_visual_checks_required": [
             "recurring_character_identity_is_clear",
             "costume_palette_and_props_are_reusable",
@@ -5714,6 +5747,8 @@ def generate_character_sheet_gpt_image2(script: list[dict], topic: str) -> dict 
                 target = "ADSD 口型/身份锁定"
             elif ads_character_sheet:
                 target = "ADS 单人 POV 身份锁定（记者+受访者+道具跨镜一致）"
+            elif flow_character_sheet:
+                target = "storyboard flow 主路径身份锁定（character sheet + clean refs）"
             else:
                 target = "逐镜身份锁定 trailer"
             tg(f"🧬 GPT Image 2 character sheet 已生成（用于{target}）")
@@ -8134,7 +8169,12 @@ def _grid_multiref_segment_max_stretch() -> float:
     return max(1.0, min(4.0, raw))
 
 
-def _grid_multiref_prompt(group: list[dict], start_idx: int, motion_prompts: list[str]) -> str:
+def _grid_multiref_prompt(
+    group: list[dict],
+    start_idx: int,
+    motion_prompts: list[str],
+    has_character_sheet: bool = False,
+) -> str:
     lines = []
     action_mode = False
     for offset, scene in enumerate(group):
@@ -8160,9 +8200,16 @@ def _grid_multiref_prompt(group: list[dict], start_idx: int, motion_prompts: lis
             "identity, costume, period setting, lighting, color palette, and scene geography. Animate plausible motion: "
             "camera push, handheld drift, cloth, paper, rain, crowd, smoke, and natural human movements."
         )
+    character_rule = (
+        "The first uploaded image is a character/model sheet only. Use it to lock the hero/subject identity, "
+        "face, costume, props, creature/vehicle design, palette, and scale; never render the sheet itself. "
+        "All remaining uploaded images are the sequential shot/key-pose references. "
+        if has_character_sheet else ""
+    )
     return (
         "Use the uploaded clean storyboard reference images as a sequential shot plan. "
-        "Each uploaded image is one shot or key action pose, in the same order as the images array. "
+        f"{character_rule}"
+        "Each shot reference image is one shot or key action pose, in the same order as the shot references array. "
         f"{style} "
         "Do not render the storyboard grid, panel borders, shot numbers, labels, captions, subtitles, arrows, "
         "director notes, UI text, watermarks, logos, or any burned-in text. "
@@ -9123,6 +9170,24 @@ def _generate_grid_multiref_motion_segments(script: list[dict], motion_prompts: 
         _write_grid_multiref_motion_qa(qa)
         return qa
 
+    sheet_url = None
+    sheet_path = OUTPUT_DIR / "character_sheet.png"
+    if (
+        STORYBOARD_GRID_MULTIREF_MAIN
+        and sheet_path.exists()
+        and sheet_path.stat().st_size > 100000
+        and os.environ.get("ADR_GRID_MULTIREF_USE_CHARACTER_SHEET", "1").strip().lower() not in ("0", "false", "no", "off")
+    ):
+        try:
+            sheet_url = _upload_to_weryai(str(sheet_path))
+            qa["character_sheet"] = str(sheet_path)
+            qa["character_sheet_url"] = sheet_url
+            qa["reference_order"] = "character_sheet_first_then_storyboard_clean_refs"
+            tg("🧬 Grid multi-ref 已加入 character sheet 身份参考")
+        except Exception as e:
+            qa.setdefault("warnings", []).append(f"character_sheet_upload_failed:{e}")
+            log(f"grid_multiref character_sheet upload skipped: {e}")
+
     tg(f"🧪 Grid multi-ref motion QA 启动：clean refs {len(refs)} 张，每组 {qa['group_size']} 张")
     group_size = qa["group_size"]
     for group_no, start in enumerate(range(0, len(refs), group_size), start=1):
@@ -9157,9 +9222,9 @@ def _generate_grid_multiref_motion_segments(script: list[dict], motion_prompts: 
                     tg(f"⚠️ Grid multi-ref {record['scene_start']}-{record['scene_end']} 未完成：{record.get('reason')}")
                 _write_grid_multiref_motion_qa(qa)
                 continue
-            image_urls = [_upload_to_weryai(scene["img_path"]) for scene in group]
+            image_urls = ([sheet_url] if sheet_url else []) + [_upload_to_weryai(scene["img_path"]) for scene in group]
             duration = _grid_multiref_duration(group)
-            prompt = _grid_multiref_prompt(group, scene_indices[0], motion_prompts)
+            prompt = _grid_multiref_prompt(group, scene_indices[0], motion_prompts, has_character_sheet=bool(sheet_url))
             _wait_motion_submit_slot(f"grid multi-ref {group_no}")
             r = req_post("/generation/almighty-reference-to-video", {
                 "model": "WERYDANCE_2_0",
@@ -12917,6 +12982,76 @@ def step10_deliver(final_path: str, topic: str, script: list[dict]):
             if attempt < 2:
                 time.sleep(10)
 
+    # ── 尝试 3：小土伯/TG 文件兜底。视频上传链路 SSL 抖动时，压 lite/micro 后用 sendDocument 发文件。 ──
+    if (
+        not video_ok
+        and os.environ.get("ADR_TG_FILE_FALLBACK", "1").strip().lower() not in ("0", "false", "no", "off")
+    ):
+        tg("⚠️ sendVideo 未确认成功，启动小土伯文件兜底：lite/micro → sendDocument")
+        fallback_profiles = [
+            ("lite", "854:-2", "24", "30", "80k", "200k"),
+            ("micro", "426:-2", "18", "38", "32k", "120k"),
+        ]
+        for label, scale, fps, crf, audio_br, limit_rate in fallback_profiles:
+            fb_path = final_path.rsplit(".", 1)[0] + f"_tg_{label}.mp4"
+            try:
+                if not os.path.exists(fb_path) or os.path.getsize(fb_path) < 10000:
+                    ffmpeg(
+                        "-i", final_path,
+                        "-vf", f"scale={scale},fps={fps}",
+                        "-c:v", "libx264", "-crf", crf, "-preset", "veryfast",
+                        "-c:a", "aac", "-b:a", audio_br,
+                        "-movflags", "+faststart",
+                        fb_path,
+                        timeout=180,
+                    )
+                fb_size_mb = os.path.getsize(fb_path) / (1024 * 1024)
+                log(f"TG fallback {label} ready: {fb_size_mb:.1f}MB -> {fb_path}")
+            except Exception as e:
+                log(f"TG fallback {label} 压缩失败: {e}")
+                continue
+
+            doc_url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendDocument"
+            for attempt in range(2):
+                probe_before = _send_probe(f"doc-{label}-start-{attempt+1}")
+                try:
+                    import subprocess as _sp
+                    curl_cmd = [
+                        "curl", "--ipv4", "--http1.1", "--tlsv1.2", "-sS",
+                        "--connect-timeout", "30", "--max-time", "600",
+                        "--limit-rate", limit_rate,
+                        "-X", "POST", doc_url,
+                        "-F", f"chat_id={TG_CHAT_ID}",
+                        "-F", f"caption={short_caption} · TG {label} fallback",
+                        "-F", f"document=@{fb_path}",
+                    ]
+                    result = _sp.run(curl_cmd, capture_output=True, text=True, timeout=660)
+                    if result.returncode == 0 and '"ok":true' in result.stdout:
+                        video_ok = True
+                        log(f"TG sendDocument fallback 成功：{label} 第 {attempt+1} 次")
+                        _delete_probe(probe_before)
+                        break
+                    log(f"TG sendDocument fallback 失败：{label} 第 {attempt+1} 次 rc={result.returncode} stdout={result.stdout[:160]} stderr={result.stderr[:160]}")
+                    time.sleep(3)
+                    probe_after = _send_probe(f"doc-{label}-check-{attempt+1}")
+                    if probe_before is not None and probe_after is not None:
+                        gap = probe_after - probe_before
+                        if gap >= 2:
+                            video_ok = True
+                            log(f"TG sendDocument fallback probe 跳号：{label} 间隔 {gap} → 文件已落到 chat")
+                            _delete_probe(probe_after)
+                            _delete_probe(probe_before)
+                            break
+                        _delete_probe(probe_after)
+                except Exception as e:
+                    log(f"TG sendDocument fallback 异常：{label} 第 {attempt+1} 次 {type(e).__name__}: {e}")
+                _delete_probe(probe_before)
+                if attempt < 1:
+                    time.sleep(6)
+            if video_ok:
+                tg(f"✅ TG 文件兜底成功：{label} 版已发送")
+                break
+
     if video_ok:
         log("step10 deliver 完成：视频上传成功")
         tg("✅ 全流程完成！")
@@ -12936,7 +13071,7 @@ def _print_execution_plan() -> None:
         ("Step2 text-to-audio 主音轨", not NO_VOICE and not ADS_DIALOGUE_MODE, "1-3", "~25", "主路径：text-to-audio per-line；失败降级 Podcast → OpenAI → Edge TTS"),
         ("Step2 BGM-only 静音轨", NO_VOICE, "0.1", "0", "ffmpeg 生成静音占位"),
         ("ADSD 逐句 text-to-audio", ADS_DIALOGUE_MODE, "2-3", "~25", "每 turn 一次 TTS"),
-        ("Step6 character_sheet", CHARACTER_TRAILER_MODE or (ADS_DIALOGUE_MODE and ADSD_LIP_SYNC_EXPERIMENT) or (ADS_REPORTER_MODE and not ADS_DIALOGUE_MODE and ADS_CHARACTER_SHEET_REQUESTED), "2-3", "~60", "GPT Image 2 model sheet"),
+        ("Step6 character_sheet", CHARACTER_TRAILER_MODE or STORYBOARD_GRID_MULTIREF_MAIN or (ADS_DIALOGUE_MODE and ADSD_LIP_SYNC_EXPERIMENT) or (ADS_REPORTER_MODE and not ADS_DIALOGUE_MODE and ADS_CHARACTER_SHEET_REQUESTED), "2-3", "~60", "GPT Image 2 model sheet"),
         ("Step6 production_storyboard_page", True, "2-3", "~60", "GPT Image 2"),
         ("Step6 storyboard_grid", GPT_IMAGE2_STORYBOARD_GRID, "3-5", "~80", "GPT Image 2 多 panel 大图 + 切片"),
         ("Step6 per-scene 单图 (fallback)", not GPT_IMAGE2_STORYBOARD_GRID, "5-8", "~80", "weryai text-to-image 单张 × N"),
