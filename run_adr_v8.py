@@ -964,7 +964,7 @@ _TG_DASHBOARD_STAGES = [
     ("故事板", 48, [r"storyboard", r"分镜", r"4K storyboard"]),
     ("素材", 58, [r"并行生成", r"图片", r"BGM 生成完毕", r"场景 QA"]),
     ("动态化", 74, [r"动态化启动", r"Motion prompts", r"动作桥接", r"口型同步启动"]),
-    ("动态完成", 84, [r"动态化完成", r"口型同步 QA", r"Grid multi-ref"]),
+    ("动态完成", 84, [r"动态化完成", r"口型同步 QA", r"WERYDANCE 渲染 QA", r"Grid multi-ref"]),
     ("合成", 91, [r"视频轨拼接完成", r"最终合成中", r"字幕"]),
     ("交付", 97, [r"成片输出完毕", r"发布门禁", r"社媒文案", r"封面"]),
     ("完成", 100, [r"全流程完成", r"耗时统计"]),
@@ -10593,11 +10593,21 @@ def step66_adsd_lip_sync(script: list[dict]):
         "records": records,
         "created_at": datetime.now().isoformat(timespec="seconds"),
     }
-    (OUTPUT_DIR / "lip_sync_qa.json").write_text(json.dumps(qa, ensure_ascii=False, indent=2), encoding="utf-8")
+    # 这个 QA 本质是 WERYDANCE 渲染成功率 (API hard-fail 监控)，不验证真实口型质量
+    # 主存盘改名 render_success_qa.json；同时写 lip_sync_qa.json 兼容旧 reader
+    qa["qa_type_clarification"] = "werydance_render_success_not_actual_lip_sync_quality"
+    qa["interpretation_note"] = (
+        "pass=True 仅代表 N 个 turn 都从 WERYDANCE 拿到了有效视频并通过 ffmpeg postprocess。"
+        "不验证嘴是否真在动 / 张嘴时机是否对得上音频。真实口型质量需要 vision 帧分析或人工抽检 manual_visual_checks。"
+    )
+    _qa_json_text = json.dumps(qa, ensure_ascii=False, indent=2)
+    (OUTPUT_DIR / "render_success_qa.json").write_text(_qa_json_text, encoding="utf-8")
+    # 旧名兼容: delivery_qa / werydance_caption_covered_turns 等下游仍读 lip_sync_qa.json
+    (OUTPUT_DIR / "lip_sync_qa.json").write_text(_qa_json_text, encoding="utf-8")
     if qa["pass"]:
-        tg(f"✅ {ADSD_MODE_NAME} 口型同步 QA 通过：A-roll {a_roll_success}/{a_roll_total} ✓ · B-roll {b_roll_success}/{b_roll_total} (motion only)")
+        tg(f"✅ {ADSD_MODE_NAME} WERYDANCE 渲染 QA 通过：A-roll {a_roll_success}/{a_roll_total} ✓ · B-roll {b_roll_success}/{b_roll_total} (motion only) · 注：本 QA 仅监控渲染 hard-fail，真实口型对错需人工抽检")
     else:
-        tg(f"⚠️ {ADSD_MODE_NAME} 口型同步 QA 未达标：A-roll {a_roll_success}/{a_roll_total}（阈值 80%），可静态/motion兜底成片")
+        tg(f"⚠️ {ADSD_MODE_NAME} WERYDANCE 渲染 QA 未达标：A-roll {a_roll_success}/{a_roll_total}（阈值 80%），可静态/motion兜底成片")
 
 
 def step65_motion(script: list[dict]):
@@ -11412,6 +11422,9 @@ def _write_adsd_delivery_qa(final_path: str) -> dict | None:
             "subtitle_qa": _qa_file_pass("subtitle_qa.json"),
             "speaker_focus_qa": _qa_file_pass("speaker_focus_qa.json"),
             "gender_voice_qa": _qa_file_pass("gender_voice_qa.json"),
+            # lip_sync_qa 已改名为 render_success_qa（本质是 WERYDANCE 渲染成功率，不验真实口型）
+            # 仍保留旧 key 兼容下游 reader；file 双写
+            "render_success_qa": _qa_file_pass("render_success_qa.json"),
             "lip_sync_qa": _qa_file_pass("lip_sync_qa.json"),
             "asr_qa": asr_passed,
             "audio_video_delta": audio_video_delta,
