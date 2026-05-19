@@ -265,6 +265,14 @@ ADSD_RICH_MOTION_PROMPT = (
     "--adsd-rich-motion" in sys.argv
     or os.environ.get("ADR_ADSD_RICH_MOTION", "").strip().lower() in ("1", "true", "yes", "on")
 )
+# LLM 智能音色分配 (Phase: voice-LLM)
+# 默认 ON — LLM 看 voice_assets.json + 12 turn text 自动选 voice_asset_id
+# keyword 规则保留作 fallback (LLM 失败 / 选了不存在的 asset 时)
+# 关闭: ADR_ADSD_LLM_VOICE_ASSIGN=0 走纯 keyword 规则
+ADSD_LLM_VOICE_ASSIGN = (
+    "--no-llm-voice-assign" not in sys.argv
+    and os.environ.get("ADR_ADSD_LLM_VOICE_ASSIGN", "1").strip().lower() not in ("0", "false", "no", "off")
+)
 ADSD_ALMIGHTY_AUDIO_DUB_EXPERIMENT = (
     ADS_DIALOGUE_MODE
     and (
@@ -434,6 +442,162 @@ def _voice_asset_id_for_speaker(speaker: str, gender: str | None = None) -> str:
                 return asset_id
     # 关键字未命中 → gender fallback
     return ADSD_GENDER_FALLBACK_VOICE_ASSET.get(g, ADSD_DEFAULT_MALE_VOICE_ASSET)
+
+
+def _llm_assign_voice_assets(turns: list[dict]) -> dict[int, str]:
+    """LLM 智能音色分配 — 看完整 voice_assets.json + 全部 turn 文本，per-turn 选最优 voice_asset_id。
+    返回 {turn_idx (0-based): voice_asset_id}。
+    失败/未命中: 对应 idx 不在 dict → 调用方走 keyword fallback。
+    """
+    if not turns or not ADSD_LLM_VOICE_ASSIGN:
+        return {}
+    try:
+        catalog = _load_voice_assets()
+    except Exception as e:
+        log(f"LLM voice assign: 读 voice_assets.json 失败 {e}")
+        return {}
+    assets = catalog.get("assets", [])
+    if not assets:
+        return {}
+    # 过滤候选池：跳过歌声 / 混音未分离 / 高风险公众人物
+    selectable = []
+    for a in assets:
+        flags = set(a.get("quality_flags", []) or [])
+        if "singing_not_speech" in flags or "music_contaminated" in flags:
+            continue
+        if "mixed_two_speakers_not_diarized" in flags:
+            continue
+        if a.get("high_risk_public_figure"):
+            continue
+        selectable.append({
+            "voice_id": a.get("voice_id"),
+            "name": a.get("display_name", ""),
+            "person": str(a.get("identified_person", ""))[:50],
+            "gender": a.get("gender", ""),
+            "age": a.get("age_style", ""),
+            "tone_tags": (a.get("tone_tags") or [])[:5],
+            "scene_tags": (a.get("scene_tags") or [])[:3],
+            "accent": a.get("accent", ""),
+        })
+    if not selectable:
+        return {}
+    turn_summary = [
+        {
+            "idx": i,
+            "speaker": str(t.get("speaker", "")),
+            "voice_gender": str(t.get("voice_gender", "")),
+            "emotion": str(t.get("emotion", "neutral")),
+            "text": str(t.get("text", ""))[:80],
+        }
+        for i, t in enumerate(turns)
+    ]
+    prompt = f"""你是 ADR 纪录片音色总监。为每个 turn 从音色库选最匹配的 voice_id。
+
+候选音色池（已过滤歌声 / 混音 / 高风险公众人物）:
+{json.dumps(selectable, ensure_ascii=False)}
+
+剧本 {len(turns)} turn:
+{json.dumps(turn_summary, ensure_ascii=False)}
+
+选择规则（严格遵守）:
+1. 同 speaker 跨 turn 必须用同一 voice_id（角色一致性）
+2. gender 必须匹配 — turn.voice_gender ≠ asset.gender 时严禁选
+3. 语义匹配：text 内容 + speaker 身份 + emotion 综合判定
+   • 学者/知识访谈 → 许知远 / 罗翔
+   • 工程师/CEO/合伙人 → 黄仁勋
+   • 玄幻/古风长者/村长 → 绫璟道人
+   • 年轻男弟子/学生 → 秦牧
+   • 都市女白领/职场女 → urban_talk
+   • 印尼/东南亚口音 → mettsarchive
+4. 严肃纪录片基调避开"短视频网红/活力女"标签
+5. 武侠/玄幻题材避开"现代访谈"音色
+6. 同 gender 内有多选时，按 tone_tags 与 emotion 最匹配的选
+
+输出 JSON 数组（仅此，无 markdown / 无解释）:
+[{{"idx": 0, "voice_id": "external_xxx_001", "reason": "10字内"}}, ...]
+"""
+    try:
+        raw = chat(
+            "GEMINI_25_FLASH",
+            "你是 ADR 纪录片音色总监。只输出 JSON 数组，不解释。",
+            prompt,
+            max_tokens=2000,
+            timeout=60,
+        )
+    except Exception as e:
+        log(f"LLM voice assign: chat 调用失败 {e}")
+        return {}
+    arr_start = raw.find('[')
+    arr_end = raw.rfind(']')
+    if arr_start < 0 or arr_end <= arr_start:
+        log("LLM voice assign: JSON 解析失败（无 [...]）")
+        return {}
+    try:
+        parsed = json.loads(raw[arr_start:arr_end + 1])
+    except Exception as e:
+        log(f"LLM voice assign: JSON parse 失败 {e}")
+        return {}
+    valid_ids = {a["voice_id"] for a in selectable}
+    by_id = {a["voice_id"]: a for a in selectable}
+    result: dict[int, str] = {}
+    reasons: dict[int, str] = {}
+    for entry in parsed:
+        if not isinstance(entry, dict):
+            continue
+        idx = entry.get("idx")
+        vid = entry.get("voice_id")
+        if not isinstance(idx, int) or not (0 <= idx < len(turns)):
+            continue
+        if vid not in valid_ids:
+            continue
+        # gender 校验：LLM 选的 asset.gender 必须与 turn.voice_gender 匹配
+        turn_gender = str(turns[idx].get("voice_gender", "")).strip().lower()
+        asset_gender = str(by_id[vid].get("gender", "")).strip().lower()
+        if turn_gender and asset_gender and turn_gender != asset_gender:
+            log(f"LLM voice assign turn {idx+1}: gender 冲突 ({turn_gender} vs {asset_gender}) → 跳过")
+            continue
+        result[idx] = vid
+        reasons[idx] = str(entry.get("reason", ""))[:40]
+    if result:
+        log(f"LLM voice assign: {len(result)}/{len(turns)} turn 完成 LLM 分配")
+    return result
+
+
+def _apply_llm_voice_assignment(turns: list[dict]) -> dict | None:
+    """在 turns 已通过 keyword 推断后，调 LLM 智能覆盖。
+    LLM 失败或未覆盖的 turn 保留原 keyword 决策。
+    返回 QA dict (per-turn decision source: llm / keyword / fallback)。
+    """
+    if not turns or not ADSD_LLM_VOICE_ASSIGN:
+        return None
+    llm_choices = _llm_assign_voice_assets(turns)
+    qa = {
+        "mode": "adsd_voice_assign_llm_with_keyword_fallback",
+        "llm_enabled": True,
+        "total_turns": len(turns),
+        "llm_assigned_count": len(llm_choices),
+        "keyword_fallback_count": len(turns) - len(llm_choices),
+        "per_turn": [],
+    }
+    for i, t in enumerate(turns):
+        original = t.get("voice_asset_id", "")
+        if i in llm_choices:
+            new_id = llm_choices[i]
+            source = "llm" if new_id != original else "llm_agrees_with_keyword"
+            t["voice_asset_id"] = new_id
+        else:
+            source = "keyword_fallback"
+        qa["per_turn"].append({
+            "turn": i + 1,
+            "speaker": t.get("speaker", ""),
+            "voice_gender": t.get("voice_gender", ""),
+            "emotion": t.get("emotion", "neutral"),
+            "final_voice_asset_id": t.get("voice_asset_id", ""),
+            "decision_source": source,
+        })
+    return qa
+
+
 DEFAULT_MALE_VOICE_ASSET = os.environ.get("ADR_DEFAULT_MALE_VOICE_ASSET", ADSD_DEFAULT_MALE_VOICE_ASSET)
 DEFAULT_FEMALE_VOICE_ASSET = os.environ.get("ADR_DEFAULT_FEMALE_VOICE_ASSET", ADSD_DEFAULT_FEMALE_VOICE_ASSET)
 DEFAULT_VOICE_ASSET = os.environ.get("ADR_DEFAULT_VOICE_ASSET", "").strip()
@@ -2311,6 +2475,22 @@ def step1_script(topic: str) -> list[dict]:
                 log(f"ADSD 对话剧本生成失败（第 {_try+1}/3 次）：{e}")
                 if _try == 2:
                     raise
+
+    # LLM 智能音色分配（覆盖前面 _voice_asset_id_for_speaker 关键字推断）
+    # 启用条件: ADSD 模式 + dialogue_turns 已就绪 + 没关 flag
+    if ADS_DIALOGUE_MODE and dialogue_turns:
+        try:
+            _voice_qa = _apply_llm_voice_assignment(dialogue_turns)
+            if _voice_qa:
+                (OUTPUT_DIR / "adsd_voice_assign_qa.json").write_text(
+                    json.dumps(_voice_qa, ensure_ascii=False, indent=2),
+                    encoding="utf-8",
+                )
+                _llm_n = _voice_qa.get("llm_assigned_count", 0)
+                _kw_n = _voice_qa.get("keyword_fallback_count", 0)
+                tg(f"🎙 LLM 智能音色分配：{_llm_n} 由 LLM 决策 / {_kw_n} keyword 兜底")
+        except Exception as e:
+            log(f"LLM voice assign 整体异常（不致命，保留 keyword 决策）：{e}")
 
     # 最多重试 3 次拿到足够句数 + 通过数据校验（外部注入/ADSD 时跳过）
     if not _script_injected:
