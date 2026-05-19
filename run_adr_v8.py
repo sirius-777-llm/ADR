@@ -3851,19 +3851,28 @@ def _tts_turn_to_audio(turn: dict, idx: int, max_retries: int = 3) -> tuple[str,
 
 
 def _asr_verify_dialogue_audio(audio_path: str, label: str = "ADSD ASR", result_name: str = "speech_recognize_result.json") -> dict | None:
-    """Upload ADSD master audio through Telegram and verify transcript with WeryAI ASR."""
+    """Upload ADSD master audio through Telegram (作匿名文件托管) → 拿 URL → 调 weryai ASR 验证 TTS 文本一致性。
+    上传走静默通知 (disable_notification=true)；ASR 完成后自动 deleteMessage 撤回中转 mp3，避免污染用户 TG。
+    """
     if os.environ.get("ADR_ADSD_SKIP_ASR", "").strip().lower() in ("1", "true", "yes", "on"):
         return None
+    _tg_message_id: int | None = None  # 中转 mp3 的 message_id，用于完成后撤回
     try:
         with open(audio_path, "rb") as f:
             r = requests.post(
                 f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendAudio",
-                data={"chat_id": TG_CHAT_ID, "caption": "ADSD QA audio for ASR"},
+                data={
+                    "chat_id": TG_CHAT_ID,
+                    "caption": "·ADSD ASR 中转(自动删)·",
+                    "disable_notification": "true",  # 静默上传不弹推送
+                },
                 files={"audio": (os.path.basename(audio_path), f, "audio/mpeg")},
                 timeout=(30, 180),
             )
         r.raise_for_status()
-        file_id = (r.json().get("result") or {}).get("audio", {}).get("file_id")
+        _result = r.json().get("result") or {}
+        _tg_message_id = _result.get("message_id")
+        file_id = (_result.get("audio") or {}).get("file_id")
         if not file_id:
             raise RuntimeError("Telegram sendAudio 无 file_id")
         fr = requests.get(
@@ -3890,6 +3899,17 @@ def _asr_verify_dialogue_audio(audio_path: str, label: str = "ADSD ASR", result_
         log(f"ADSD ASR 校验失败（不阻断）：{e}")
         tg(f"⚠️ ADSD ASR 校验失败，不阻断成片：{e}")
         return None
+    finally:
+        # ASR 完成（成功或失败）后撤回中转 mp3，避免污染用户 TG
+        if _tg_message_id is not None:
+            try:
+                requests.post(
+                    f"https://api.telegram.org/bot{TG_BOT_TOKEN}/deleteMessage",
+                    data={"chat_id": TG_CHAT_ID, "message_id": _tg_message_id},
+                    timeout=10,
+                )
+            except Exception:
+                pass
 
 
 def _asr_verify_dialogue_turns(script: list[dict]) -> dict | None:
