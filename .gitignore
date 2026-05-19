@@ -8,7 +8,11 @@ __pycache__/
 *.log
 /output/
 /tmp/
-voice_assets/
+# 音色库：只追踪 voice_assets.json 元数据 (catalog + sha256)
+# 不追踪 references/ 下面的 wav (体积大 + 涉及第三方音频版权风险)
+voice_assets/references/
+voice_assets/*.wav
+voice_assets/*.mp3
 # 密钥/token 类安全兜底（任何包含这些字符串的文件都不提交）
 *secret*
 *_token*
