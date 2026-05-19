@@ -579,6 +579,23 @@ def _apply_llm_voice_assignment(turns: list[dict]) -> dict | None:
     # 保留 keyword 阶段的原始决策，作冲突回退池
     keyword_decisions = {i: t.get("voice_asset_id", "") for i, t in enumerate(turns)}
     llm_choices = _llm_assign_voice_assets(turns)
+    # 加载候选池（同 _llm_assign_voice_assets 的过滤口径）供冲突时 diversifier 使用
+    _diversifier_pool: dict[str, list[str]] = {"male": [], "female": []}
+    try:
+        _catalog = _load_voice_assets()
+        for a in _catalog.get("assets", []):
+            flags = set(a.get("quality_flags", []) or [])
+            if "singing_not_speech" in flags or "music_contaminated" in flags:
+                continue
+            if "mixed_two_speakers_not_diarized" in flags:
+                continue
+            if a.get("high_risk_public_figure"):
+                continue
+            g = str(a.get("gender", "")).strip().lower()
+            if g in _diversifier_pool:
+                _diversifier_pool[g].append(a.get("voice_id", ""))
+    except Exception:
+        pass
     # 后处理：speaker → first turn idx 映射，同 speaker 跨 turn 共用 voice_id（保留），
     # 不同 speaker 但 LLM 给同一 voice_id → 冲突
     speaker_to_voice: dict[str, str] = {}  # 第一个出现的 speaker 锁定 voice
@@ -603,24 +620,39 @@ def _apply_llm_voice_assignment(turns: list[dict]) -> dict | None:
             continue
         # 新 speaker
         if vid in voice_to_speaker and voice_to_speaker[vid] != sp:
-            # 不同 speaker 撞同 voice → 这个 speaker 回退到 keyword 决策
+            # 不同 speaker 撞同 voice → 1) keyword 决策；2) 还撞 → 从候选池挑未占用的同 gender voice
+            kw_vid = keyword_decisions.get(i, "")
+            chosen_vid: str = ""
+            choose_source = ""
+            if kw_vid and kw_vid not in voice_to_speaker:
+                chosen_vid = kw_vid
+                choose_source = "keyword_fallback_after_llm_collision"
+            else:
+                # diversifier: 从池里挑未占用的同 gender
+                turn_gender = str(t.get("voice_gender", "")).strip().lower()
+                pool = _diversifier_pool.get(turn_gender, [])
+                for cand in pool:
+                    if cand and cand not in voice_to_speaker:
+                        chosen_vid = cand
+                        choose_source = "diversifier_pool_pick"
+                        break
+                if not chosen_vid:
+                    # 池子也用尽 → 保持 LLM 重复决策
+                    chosen_vid = vid
+                    choose_source = "exhausted_keep_llm_dup"
             conflicts.append({
                 "turn": i + 1,
                 "speaker": sp,
                 "reason": "voice_id_collision_with_other_speaker",
                 "llm_chose": vid,
                 "already_held_by": voice_to_speaker[vid],
-                "fallback_to_keyword": keyword_decisions.get(i, ""),
+                "resolved_to": chosen_vid,
+                "resolved_source": choose_source,
             })
-            kw_vid = keyword_decisions.get(i, "")
-            # 如果 keyword 也撞别人 → 干脆从 LLM 移除让上层走 fallback
-            if kw_vid and kw_vid not in voice_to_speaker:
-                llm_choices[i] = kw_vid
-                speaker_to_voice[sp] = kw_vid
-                voice_to_speaker[kw_vid] = sp
-            else:
-                # 真没辙：保持 LLM 重复决策，至少有声音
-                speaker_to_voice[sp] = vid
+            llm_choices[i] = chosen_vid
+            speaker_to_voice[sp] = chosen_vid
+            if chosen_vid not in voice_to_speaker:
+                voice_to_speaker[chosen_vid] = sp
             continue
         speaker_to_voice[sp] = vid
         voice_to_speaker[vid] = sp
