@@ -501,17 +501,22 @@ def _llm_assign_voice_assets(turns: list[dict]) -> dict[int, str]:
 
 选择规则（严格遵守）:
 1. 同 speaker 跨 turn 必须用同一 voice_id（角色一致性）
-2. gender 必须匹配 — turn.voice_gender ≠ asset.gender 时严禁选
-3. 语义匹配：text 内容 + speaker 身份 + emotion 综合判定
+2. **不同 speaker 必须用不同 voice_id**（避免观众听感混淆）
+   ★ 例外：候选池里同 gender 可选 asset 数 < 该 gender 的 speaker 数时
+     可以重复，但要尽量挑 tone_tags 差异最大的两个分配
+3. gender 必须匹配 — turn.voice_gender ≠ asset.gender 时严禁选
+4. 语义匹配：text 内容 + speaker 身份 + emotion 综合判定
    • 学者/知识访谈 → 许知远 / 罗翔
    • 工程师/CEO/合伙人 → 黄仁勋
    • 玄幻/古风长者/村长 → 绫璟道人
    • 年轻男弟子/学生 → 秦牧
    • 都市女白领/职场女 → urban_talk
    • 印尼/东南亚口音 → mettsarchive
-4. 严肃纪录片基调避开"短视频网红/活力女"标签
-5. 武侠/玄幻题材避开"现代访谈"音色
-6. 同 gender 内有多选时，按 tone_tags 与 emotion 最匹配的选
+   • 演员对白/戏剧/体育人物 → 黄渤
+5. 严肃纪录片基调避开"短视频网红/活力女"标签
+6. 武侠/玄幻题材避开"现代访谈"音色
+7. 同 gender 内有多选时，按 tone_tags 与 emotion 最匹配的选；
+   优先保证规则 2 的差异化
 
 输出 JSON 数组（仅此，无 markdown / 无解释）:
 [{{"idx": 0, "voice_id": "external_xxx_001", "reason": "10字内"}}, ...]
@@ -566,24 +571,79 @@ def _llm_assign_voice_assets(turns: list[dict]) -> dict[int, str]:
 def _apply_llm_voice_assignment(turns: list[dict]) -> dict | None:
     """在 turns 已通过 keyword 推断后，调 LLM 智能覆盖。
     LLM 失败或未覆盖的 turn 保留原 keyword 决策。
+    后处理：检测"不同 speaker 撞同一 voice_id"冲突，第二个起回退到 keyword 决策。
     返回 QA dict (per-turn decision source: llm / keyword / fallback)。
     """
     if not turns or not ADSD_LLM_VOICE_ASSIGN:
         return None
+    # 保留 keyword 阶段的原始决策，作冲突回退池
+    keyword_decisions = {i: t.get("voice_asset_id", "") for i, t in enumerate(turns)}
     llm_choices = _llm_assign_voice_assets(turns)
+    # 后处理：speaker → first turn idx 映射，同 speaker 跨 turn 共用 voice_id（保留），
+    # 不同 speaker 但 LLM 给同一 voice_id → 冲突
+    speaker_to_voice: dict[str, str] = {}  # 第一个出现的 speaker 锁定 voice
+    voice_to_speaker: dict[str, str] = {}  # 反向锁
+    conflicts: list[dict] = []
+    for i, t in enumerate(turns):
+        sp = str(t.get("speaker", "")).strip()
+        if i not in llm_choices:
+            continue
+        vid = llm_choices[i]
+        if sp in speaker_to_voice:
+            # 同 speaker 后续 turn → 强制用第一个 turn 锁定的 voice
+            if vid != speaker_to_voice[sp]:
+                conflicts.append({
+                    "turn": i + 1,
+                    "speaker": sp,
+                    "reason": "same_speaker_voice_drift",
+                    "llm_chose": vid,
+                    "locked_to": speaker_to_voice[sp],
+                })
+                llm_choices[i] = speaker_to_voice[sp]
+            continue
+        # 新 speaker
+        if vid in voice_to_speaker and voice_to_speaker[vid] != sp:
+            # 不同 speaker 撞同 voice → 这个 speaker 回退到 keyword 决策
+            conflicts.append({
+                "turn": i + 1,
+                "speaker": sp,
+                "reason": "voice_id_collision_with_other_speaker",
+                "llm_chose": vid,
+                "already_held_by": voice_to_speaker[vid],
+                "fallback_to_keyword": keyword_decisions.get(i, ""),
+            })
+            kw_vid = keyword_decisions.get(i, "")
+            # 如果 keyword 也撞别人 → 干脆从 LLM 移除让上层走 fallback
+            if kw_vid and kw_vid not in voice_to_speaker:
+                llm_choices[i] = kw_vid
+                speaker_to_voice[sp] = kw_vid
+                voice_to_speaker[kw_vid] = sp
+            else:
+                # 真没辙：保持 LLM 重复决策，至少有声音
+                speaker_to_voice[sp] = vid
+            continue
+        speaker_to_voice[sp] = vid
+        voice_to_speaker[vid] = sp
+
     qa = {
         "mode": "adsd_voice_assign_llm_with_keyword_fallback",
         "llm_enabled": True,
         "total_turns": len(turns),
         "llm_assigned_count": len(llm_choices),
         "keyword_fallback_count": len(turns) - len(llm_choices),
+        "conflicts_resolved": len(conflicts),
+        "conflicts": conflicts,
+        "speaker_to_voice_locked": speaker_to_voice,
         "per_turn": [],
     }
     for i, t in enumerate(turns):
-        original = t.get("voice_asset_id", "")
+        original = keyword_decisions.get(i, "")
         if i in llm_choices:
             new_id = llm_choices[i]
-            source = "llm" if new_id != original else "llm_agrees_with_keyword"
+            if new_id == original:
+                source = "llm_agrees_with_keyword"
+            else:
+                source = "llm"
             t["voice_asset_id"] = new_id
         else:
             source = "keyword_fallback"
