@@ -6848,10 +6848,17 @@ def step6_parallel(script: list[dict], topic: str, pregenerated_bgm_path: str | 
     _ensure_motion_action_plan(script)
     _write_motion_action_plan_qa(script)
     n = len(script)
-    if pregenerated_bgm_path:
-        tg(f"🚀 并行生成：{n} 张图片（复用 BGM-driven 已生成音乐）...")
+    _approval_note = "图片生成即审批" if not SKIP_APPROVAL else "免审批"
+    # storyboard_grid 启用时: 1 张 grid 4K 大图切 n panel + character_sheet + motion_bridge_refs
+    # fallback: n 张单独 generate_image
+    if GPT_IMAGE2_STORYBOARD_GRID:
+        _gen_brief = f"storyboard grid (切 {n} panel) + character_sheet + motion_bridge_refs"
     else:
-        tg(f"🚀 并行生成：{n} 张图片 + BGM（图片生成即审批，BGM 后台同步跑）...")
+        _gen_brief = f"{n} 张图片"
+    if pregenerated_bgm_path:
+        tg(f"🚀 并行生成：{_gen_brief}（{_approval_note}，复用 BGM-driven 已生成音乐）...")
+    else:
+        tg(f"🚀 并行生成：{_gen_brief} + BGM（{_approval_note}，BGM 后台同步跑）...")
 
     MAX_REDO = 3
     bgm_tone = script[0].get("tone", "中性") if script else "中性"
@@ -7819,7 +7826,15 @@ def _werydance_caption_instruction(scene: dict) -> str:
 def _werydance_negative_prompt(scene: dict) -> str:
     if _werydance_caption_request(scene).get("requested"):
         return "watermark, logo, extra text, misspelled text, garbled characters, duplicate captions"
-    return "no subtitles, no text overlay, no watermark, no captions, no burned-in text, no logo"
+    # 强化：WERYDANCE 模型偶尔会自作主张在画面下方烧中文字幕，跟我们的 ASS 字幕双重叠
+    # 用多重否定关键词压制 (single negative prompt 力度不够，扩到所有 text-related artifact)
+    return (
+        "no subtitles, no captions, no on-screen text, no burned-in text, no Chinese subtitles, "
+        "no English subtitles, no text overlay, no caption bar, no chyron, no lower-third graphic, "
+        "no speech bubbles, no thought bubbles, no signage text, no UI labels, no character name tags, "
+        "no watermark, no logo, no studio mark, no copyright mark, "
+        "no random Chinese characters anywhere in the frame, no garbled glyphs, no floating text"
+    )
 
 
 def _motion_reference_prompt(scene: dict, motion_prompt: str, safe_retry: bool = False, annotated: bool = False) -> str:
@@ -9676,8 +9691,14 @@ def _adsd_lip_sync_prompt(scene: dict, safe_retry: bool = False) -> str:
         if ADSD_ONSITE_POV_MODE else ""
     )
     expr = _emotion_expression_phrase(scene.get("emotion"))
+    _no_text_ban = (
+        "ABSOLUTELY NO TEXT IN FRAME: do not burn in subtitles, do not render Chinese/English captions, "
+        "do not draw chyron / lower-thirds / speech bubbles / character name tags / on-screen typography. "
+        "The frame must be PURELY cinematic image — no text of any kind. "
+    )
     if safe_retry:
         return (
+            f"{_no_text_ban}"
             "Period dialogue scene with authentic emotional expression. "
             "If a character sheet reference is provided, use it only to preserve the active speaker identity; do not render the sheet itself. "
             f"{_adsd_gender_lock_phrase(scene.get('voice_gender'))} "
@@ -9690,6 +9711,7 @@ def _adsd_lip_sync_prompt(scene: dict, safe_retry: bool = False) -> str:
         )
     shot = scene.get("shot", "")
     return (
+        f"{_no_text_ban}"
         "Historically grounded period dialogue scene with authentic emotional expression. "
         "If a character sheet reference is provided, use it only to preserve the active speaker identity; do not render the sheet itself. "
         f"{_adsd_gender_lock_phrase(scene.get('voice_gender'))} "
@@ -9718,7 +9740,12 @@ def _adsd_broll_motion_prompt(scene: dict, safe_retry: bool = False) -> str:
     )
     action_boost = _action_motion_fragment() if _is_action_scene(text, shot) else ""
     expr = _emotion_expression_phrase(scene.get("emotion"))
+    _no_text_ban = (
+        "ABSOLUTELY NO TEXT IN FRAME: do not burn in subtitles, do not render Chinese/English captions, "
+        "no chyron / lower-thirds / speech bubbles / on-screen typography. Purely cinematic image. "
+    )
     base = (
+        f"{_no_text_ban}"
         "Cinematic documentary B-roll, voice-over scene — real-world cinematography style with authentic emotional expression. "
         "If a character sheet reference is provided, use it only to preserve character identity across panels; do not render the sheet itself. "
         f"{_adsd_gender_lock_phrase(scene.get('voice_gender'))} "
