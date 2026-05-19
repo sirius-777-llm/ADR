@@ -10521,6 +10521,16 @@ def step66_adsd_lip_sync(script: list[dict]):
     werydance_caption_cnt = sum(1 for r in records if r.get("pass") and r.get("werydance_captions_requested") and not r.get("ass_fallback_required"))
     sheet_path = OUTPUT_DIR / "character_sheet.png"
     multiref_alt_attach_total = sum(r.get("alt_panel_count", 0) for r in _alt_attach_log)
+    # 区分 A-roll (需口型同步) vs B-roll (motion 模式，无口型要求)
+    # 之前 success_rate 把两类混在一起算 → B-roll 失败拉低 lip-sync 阈值；B-roll 成功又水分掩盖 A-roll 真问题
+    a_roll_idxs = [i for i, s in enumerate(script) if s.get("needs_lip_sync", True)]
+    b_roll_idxs = [i for i, s in enumerate(script) if not s.get("needs_lip_sync", True)]
+    a_roll_success = sum(1 for i in a_roll_idxs if results.get(i))
+    b_roll_success = sum(1 for i in b_roll_idxs if results.get(i))
+    a_roll_total = len(a_roll_idxs)
+    b_roll_total = len(b_roll_idxs)
+    a_roll_pass = a_roll_total == 0 or a_roll_success >= max(1, math.ceil(a_roll_total * 0.8))
+    b_roll_pass = b_roll_total == 0 or b_roll_success >= max(1, math.ceil(b_roll_total * 0.8))
     qa = {
         "mode": ADSD_MODE_NAME,
         "interface": "almighty-reference-to-video+video-lips-change-fallback" if ADSD_LIPS_CHANGE_REPAIR else "almighty-reference-to-video",
@@ -10548,28 +10558,46 @@ def step66_adsd_lip_sync(script: list[dict]):
         "total": n,
         "success_count": success_cnt,
         "success_rate": round(success_cnt / max(n, 1), 4),
-        "pass": success_cnt >= max(1, math.ceil(n * 0.8)),
+        # A-roll / B-roll 分轨统计
+        "a_roll_total": a_roll_total,
+        "a_roll_success": a_roll_success,
+        "a_roll_success_rate": round(a_roll_success / max(a_roll_total, 1), 4) if a_roll_total else 1.0,
+        "a_roll_pass": a_roll_pass,
+        "b_roll_total": b_roll_total,
+        "b_roll_success": b_roll_success,
+        "b_roll_success_rate": round(b_roll_success / max(b_roll_total, 1), 4) if b_roll_total else 1.0,
+        "b_roll_pass": b_roll_pass,
+        # pass 判定: A-roll 口型成功率 ≥80% (B-roll 不进口型阈值)
+        "pass": a_roll_pass,
+        "lip_sync_metric_policy": "a_roll_only_for_lip_sync_threshold_b_roll_separate_motion_track",
         "policy": "failed_turns_keep_existing_segments",
         "master_audio_mux_required": not embedded_audio_ready,
         "final_audio_offset_required": 0.0,
         "voice_reference_policy": "use owned, licensed, consented, or otherwise lawful voice references; avoid undisclosed real-person impersonation",
-        "manual_visual_checks_required": [
-            "mouth_visible",
-            "active_speaker_correct",
-            "no_face_drift",
-            "mouth_motion_matches_syllable_timing",
-            "generated_dialogue_matches_script",
-            "voice_timbre_matches_authorized_reference",
-            "no_undisclosed_real_person_impersonation",
-        ],
+        "manual_visual_checks_required": {
+            "a_roll": [
+                "mouth_visible",
+                "active_speaker_correct",
+                "no_face_drift",
+                "mouth_motion_matches_syllable_timing",
+                "voice_timbre_matches_authorized_reference",
+                "no_undisclosed_real_person_impersonation",
+            ],
+            "b_roll": [
+                "scene_matches_voice_over_narration",
+                "no_mouth_lip_sync_attempted",
+                "ambient_motion_natural",
+                "no_active_speaker_lock",
+            ],
+        },
         "records": records,
         "created_at": datetime.now().isoformat(timespec="seconds"),
     }
     (OUTPUT_DIR / "lip_sync_qa.json").write_text(json.dumps(qa, ensure_ascii=False, indent=2), encoding="utf-8")
     if qa["pass"]:
-        tg(f"✅ {ADSD_MODE_NAME} 口型同步 QA 通过：{success_cnt}/{n}")
+        tg(f"✅ {ADSD_MODE_NAME} 口型同步 QA 通过：A-roll {a_roll_success}/{a_roll_total} ✓ · B-roll {b_roll_success}/{b_roll_total} (motion only)")
     else:
-        tg(f"⚠️ {ADSD_MODE_NAME} 口型同步 QA 未达标：{success_cnt}/{n}，本次仍可用静态/motion兜底成片")
+        tg(f"⚠️ {ADSD_MODE_NAME} 口型同步 QA 未达标：A-roll {a_roll_success}/{a_roll_total}（阈值 80%），可静态/motion兜底成片")
 
 
 def step65_motion(script: list[dict]):
@@ -11355,13 +11383,20 @@ def _write_adsd_delivery_qa(final_path: str) -> dict | None:
 
     lip_sync_qa = _read_output_json("lip_sync_qa.json")
     if ADSD_LIP_SYNC_EXPERIMENT and isinstance(lip_sync_qa, dict):
-        rate = float(lip_sync_qa.get("success_rate") or 0)
-        if rate < 0.8:
-            issues.append(f"lip_sync success_rate below 0.8: {rate:.4f}")
-        if lip_sync_qa.get("success_count") != lip_sync_qa.get("total"):
-            warnings.append(
-                f"lip_sync partial success: {lip_sync_qa.get('success_count')}/{lip_sync_qa.get('total')}"
-            )
+        # 只查 A-roll 口型成功率 — B-roll motion turn 不进 lip-sync 阈值
+        a_roll_total = int(lip_sync_qa.get("a_roll_total", 0) or 0)
+        a_roll_success = int(lip_sync_qa.get("a_roll_success", 0) or 0)
+        if a_roll_total > 0:
+            a_rate = a_roll_success / a_roll_total
+            if a_rate < 0.8:
+                issues.append(f"A-roll lip_sync success_rate below 0.8: {a_rate:.4f} ({a_roll_success}/{a_roll_total})")
+            elif a_roll_success != a_roll_total:
+                warnings.append(f"A-roll lip_sync partial success: {a_roll_success}/{a_roll_total}")
+        # B-roll motion 失败单独 warning (不阻塞)
+        b_roll_total = int(lip_sync_qa.get("b_roll_total", 0) or 0)
+        b_roll_success = int(lip_sync_qa.get("b_roll_success", 0) or 0)
+        if b_roll_total > 0 and b_roll_success != b_roll_total:
+            warnings.append(f"B-roll motion partial: {b_roll_success}/{b_roll_total} (not lip-sync gated)")
 
     payload = {
         "mode": ADSD_MODE_NAME,
