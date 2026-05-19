@@ -10767,6 +10767,94 @@ def step65_grid_multiref_motion_qa(script: list[dict]):
     _write_storyboard_motion_compare_qa(grid_motion_qa, previs_qa, seg_qa, trailer_qa, character_trailer_qa)
 
 
+# ── audio_dub voice-clone splice：把 A-roll seg 里的克隆音色拼回主音轨 ─────────
+def _build_voice_clone_hybrid_audio(script: list[dict], master_voice_path: str) -> str | None:
+    """ADSD audio_dub 模式专用：A-roll seg_N.mp4 里 WERYDANCE 生成的克隆音色
+    会被 step9 默认主音轨 mux 流程覆盖（master_voice = weryai 默认 TTS）。
+    本函数构造混合主音轨：
+      - A-roll turn → 抽 seg_N.mp4 的音轨（克隆音色）
+      - B-roll turn → 切 master_voice 的对应区间（默认 TTS）
+    返回新 mp3 路径，供 step9 替换 voice_path。失败返回 None。
+    """
+    if not (ADS_DIALOGUE_MODE and ADSD_ALMIGHTY_AUDIO_DUB_EXPERIMENT and ADSD_LIP_SYNC_EXPERIMENT):
+        return None
+    if not master_voice_path or not os.path.exists(master_voice_path):
+        return None
+    a_roll_count = 0
+    parts: list[str] = []
+    work_dir = OUTPUT_DIR / "hybrid_audio_parts"
+    work_dir.mkdir(exist_ok=True)
+    for i, scene in enumerate(script):
+        needs_lip = bool(scene.get("needs_lip_sync", True))
+        seg_path = scene.get("vid_path") or ""
+        audio_start = float(scene.get("audio_start", 0.0) or 0.0)
+        vid_dur = float(scene.get("vid_duration", 0.0) or 0.0)
+        if vid_dur <= 0:
+            continue
+        part_wav = str(work_dir / f"part_{i:02d}.wav")
+        a_roll_seg_has_audio = (
+            needs_lip and seg_path and os.path.exists(seg_path) and _has_audio_stream(seg_path)
+        )
+        try:
+            if a_roll_seg_has_audio:
+                ffmpeg(
+                    "-i", seg_path,
+                    "-vn", "-ac", "1", "-ar", "44100",
+                    "-c:a", "pcm_s16le",
+                    part_wav,
+                    timeout=60,
+                )
+                a_roll_count += 1
+            else:
+                ffmpeg(
+                    "-ss", f"{audio_start:.3f}", "-t", f"{vid_dur:.3f}",
+                    "-i", master_voice_path,
+                    "-ac", "1", "-ar", "44100",
+                    "-c:a", "pcm_s16le",
+                    part_wav,
+                    timeout=60,
+                )
+            if not os.path.exists(part_wav) or os.path.getsize(part_wav) < 1000:
+                log(f"hybrid audio part {i} 抽取异常，跳过")
+                continue
+            parts.append(part_wav)
+        except Exception as e:
+            log(f"hybrid audio part {i} 异常：{e}")
+            continue
+    if not parts or a_roll_count == 0:
+        log("hybrid audio: 无可用 A-roll 克隆音轨，跳过 splice")
+        return None
+    concat_list = work_dir / "concat.txt"
+    concat_list.write_text(
+        "\n".join(f"file '{p}'" for p in parts),
+        encoding="utf-8",
+    )
+    out_wav = str(OUTPUT_DIR / "hybrid_master_voice.wav")
+    out_mp3 = str(OUTPUT_DIR / "hybrid_master_voice.mp3")
+    try:
+        ffmpeg(
+            "-f", "concat", "-safe", "0",
+            "-i", str(concat_list),
+            "-ac", "1", "-ar", "44100",
+            "-c:a", "pcm_s16le",
+            out_wav,
+            timeout=120,
+        )
+        ffmpeg(
+            "-i", out_wav,
+            "-c:a", "libmp3lame", "-b:a", "192k",
+            out_mp3,
+            timeout=60,
+        )
+    except Exception as e:
+        log(f"hybrid audio concat 失败：{e}")
+        return None
+    if not os.path.exists(out_mp3) or os.path.getsize(out_mp3) < 1000:
+        return None
+    log(f"hybrid voice-clone master audio built ({a_roll_count} A-roll cloned, {len(parts)-a_roll_count} B-roll fallback)：{out_mp3}")
+    return out_mp3
+
+
 # ── 第七步：拼接视频轨 ────────────────────────────────────────────────────────
 def step7_concat(script: list[dict]) -> str:
     # P1：grid_multiref 主路径：N 组 group videos concat 成 grid_multiref_combined.mp4 → raw_concat
@@ -13524,6 +13612,20 @@ def main():
         t = time.time(); bgm_path   = step6_parallel(script, topic, bgm_path if NO_VOICE else None); timings["图片+BGM 并发"] = time.time() - t
         if ADS_DIALOGUE_MODE and ADSD_LIP_SYNC_EXPERIMENT:
             t = time.time(); step66_adsd_lip_sync(script);                    timings["ADSD 口型同步"] = time.time() - t
+            # audio_dub 克隆音色 splice：A-roll seg 内的克隆音色拼成混合主音轨，
+            # 否则 step9 默认主音轨 mux 会用 weryai 默认 TTS 覆盖掉真克隆。
+            try:
+                t = time.time()
+                hybrid_voice = _build_voice_clone_hybrid_audio(script, voice_path)
+                timings["audio_dub 克隆音色 splice"] = time.time() - t
+                if hybrid_voice:
+                    voice_path = hybrid_voice
+                    tg("🎙 audio_dub 克隆音色已 splice 进主音轨（A-roll=克隆，B-roll=默认 TTS）")
+                else:
+                    tg("⚠️ audio_dub 克隆 splice 跳过：A-roll 全部缺音，回退默认主音轨")
+            except Exception as e:
+                log(f"hybrid voice-clone splice 异常（回退默认主音轨）：{e}")
+                tg(f"⚠️ audio_dub splice 异常（回退默认主音轨）：{e}")
         elif WITH_MOTION:
             t = time.time(); step65_motion(script);                            timings["动态化 (WERYDANCE)"] = time.time() - t
         elif STORYBOARD_GRID_MULTIREF_MOTION or PREVIS_PAGE_MOTION or STORYBOARD_TRAILER_MODE or CHARACTER_TRAILER_MODE:
