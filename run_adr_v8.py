@@ -9876,12 +9876,19 @@ def _postprocess_lip_sync_segment(src_video: str, scene: dict, target_dur: float
 def _postprocess_audio_dub_segment(src_video: str, scene: dict, target_dur: float) -> bool:
     """Normalize Almighty audio-dub video while preserving generated segment audio for QA sidecars.
 
+    关键：WERYDANCE 输出 ~5s 完整克隆语音，master_voice TTS 时长往往更短。
+    若按 target_dur 硬 atrim 会截断克隆语音 → 改成 effective_dur = max(target_dur, src_dur)
+    保留完整克隆，后续 retiming 把真实时长写回 scene 让 timeline 同步拉长。
+
     pad 段视频用 panel still + Ken Burns 替代 tpad clone（解决冻人脸 bug）；
     pad 段音频仍走 apad 静音填充。
     """
     vid_path = scene["vid_path"]
     src_dur = ffprobe_duration(src_video)
-    pad = max(0.0, target_dur - src_dur)
+    # 不 trim raw audio：克隆语音可能比 master_voice TTS 长，硬截会切掉尾部
+    effective_dur = max(target_dur, src_dur)
+    pad = max(0.0, effective_dur - src_dur)
+    scene["_audio_dub_effective_dur"] = effective_dur
     panel_path = scene.get("img_path", "")
     use_panel_pad = (
         pad > 0.04
@@ -9892,8 +9899,8 @@ def _postprocess_audio_dub_segment(src_video: str, scene: dict, target_dur: floa
     if use_panel_pad:
         zoompan_frames = max(1, int(pad * 24))
         # 三个 stream：[0:v] wery video, [0:a] wery audio, [1:v] panel still
-        # 视频：normalize wery + concat panel Ken Burns，trim 到 target_dur
-        # 音频：apad 填静音到 target_dur
+        # 视频：normalize wery + concat panel Ken Burns，trim 到 effective_dur
+        # 音频：apad 填静音到 effective_dur（不 atrim raw 部分）
         filter_complex = (
             f"[0:v]scale={VIDEO_W}:{VIDEO_H}:force_original_aspect_ratio=increase,"
             f"crop={VIDEO_W}:{VIDEO_H},setsar=1[werynorm];"
@@ -9904,8 +9911,8 @@ def _postprocess_audio_dub_segment(src_video: str, scene: dict, target_dur: floa
             f"d={zoompan_frames}:s={VIDEO_W}x{VIDEO_H}:fps=24,"
             f"setsar=1[panel];"
             f"[werynorm][panel]concat=n=2:v=1:a=0,"
-            f"trim=duration={target_dur:.3f},setpts=PTS-STARTPTS[vout];"
-            f"[0:a]apad=pad_dur={pad:.3f},atrim=duration={target_dur:.3f},asetpts=PTS-STARTPTS[aout]"
+            f"trim=duration={effective_dur:.3f},setpts=PTS-STARTPTS[vout];"
+            f"[0:a]apad=pad_dur={pad:.3f},atrim=duration={effective_dur:.3f},asetpts=PTS-STARTPTS[aout]"
         )
         try:
             ffmpeg(
@@ -9923,15 +9930,15 @@ def _postprocess_audio_dub_segment(src_video: str, scene: dict, target_dur: floa
             return os.path.exists(vid_path) and os.path.getsize(vid_path) > 10000
         except Exception as e:
             log(f"[audio-dub postprocess] panel-pad Ken Burns 失败回退 tpad clone: {e}")
-    # 回退 / 短 pad / 无 panel 路径：原 tpad clone
+    # 回退 / 短 pad / 无 panel 路径：原 tpad clone（仍按 effective_dur 处理）
     vf = (
         f"scale={VIDEO_W}:{VIDEO_H}:force_original_aspect_ratio=increase,"
         f"crop={VIDEO_W}:{VIDEO_H},setsar=1"
     )
     if pad > 0.04:
         vf += f",tpad=stop_mode=clone:stop_duration={pad:.3f}"
-    vf += f",trim=duration={target_dur:.3f},setpts=PTS-STARTPTS"
-    af = f"apad=pad_dur={pad:.3f},atrim=duration={target_dur:.3f},asetpts=PTS-STARTPTS"
+    vf += f",trim=duration={effective_dur:.3f},setpts=PTS-STARTPTS"
+    af = f"apad=pad_dur={pad:.3f},atrim=duration={effective_dur:.3f},asetpts=PTS-STARTPTS"
     try:
         ffmpeg(
             "-i", src_video,
@@ -10767,6 +10774,39 @@ def step65_grid_multiref_motion_qa(script: list[dict]):
     _write_storyboard_motion_compare_qa(grid_motion_qa, previs_qa, seg_qa, trailer_qa, character_trailer_qa)
 
 
+# ── audio_dub retiming：按 seg 真实长度重算 timeline，避免克隆语音被截 ─────────
+def _retime_after_audio_dub(script: list[dict]) -> int:
+    """audio_dub 跑完后，用 seg_N.mp4 真实时长重算每个 turn 的 timeline。
+
+    场景：WERYDANCE 克隆语音可能比 master_voice TTS 长。
+    postprocess 已经把 seg_N.mp4 时长设为 max(target_dur, src_dur)，
+    现在按真实时长重排 cursor，让 audio_start/sub_start/vid_duration 同步拉长。
+    返回时长被拉长的 turn 数。
+    """
+    if not (ADS_DIALOGUE_MODE and ADSD_ALMIGHTY_AUDIO_DUB_EXPERIMENT and ADSD_LIP_SYNC_EXPERIMENT):
+        return 0
+    cursor = 0.0
+    extended = 0
+    for i, scene in enumerate(script):
+        seg_path = scene.get("vid_path") or ""
+        if not seg_path or not os.path.exists(seg_path):
+            continue
+        seg_dur = ffprobe_duration(seg_path)
+        if seg_dur <= 0:
+            continue
+        old_dur = float(scene.get("vid_duration", 0.0) or 0.0)
+        if seg_dur > old_dur + 0.05:
+            extended += 1
+        scene["audio_start"] = cursor
+        scene["audio_end"] = cursor + seg_dur
+        scene["vid_duration"] = seg_dur
+        scene["sub_start"] = cursor + SUB_DELAY
+        scene["sub_end"] = cursor + seg_dur + SUB_DELAY
+        cursor += seg_dur
+    log(f"audio_dub retiming: {extended} turn 时长被拉长，总片长 → {cursor:.2f}s")
+    return extended
+
+
 # ── audio_dub voice-clone splice：把 A-roll seg 里的克隆音色拼回主音轨 ─────────
 def _build_voice_clone_hybrid_audio(script: list[dict], master_voice_path: str) -> str | None:
     """ADSD audio_dub 模式专用：A-roll seg_N.mp4 里 WERYDANCE 生成的克隆音色
@@ -10840,8 +10880,11 @@ def _build_voice_clone_hybrid_audio(script: list[dict], master_voice_path: str) 
             out_wav,
             timeout=120,
         )
+        # loudnorm 统一响度：WERYDANCE 克隆 audio 比 weryai TTS 响很多，
+        # 不归一化会导致 A-roll 段把 BGM 听感压扁。-16 LUFS 是流媒体标准目标。
         ffmpeg(
             "-i", out_wav,
+            "-af", "loudnorm=I=-16:LRA=11:TP=-1.5",
             "-c:a", "libmp3lame", "-b:a", "192k",
             out_mp3,
             timeout=60,
@@ -13612,6 +13655,16 @@ def main():
         t = time.time(); bgm_path   = step6_parallel(script, topic, bgm_path if NO_VOICE else None); timings["图片+BGM 并发"] = time.time() - t
         if ADS_DIALOGUE_MODE and ADSD_LIP_SYNC_EXPERIMENT:
             t = time.time(); step66_adsd_lip_sync(script);                    timings["ADSD 口型同步"] = time.time() - t
+            # audio_dub retiming：按 seg_N.mp4 真实时长重算 timeline，
+            # 防 master_voice TTS 短于克隆语音时 hybrid voice 被截尾
+            try:
+                t = time.time()
+                extended = _retime_after_audio_dub(script)
+                timings["audio_dub timeline 重算"] = time.time() - t
+                if extended > 0:
+                    tg(f"🕐 audio_dub timeline 重算：{extended} turn 按克隆真实长度拉长")
+            except Exception as e:
+                log(f"audio_dub retiming 异常（保留原 timeline）：{e}")
             # audio_dub 克隆音色 splice：A-roll seg 内的克隆音色拼成混合主音轨，
             # 否则 step9 默认主音轨 mux 会用 weryai 默认 TTS 覆盖掉真克隆。
             try:
@@ -13620,7 +13673,7 @@ def main():
                 timings["audio_dub 克隆音色 splice"] = time.time() - t
                 if hybrid_voice:
                     voice_path = hybrid_voice
-                    tg("🎙 audio_dub 克隆音色已 splice 进主音轨（A-roll=克隆，B-roll=默认 TTS）")
+                    tg("🎙 audio_dub 克隆音色已 splice 进主音轨（A-roll=克隆，B-roll=默认 TTS，loudnorm 已统一响度）")
                 else:
                     tg("⚠️ audio_dub 克隆 splice 跳过：A-roll 全部缺音，回退默认主音轨")
             except Exception as e:
