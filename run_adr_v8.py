@@ -10559,11 +10559,10 @@ def _lip_sync_one_scene(idx: int, scene: dict, target_dur: float, aspect_ratio: 
         return idx, ok, info
     try:
         image_url = _upload_to_weryai(scene["img_path"])
-        # multi-ref 默认启用 (Phase 6)：
-        # a_roll        → sheet + alt_panels + image
-        # narrated_b    → sheet + image (旁白也需要 character 一致性，但不要 alt_panels 因为旁白用统一画面风格)
-        # silent_b      → 只 image (无主体角色，sheet 反而干扰)
-        multi_ref_default = os.environ.get("ADR_MULTI_REF_DEFAULT", "1").strip().lower() not in ("0", "false", "no", "off")
+        # multi-ref 在 audio_dub mode 下默认 OFF：silentb2 测试发现开启后 a_roll task_failed (rate limit)
+        # 需要进一步排查 ref_images 顺序 / alt_panel 选图问题，先回滚保稳定
+        # 想恢复 → export ADR_MULTI_REF_DEFAULT=1
+        multi_ref_default = os.environ.get("ADR_MULTI_REF_DEFAULT", "0").strip().lower() in ("1", "true", "yes", "on")
         broll_use_sheet = (
             multi_ref_default
             or os.environ.get("ADR_ADSD_BROLL_USE_CHARACTER_SHEET", "0").strip().lower() in ("1", "true", "yes", "on")
