@@ -421,6 +421,59 @@ def _infer_needs_lip_sync(speaker: str, text: str = "", emotion: str = "") -> bo
     return True
 
 
+# ── 三类 turn 区分 (silent_b PR) ──────────────────────────────────────────────
+# a_roll       说话人特写 + 对白 + 克隆音色 (needs_lip_sync=True)
+# narrated_b   空镜/远景/剪影 + 旁白 + 克隆音色 (needs_lip_sync=False, has dialogue)
+# silent_b     空镜/呼吸位 + 无 dialogue + 仅 BGM (needs_lip_sync=False, no dialogue)
+SILENT_B_SPEAKERS = {"(silent)", "silent", "(无)", "无对白", "空镜"}
+
+
+def _infer_turn_type(speaker: str, text: str = "", emotion: str = "", turn_type_hint: str = "") -> str:
+    """推断 turn 类型。优先级：explicit hint > rules。
+
+    返回 "a_roll" | "narrated_b" | "silent_b"
+    """
+    explicit = (turn_type_hint or "").strip().lower()
+    if explicit in ("a_roll", "narrated_b", "silent_b"):
+        return explicit
+    sp = str(speaker or "").strip()
+    txt = str(text or "").strip()
+    if not txt or sp in SILENT_B_SPEAKERS or sp.lower() in {"silent", "silent_b"}:
+        return "silent_b"
+    if "旁白" in sp or sp.lower() in ("narrator", "voiceover", "vo", "解说"):
+        return "narrated_b"
+    if _is_action_scene(txt):
+        return "narrated_b"
+    return "a_roll"
+
+
+def _resolve_turn_type(scene: dict) -> str:
+    """从 scene dict 取 turn_type；缺省时按 speaker/text/needs_lip_sync 兜底推断。"""
+    if not isinstance(scene, dict):
+        return "a_roll"
+    explicit = (scene.get("turn_type") or "").strip().lower()
+    if explicit in ("a_roll", "narrated_b", "silent_b"):
+        return explicit
+    speaker = scene.get("speaker", "") or ""
+    text = scene.get("text") or scene.get("dialogue") or ""
+    # 老 scene 没 turn_type 但有 needs_lip_sync：True → a_roll
+    if scene.get("needs_lip_sync") is True and str(text).strip():
+        return "a_roll"
+    return _infer_turn_type(speaker, text, scene.get("emotion", ""))
+
+
+def _is_silent_b(scene: dict) -> bool:
+    return _resolve_turn_type(scene) == "silent_b"
+
+
+def _is_narrated_b(scene: dict) -> bool:
+    return _resolve_turn_type(scene) == "narrated_b"
+
+
+def _is_a_roll(scene: dict) -> bool:
+    return _resolve_turn_type(scene) == "a_roll"
+
+
 def _voice_asset_id_for_speaker(speaker: str, gender: str | None = None) -> str:
     """根据 speaker name 关键字命中音色库的 voice_id；命中失败按 gender 走 fallback。"""
     s = str(speaker or "")
@@ -1948,6 +2001,17 @@ def _finalize_adsd_turns(turns: list[dict]) -> list[dict]:
                 turn.get("text", ""),
                 turn.get("emotion", ""),
             )
+        # 三类 turn 区分：a_roll / narrated_b / silent_b
+        if not turn.get("turn_type"):
+            turn["turn_type"] = _infer_turn_type(
+                turn.get("speaker", ""),
+                turn.get("text", ""),
+                turn.get("emotion", ""),
+                turn.get("turn_type_hint", ""),
+            )
+        # silent_b 的 needs_lip_sync 强制 False（保证下游 A-roll 路径不会误进）
+        if turn["turn_type"] == "silent_b":
+            turn["needs_lip_sync"] = False
     return turns
 
 
@@ -1993,6 +2057,7 @@ def _parse_adsd_override_turns(raw_lines: list[str], topic: str) -> list[dict]:
             else f"voice-over：画面展示与「{text[:40]}」相关的场景，镜头自由运动，无需出现说话人正脸"
         )
         inferred_emotion = _infer_emotion_from_text(text, speaker)
+        turn_type = _infer_turn_type(speaker, text, inferred_emotion)
         turns.append({
             "dialogue_turn": i + 1,
             "speaker": speaker,
@@ -2000,7 +2065,8 @@ def _parse_adsd_override_turns(raw_lines: list[str], topic: str) -> list[dict]:
             "speaker_id": voice["voice_id"],
             "speaker_name": voice["voice_name"],
             "voice_asset_id": voice_asset_id,
-            "needs_lip_sync": needs_lip_sync,
+            "needs_lip_sync": needs_lip_sync if turn_type != "silent_b" else False,
+            "turn_type": turn_type,
             "text": text,
             "shot": shot_desc,
             "emotion": inferred_emotion,
@@ -2074,55 +2140,158 @@ def _adsd_pov_contract() -> str:
 
 
 def _generate_adsd_dialogue_turns(topic: str, num_turns: int, tone: str, style_guide: str) -> list[dict]:
-    """Generate ADSD dialogue turns. Each turn becomes one TTS unit and one video segment."""
+    """Generate ADSD dialogue turns. Each turn becomes one TTS unit and one video segment.
+
+    三类 turn (silent_b PR):
+      a_roll       说话人特写 + 对白 (主导)
+      narrated_b   旁白 + 空镜/远景/剪影 (开场/结尾/关键转场，全片 ≤ 3)
+      silent_b     无对白 + 空镜呼吸位 (中段呼吸，仅 BGM)
+    """
     num_turns = max(4, min(12, num_turns))
     role_candidates = _adsd_role_candidates(topic)
     role_hint = " / ".join(role_candidates)
     fallback_role = role_candidates[0]
-    prompt = f"""你是 ADSD（ADS Dialogue）短剧化历史讲解编剧。
+    # narrated_b 全片硬上限：3（开场+结尾+最多 1 个关键转场）
+    max_narrated = min(3, num_turns // 4 + 2)
+    # silent_b 占比目标：20%-35%
+    min_silent = max(1, int(num_turns * 0.20))
+    max_silent = max(min_silent + 1, int(num_turns * 0.35))
 
+    def _build_prompt(retry_hint: str = "") -> str:
+        retry_block = f"\n【重试提醒】上一次输出违反约束：{retry_hint}\n请严格按以下规则重新生成。\n" if retry_hint else ""
+        return f"""你是 ADSD 纪录片编剧。{retry_block}
 主题：「{topic}」
-目标：生成 {num_turns} 句现场视角台词，用最适合剧情的说话结构把复杂历史讲给普通人听懂。
+目标：生成 {num_turns} 句视听节奏合理的纪录片镜头脚本。
 
-可用现场角色方向（可按题材微调，但必须是历史现场内的人）：
+【纪录片节奏铁律】
+旁白是「框架 + 标点」，不是「主体」。
+让说话人自己讲故事，让画面自己呼吸。
+不要每个镜头都塞旁白——观众会出戏。
+
+【三类 turn 区分】
+a_roll      说话人特写镜头 + 对白 + 角色音色
+            画面：说话人面部/半身入镜
+            用于：表达观点、冲突、情感
+            必须有 text
+
+narrated_b  旁白衔接镜头 + 空镜/远景/剪影 + 旁白音色
+            画面：可以有人但禁止嘴部特写
+                  推荐：剪影 / 背影 / 远景 / 群像 / 雕像 / 历史画卷
+            用于：开场 setup / 关键转场 / 结尾收口
+            必须有 text
+            speaker = "旁白"
+
+silent_b    氛围呼吸镜头 + 仅 BGM
+            画面：场景空镜 / 物件特写 / 环境氛围 / 远景人影
+            用于：中段呼吸 / 情绪沉淀 / 节奏调节
+            text = ""
+            speaker = "(silent)"
+            时长 3-6 秒（短）
+
+【硬约束】
+1. turn 1 必须是 narrated_b（开场 setup）
+2. turn {num_turns} 必须是 narrated_b（结尾收口）
+3. narrated_b 全片 ≤ {max_narrated} 个（含开场+结尾）
+4. silent_b 数量 ∈ [{min_silent}, {max_silent}]
+5. 任意两个 narrated_b 间距 ≥ 3 turn
+6. 中段（turn 2~{num_turns-1}）以 a_roll 为主，穿插 silent_b
+7. narrated_b 仅在「真转场」用：时间大跳 / 地点大跳 / 视角切换
+
+【可用现场角色方向】（用于 a_roll，按题材微调，必须是题材内部的人）
 {role_hint}
 
-你必须先在心里判断本题最适合哪种结构，但输出里不要解释：
-- 独白：一个当事人/见证人连续讲述，适合内心独白、临终陈述、密信、回忆录、案前陈词。
-- 双人对白：两个人一问一答，适合解释复杂背景、因果和专名。
-- 多人群像：3~4 个角色轮流发言，适合朝堂、街头、船上、战场、书院、报馆等多方在场的剧情。
+【输出字段】每项必须包含：
+- turn_type    "a_roll" | "narrated_b" | "silent_b"
+- speaker      a_roll: 角色名；narrated_b: "旁白"；silent_b: "(silent)"
+- voice_gender "male" | "female"；silent_b 写 "male"（不会用到，但保持字段）
+- visual_subject 12-30 词英文角色外形描述（同 speaker 跨 turn 一致；silent_b 写场景外形）
+- text         a_roll/narrated_b 中文对白 18-36 字；silent_b 写 ""
+- shot         中文画面描述（具体到地点/道具/动作）
+                a_roll: speaker 入镜说话
+                narrated_b: 必须写「无嘴部特写」类构图 (剪影/背影/远景/群像/雕像/画卷)
+                silent_b: 写空镜/物件/环境氛围
+- emotion      neutral / tense / solemn / explanatory（silent_b 写 "neutral"）
+- duration_hint 数字，秒
+                a_roll: 自适应（按 text 长度估算 3-10）
+                narrated_b: 6-12
+                silent_b: 3-6
+- broll_rule   仅 narrated_b/silent_b 填，单选：
+                narrated_b: silhouette | back_view | wide_shot | crowd | statue | historical_painting
+                silent_b:   empty_scene | object_close_up | environmental | distant_figure
+                a_roll: 写 ""
 
-硬性要求：
-1. 只输出 JSON 数组，不要 Markdown，不要解释。
-2. 数组长度必须正好 {num_turns}。
-3. 每项字段必须包含：speaker、voice_gender、visual_subject、text、shot、emotion。
-4. speaker 必须是现场角色名；全片使用 1~4 个 speaker。根据剧情需要可独白、双人或多人，不强制交替。
-5. **voice_gender 只能是 "male" 或 "female"**——这是 TTS 音色性别（即使角色是动物/机器人/抽象灵也必须二选一），同一 speaker 跨所有 turn 必须一致。
-6. **visual_subject 是 12-30 词英文，描述角色的视觉外形**——同一 speaker 跨所有 turn 必须一致。
-   - 真人：写性别 + 种族 + 年龄段 + 服饰 + 时代背景。例：`"an adult Han Chinese woman, qipao, 1920s Shanghai, soft natural light"`
-   - 动物 / 拟人动物：写具体物种 + 颜色 + 材质 + 是否拟人化。例：`"a worker bee queen, golden fuzz, translucent blue wings, anthropomorphic torso"`
-   - 机器人 / AI：写形态 + 材质 + 颜色 + 标志特征。例：`"an industrial robot, worn copper plating, glowing optical sensors, no human face"`
-   - 抽象/灵：写水墨/烟雾/光影 + 半透明形态。例：`"an ink-wash spirit, semi-transparent silhouette, drifting form"`
-7. text 是中文对白，每句 18~36 字，白话、直接、普通人能听懂。
-8. shot 是中文画面说明，要具体到地点、道具、人物动作；必须让当前 speaker 成为画面里的说话主体；如有其他角色，只作为倾听/反应对象。**shot 不需要再写性别**——visual_subject 已经锁定外形。
-9. emotion 只能从 neutral / tense / solemn / explanatory 中选。
-10. 严禁诗化表达、隐喻、金句、含蓄暗示、空泛大词。
-11. 每 2~3 句必须解释一个专名或因果。
-12. 结尾要把主题讲清楚，不要只煽情。
-13. 角色必须服务沉浸感：可以是时代内部的新闻人/报馆人/通讯员；是否跳戏由沉浸感审稿环节判断，不靠关键词硬禁。
-14. 这是"时代内部人物的现场视角"；镜头可以像观众站在现场旁听，而不是电视采访。
-{"15. 已启用 POV 现场旁听模式：shot 必须写出观众仿佛站在人群边、门口、案前、船边、廊下或帐内近距离看见当前 speaker 说话；不要写成记者出镜、直播、采访。" if ADSD_ONSITE_POV_MODE else ""}
-16. 不要为了凑人数而加角色；如果一个人讲最清楚，就用独白；如果多人在场更自然，才用多人。
+【画面禁忌】（narrated_b / silent_b）
+✗ 不能有「角色对镜头说话」
+✗ 不能有「嘴部特写」
+✗ 不能有「角色直接看镜头并张嘴」
 
-语言风格：
+【语言风格】
 {style_guide}
 
-输出示例格式：
+【输出格式】严格 JSON 数组，不要 Markdown，不要解释。
+
+【示例输出（混合三类）】
 [
-  {{"speaker":"{fallback_role}","voice_gender":"male","visual_subject":"an adult Han Chinese man, dark long robe, 1920s Shanghai street","text":"这张告示刚贴出来，街口的人全围过来了。","shot":"街口墙边，{fallback_role}指着新贴告示，旁人凝神看","emotion":"tense"}}
+  {{"turn_type":"narrated_b","speaker":"旁白","voice_gender":"male","visual_subject":"a documentary narrator voice","text":"这是开场的旁白设定背景。","shot":"远景城墙 + 士兵剪影行进，无嘴部特写","emotion":"solemn","duration_hint":8,"broll_rule":"silhouette"}},
+  {{"turn_type":"a_roll","speaker":"{fallback_role}","voice_gender":"male","visual_subject":"an adult Han Chinese man, dark robe, late Han era","text":"这件事必须现在做，不能再等。","shot":"室内案前，{fallback_role} 正脸入镜说话，半身","emotion":"tense","duration_hint":4,"broll_rule":""}},
+  {{"turn_type":"silent_b","speaker":"(silent)","voice_gender":"male","visual_subject":"an empty palace hall, dust in light beam","text":"","shot":"洛阳宫殿空镜，光影缓慢流转，无人","emotion":"neutral","duration_hint":4,"broll_rule":"empty_scene"}}
 ]"""
-    raw = chat("GEMINI_3_1_FLASH_LITE", "你只输出严格 JSON 数组。", prompt, max_tokens=2600, timeout=180)
-    arr = _extract_json_array(raw)
+
+    def _validate(arr: list[dict]) -> str:
+        if len(arr) != num_turns:
+            return f"句数不匹配：got {len(arr)}, need {num_turns}"
+        tts = [str((x or {}).get("turn_type", "")).strip().lower() for x in arr]
+        if tts[0] != "narrated_b":
+            return "turn 1 必须是 narrated_b（开场）"
+        if tts[-1] != "narrated_b":
+            return f"turn {num_turns} 必须是 narrated_b（结尾）"
+        n_narrated = sum(1 for t in tts if t == "narrated_b")
+        if n_narrated > max_narrated:
+            return f"narrated_b 数量 {n_narrated} 超过上限 {max_narrated}"
+        n_silent = sum(1 for t in tts if t == "silent_b")
+        if not (min_silent <= n_silent <= max_silent):
+            return f"silent_b 数量 {n_silent} 不在 [{min_silent}, {max_silent}]"
+        last_narrated = -10
+        for i, t in enumerate(tts):
+            if t == "narrated_b":
+                if i - last_narrated < 3:
+                    return f"narrated_b 间距违反：turn {last_narrated+1} 和 turn {i+1} 距离 < 3"
+                last_narrated = i
+        return ""
+
+    arr: list[dict] = []
+    last_err = ""
+    for attempt in range(2):
+        raw = chat("GEMINI_3_1_FLASH_LITE", "你只输出严格 JSON 数组。", _build_prompt(last_err), max_tokens=3000, timeout=180)
+        try:
+            arr = _extract_json_array(raw)
+        except Exception as e:
+            last_err = f"JSON 解析失败：{e}"
+            continue
+        last_err = _validate(arr)
+        if not last_err:
+            break
+        log(f"ADSD script-gen 重试 #{attempt+1}：{last_err}")
+
+    # 仍违反 → 强制后处理（多余 narrated_b → silent_b；缺少 silent_b → 改 narrated_b 为 silent）
+    if last_err and arr:
+        log(f"ADSD script-gen LLM 重试失败仍违反 ({last_err})，进入强制后处理")
+        narrated_idxs = [i for i, x in enumerate(arr) if str((x or {}).get("turn_type", "")).lower() == "narrated_b"]
+        # 保留首尾 narrated_b，中段超额转 silent_b
+        keep = set([0, num_turns - 1])
+        for idx in narrated_idxs:
+            if idx in keep:
+                continue
+            if len([i for i in narrated_idxs if i in keep]) >= max_narrated:
+                arr[idx] = {**arr[idx], "turn_type": "silent_b", "speaker": "(silent)", "text": "", "broll_rule": "environmental"}
+            else:
+                keep.add(idx)
+        # 重新检查
+        last_err2 = _validate(arr)
+        if last_err2:
+            log(f"ADSD script-gen 强制后处理仍违反：{last_err2}，使用原结果继续（下游兼容）")
+    if not arr:
+        raise RuntimeError(f"ADSD 脚本生成失败：{last_err}")
     if len(arr) != num_turns:
         raise RuntimeError(f"ADSD 对话句数不匹配：got {len(arr)}, need {num_turns}")
     turns = []
@@ -2131,31 +2300,48 @@ def _generate_adsd_dialogue_turns(topic: str, num_turns: int, tone: str, style_g
     speaker_gender_map: dict[str, str] = {}
     speaker_visual_map: dict[str, str] = {}
     for i, item in enumerate(arr):
+        turn_type_raw = str(item.get("turn_type", "")).strip().lower()
+        if turn_type_raw not in ("a_roll", "narrated_b", "silent_b"):
+            # 旧 LLM 未给 turn_type：按 speaker/text 推断
+            turn_type_raw = _infer_turn_type(str(item.get("speaker", "")), str(item.get("text", "")))
+        is_silent = (turn_type_raw == "silent_b")
+        is_narrated = (turn_type_raw == "narrated_b")
+
         speaker = str(item.get("speaker", "")).strip()
+        if is_silent:
+            speaker = "(silent)"
+        elif is_narrated:
+            speaker = "旁白" if not speaker or speaker == "(silent)" else speaker
         if not speaker:
             speaker = speakers_seen[i % len(speakers_seen)] if speakers_seen else fallback_role
-        if speaker not in speakers_seen and len(speakers_seen) < 4:
-            speakers_seen.append(speaker)
-        elif speaker not in speakers_seen:
-            speaker = speakers_seen[i % len(speakers_seen)] if speakers_seen else fallback_role
+        # silent_b / narrated_b 的 speaker 不挤占 a_roll 的 4 个 speaker 配额
+        if not is_silent and not is_narrated:
+            if speaker not in speakers_seen and len(speakers_seen) < 4:
+                speakers_seen.append(speaker)
+            elif speaker not in speakers_seen:
+                speaker = speakers_seen[i % len(speakers_seen)] if speakers_seen else fallback_role
         text = str(item.get("text", "")).strip()
         shot = str(item.get("shot", "")).strip()
         emotion = str(item.get("emotion", "neutral")).strip().lower()
-        # 白名单见 adr_data/emotion.py SUPPORTED_EMOTIONS（与 EMOTION_EXPRESSION_PHRASE 同步）
         if emotion not in _SUPPORTED_EMOTIONS:
             emotion = "neutral"
+        broll_rule = str(item.get("broll_rule", "")).strip().lower()
+        try:
+            duration_hint = float(item.get("duration_hint", 0) or 0)
+        except Exception:
+            duration_hint = 0.0
+        if duration_hint <= 0:
+            duration_hint = 4.0 if is_silent else (8.0 if is_narrated else 5.0)
 
-        # voice_gender：LLM 强约束（兼容旧字段名 gender）；缺失/非法则空，由 _voice_for_speaker 兜底推断
         gender_raw = str(item.get("voice_gender") or item.get("gender") or "").strip().lower()
         if gender_raw not in ("male", "female"):
             gender_raw = ""
         if speaker in speaker_gender_map:
             voice_gender = speaker_gender_map[speaker]
         else:
-            voice_gender = gender_raw or "male"  # 缺省 male，最终兜底
+            voice_gender = gender_raw or "male"
             speaker_gender_map[speaker] = voice_gender
 
-        # visual_subject：LLM 软建议，自由英文描述外形；缺失/过短保持空，由 visual_contract 兜底用 GENDER LOCK
         vs_raw = str(item.get("visual_subject") or "").strip()
         if len(vs_raw.split()) < 4 or len(vs_raw) > 300:
             vs_raw = ""
@@ -2166,19 +2352,27 @@ def _generate_adsd_dialogue_turns(topic: str, num_turns: int, tone: str, style_g
             if visual_subject:
                 speaker_visual_map[speaker] = visual_subject
 
-        if not text or len(text) > 80:
-            raise RuntimeError(f"ADSD 第 {i+1} 句台词异常：{text}")
+        # silent_b 允许 text 为空；a_roll/narrated_b 必须有 text
+        if is_silent:
+            text = ""
+        else:
+            if not text or len(text) > 80:
+                raise RuntimeError(f"ADSD 第 {i+1} 句台词异常：{text}")
         voice = _voice_for_speaker(speaker, voice_gender)
         turns.append({
             "dialogue_turn": i + 1,
+            "turn_type": turn_type_raw,
             "speaker": speaker,
             "voice_gender": voice_gender,
             "visual_subject": visual_subject,
             "speaker_id": voice["voice_id"],
             "speaker_name": voice["voice_name"],
             "text": text,
-            "shot": shot or f"{speaker}在现场说明材料",
+            "shot": shot or (f"空镜 + 环境氛围" if is_silent else (f"无嘴部特写：剪影/远景/群像" if is_narrated else f"{speaker}在现场说明材料")),
             "emotion": emotion,
+            "broll_rule": broll_rule,
+            "duration_hint": duration_hint,
+            "needs_lip_sync": (not is_silent and not is_narrated),
         })
     speakers = [t["speaker"] for t in turns if t.get("speaker")]
     shape = _adsd_dialogue_shape(speakers)
@@ -2192,6 +2386,7 @@ def _generate_adsd_dialogue_turns(topic: str, num_turns: int, tone: str, style_g
 def _adsd_immersion_qa_rewrite_turns(topic: str, turns: list[dict], role_candidates: list[str]) -> list[dict]:
     """Use LLM judgment to keep ADSD roles immersive without hard-banning period news roles."""
     try:
+        # silent_b / narrated_b 不参与 immersion QA：silent 没台词、narrated 是旁白不算「现场角色」
         compact = [
             {
                 "speaker": t.get("speaker", ""),
@@ -2201,7 +2396,10 @@ def _adsd_immersion_qa_rewrite_turns(topic: str, turns: list[dict], role_candida
                 "shot": t.get("shot", ""),
             }
             for t in turns
+            if _resolve_turn_type(t) == "a_roll"
         ]
+        if not compact:
+            return _finalize_adsd_turns(turns)
         prompt = f"""你是历史短视频 ADSD 的沉浸感审稿人。判断角色是否让观众跳戏。
 
 主题：{topic}
@@ -4168,7 +4366,19 @@ def step2_dialogue_voice(script: list[dict]) -> str:
             cursor += first_target
     timing_qa: list[dict] = []
     for i, turn in enumerate(script):
-        wav_path, dur, meta = _tts_turn_to_audio(turn, i)
+        if _is_silent_b(turn):
+            # silent_b 跳过 TTS API，直接生成 duration_hint 长度静音 wav 段
+            sb_dur = float(turn.get("duration_hint", 0.0) or 0.0)
+            if sb_dur < 1.0:
+                sb_dur = 4.0
+            sb_dur = min(max(sb_dur, 2.0), 8.0)  # silent_b 限 2-8s
+            wav_path = str(OUTPUT_DIR / f"silent_b_{i:02d}.wav")
+            ffmpeg("-f", "lavfi", "-i", "anullsrc=r=44100:cl=mono",
+                   "-t", f"{sb_dur:.3f}", "-c:a", "pcm_s16le", wav_path, timeout=30)
+            dur = sb_dur
+            meta = {"task_id": None, "cost_credits": 0, "mp3_path": None, "silent_b": True}
+        else:
+            wav_path, dur, meta = _tts_turn_to_audio(turn, i)
         # override timing 模式下：本 turn 录到 dialogue_audio 之后，下一段 silence 的长度由 timecode 决定
         target_start = turn.get("override_audio_start")
         target_end = turn.get("override_audio_end")
@@ -9770,6 +9980,41 @@ def _adsd_broll_motion_prompt(scene: dict, safe_retry: bool = False) -> str:
     )[:2000]
 
 
+def _adsd_silent_b_motion_prompt(scene: dict, safe_retry: bool = False) -> str:
+    """silent_b 专属 prompt：氛围呼吸位，无人说话，画面呼吸。
+
+    与 broll_motion 区别：
+      broll_motion (narrated_b) 是「有人但无嘴」(剪影/远景/群像/雕像)
+      silent_b 是「呼吸位」(空镜/物件/环境/远景人影渺小)
+    """
+    shot = scene.get("shot", "")
+    broll_rule = (scene.get("broll_rule") or "").strip().lower()
+    rule_emphasis = {
+        "empty_scene": "Empty scene composition: architecture, sky, water, light shafts. No human as primary subject.",
+        "object_close_up": "Object close-up: hero object centered, shallow depth of field, slow pull / push, no human face.",
+        "environmental": "Environmental atmosphere: weather, light, time-of-day, ambient particles, no character speaking.",
+        "distant_figure": "Distant figure(s) in wide shot: silhouettes / tiny humans against landscape, viewer cannot read mouth or face.",
+    }.get(broll_rule, "Atmospheric breath shot: contemplative pacing, no dialogue, no character looking at camera.")
+    _no_text_ban = (
+        "ABSOLUTELY NO TEXT IN FRAME: no subtitles, no captions, no chyron, no on-screen typography. "
+    )
+    base = (
+        f"{_no_text_ban}"
+        "Cinematic documentary breathing shot — pure atmospheric mood, no spoken dialogue, no lip-sync, no character close-up. "
+        f"{rule_emphasis} "
+        "Slow contemplative camera move (glide / slow push / hold). "
+        "Lighting: practical real-world sources with motivated shadows; mild film grain; lens vignette; soft depth of field. "
+        "Ambient kinetic life: dust motes, light flicker, water ripple, foliage drift, fabric breath, particles in air. "
+        "No synthetic smoothness — let it read as captured reality. "
+    )
+    if safe_retry:
+        return (base + "Scene unfolds without people speaking. No logos, no watermark.")[:2000]
+    return (base +
+        f"Scene: {shot or 'environmental cutaway, mood setting'}. "
+        "No speaker labels, no logos, no watermark, no branded style references."
+    )[:2000]
+
+
 def _adsd_almighty_audio_dub_prompt(scene: dict, safe_retry: bool = False) -> str:
     """Experimental: let Almighty Reference generate spoken audio from prompt text using uploaded audio as voice reference."""
     speaker = scene.get("speaker") or "speaker"
@@ -10249,12 +10494,16 @@ def _lip_sync_poll_download_and_process(idx: int, task_id: str, scene: dict, tar
 
 
 def _lip_sync_one_scene(idx: int, scene: dict, target_dur: float, aspect_ratio: str) -> tuple[int, bool, dict]:
-    # A-roll vs B-roll：旁白/voiceover 走 B-roll motion 模式，无 audio 锁主体；其他 speaker 走 A-roll lip-sync
+    # 三类 turn 分发：a_roll lip-sync / narrated_b 旁白克隆 (有 audio 但无嘴特写) / silent_b 纯 motion
     needs_lip = bool(scene.get("needs_lip_sync", True))
+    is_narrated = _is_narrated_b(scene)
+    is_silent = _is_silent_b(scene)
     turn_audio = scene.get("dialogue_audio_mp3") or scene.get("dialogue_audio")
-    if needs_lip and (not turn_audio or not os.path.exists(turn_audio)):
+    # silent_b 不需要 audio；a_roll / narrated_b 需要 TTS 音频做 audio_ref fallback
+    if (needs_lip or is_narrated) and (not turn_audio or not os.path.exists(turn_audio)):
         return idx, False, {"turn": idx + 1, "pass": False, "reason": "missing_turn_audio"}
-    if needs_lip:
+    if needs_lip or is_narrated:
+        # a_roll 和 narrated_b 都走 voice_asset 克隆音色（narrated_b 也用 LLM 挑的旁白音色）
         voice_asset_ref = _select_voice_asset_reference(scene)
         source_audio = voice_asset_ref["path"] if voice_asset_ref else turn_audio
     else:
@@ -10270,10 +10519,11 @@ def _lip_sync_one_scene(idx: int, scene: dict, target_dur: float, aspect_ratio: 
     scene["_almighty_reference_audio"] = source_audio
     scene["_almighty_reference_audio_role"] = (
         "voice_asset_timbre_reference" if voice_asset_ref
-        else ("turn_dialogue_audio" if needs_lip else "broll_no_audio")
+        else ("turn_dialogue_audio" if needs_lip else ("narrated_voice_clone" if is_narrated else "broll_no_audio"))
     )
     scene["_almighty_voice_asset_reference"] = voice_asset_ref
     scene["_b_roll_mode"] = not needs_lip
+    scene["_narrated_b_mode"] = is_narrated
     manual_repair_turns = _load_lips_change_requested_turns()
     repair_requested = ADSD_LIPS_CHANGE_REPAIR and ((idx + 1) in manual_repair_turns)
     repair_all = ADSD_LIPS_CHANGE_REPAIR and ADSD_LIPS_CHANGE_ALL
@@ -10302,7 +10552,8 @@ def _lip_sync_one_scene(idx: int, scene: dict, target_dur: float, aspect_ratio: 
                 alt_panel_urls.append(_upload_to_weryai(alt_path))
             except Exception as e:
                 log(f"[lip-sync {idx}] alt-speaker panel upload skipped: {e}")
-        audio_url = _upload_to_weryai(source_audio) if (needs_lip and source_audio) else None
+        # a_roll 和 narrated_b 都上传 audio_ref；silent_b 不传
+        audio_url = _upload_to_weryai(source_audio) if ((needs_lip or is_narrated) and source_audio) else None
         # 顺序约定: [character_sheet(身份锚)?, alt_panel(同speaker场景示例)..., image_url(当前帧)]
         # WERYDANCE 把最后一张视为渲染目标，前面的作 identity / consistency 提示
         ref_images: list[str] = []
@@ -10319,13 +10570,30 @@ def _lip_sync_one_scene(idx: int, scene: dict, target_dur: float, aspect_ratio: 
         api_dur = int(round(min(15, max(5, _char_min, _tts_dur))))
         fast_fallback_enabled = os.environ.get("ADR_WERYDANCE_FAST_FALLBACK", "1").strip().lower() not in ("0", "false", "no", "off")
         if not needs_lip:
-            # B-roll motion 模式：不传 audio，prompt 不锁主体，全员可动
-            variants = [
-                ("broll_motion", "WERYDANCE_2_0", _adsd_broll_motion_prompt(scene, safe_retry=False), "false"),
-                ("broll_motion_safe", "WERYDANCE_2_0", _adsd_broll_motion_prompt(scene, safe_retry=True), "false"),
-            ]
-            if fast_fallback_enabled:
-                variants.append(("broll_motion_fast", "WERYDANCE_2_0_FAST", _adsd_broll_motion_prompt(scene, safe_retry=True), "false"))
+            if is_silent:
+                # silent_b：纯 motion，无 audio，呼吸位 prompt
+                variants = [
+                    ("silent_b_motion", "WERYDANCE_2_0", _adsd_silent_b_motion_prompt(scene, safe_retry=False), "false"),
+                    ("silent_b_motion_safe", "WERYDANCE_2_0", _adsd_silent_b_motion_prompt(scene, safe_retry=True), "false"),
+                ]
+                if fast_fallback_enabled:
+                    variants.append(("silent_b_motion_fast", "WERYDANCE_2_0_FAST", _adsd_silent_b_motion_prompt(scene, safe_retry=True), "false"))
+            elif is_narrated and ADSD_ALMIGHTY_AUDIO_DUB_EXPERIMENT and audio_url:
+                # narrated_b：走 audio_dub 拿克隆旁白音色，画面用 broll prompt (无嘴部特写)
+                variants = [
+                    ("narrated_b_audio_dub", "WERYDANCE_2_0", _adsd_broll_motion_prompt(scene, safe_retry=False), "true"),
+                    ("narrated_b_motion_fallback", "WERYDANCE_2_0", _adsd_broll_motion_prompt(scene, safe_retry=True), "false"),
+                ]
+                if fast_fallback_enabled:
+                    variants.insert(1, ("narrated_b_audio_dub_safe", "WERYDANCE_2_0_FAST", _adsd_broll_motion_prompt(scene, safe_retry=True), "true"))
+            else:
+                # 兜底（旧 narrated_b 行为）：纯 motion 无 audio
+                variants = [
+                    ("broll_motion", "WERYDANCE_2_0", _adsd_broll_motion_prompt(scene, safe_retry=False), "false"),
+                    ("broll_motion_safe", "WERYDANCE_2_0", _adsd_broll_motion_prompt(scene, safe_retry=True), "false"),
+                ]
+                if fast_fallback_enabled:
+                    variants.append(("broll_motion_fast", "WERYDANCE_2_0_FAST", _adsd_broll_motion_prompt(scene, safe_retry=True), "false"))
         elif ADSD_ALMIGHTY_AUDIO_DUB_EXPERIMENT:
             variants = [
                 ("audio_dub_primary", "WERYDANCE_2_0", _adsd_almighty_audio_dub_prompt(scene, safe_retry=False), "true"),
@@ -10829,10 +11097,11 @@ def _build_voice_clone_hybrid_audio(script: list[dict], master_voice_path: str) 
     parts: list[str] = []
     work_dir = OUTPUT_DIR / "hybrid_audio_parts"
     work_dir.mkdir(exist_ok=True)
+    master_voice_dur = ffprobe_duration(master_voice_path)
+    silent_b_count = 0
     for i, scene in enumerate(script):
         needs_lip = bool(scene.get("needs_lip_sync", True))
         seg_path = scene.get("vid_path") or ""
-        audio_start = float(scene.get("audio_start", 0.0) or 0.0)
         vid_dur = float(scene.get("vid_duration", 0.0) or 0.0)
         if vid_dur <= 0:
             continue
@@ -10841,7 +11110,17 @@ def _build_voice_clone_hybrid_audio(script: list[dict], master_voice_path: str) 
             needs_lip and seg_path and os.path.exists(seg_path) and _has_audio_stream(seg_path)
         )
         try:
-            if a_roll_seg_has_audio:
+            if _is_silent_b(scene):
+                # silent_b 直接生成 vid_dur 长度静音段（不切 master_voice，因为本就无对白）
+                ffmpeg(
+                    "-f", "lavfi", "-i", f"anullsrc=channel_layout=mono:sample_rate=44100",
+                    "-t", f"{vid_dur:.3f}",
+                    "-c:a", "pcm_s16le",
+                    part_wav,
+                    timeout=30,
+                )
+                silent_b_count += 1
+            elif a_roll_seg_has_audio:
                 ffmpeg(
                     "-i", seg_path,
                     "-vn", "-ac", "1", "-ar", "44100",
@@ -10851,14 +11130,34 @@ def _build_voice_clone_hybrid_audio(script: list[dict], master_voice_path: str) 
                 )
                 a_roll_count += 1
             else:
-                ffmpeg(
-                    "-ss", f"{audio_start:.3f}", "-t", f"{vid_dur:.3f}",
-                    "-i", master_voice_path,
-                    "-ac", "1", "-ar", "44100",
-                    "-c:a", "pcm_s16le",
-                    part_wav,
-                    timeout=60,
-                )
+                # B-roll fallback：必须用原 master_voice 上的位置（retiming 前），
+                # 否则 retiming 把 cursor 推过 master_voice 总长，-ss 越界读空
+                mv_start = float(scene.get("_master_voice_start", scene.get("audio_start", 0.0)) or 0.0)
+                mv_dur = float(scene.get("_master_voice_dur", vid_dur) or vid_dur)
+                # 越界保护：mv_start 不能超 master_voice 总长，mv_dur 截到剩余可用区间
+                if master_voice_dur > 0:
+                    mv_start = min(mv_start, max(0.0, master_voice_dur - 0.1))
+                    mv_dur = min(mv_dur, master_voice_dur - mv_start)
+                if mv_dur <= 0:
+                    log(f"hybrid audio part {i} master_voice 越界，用静音填补 {vid_dur:.2f}s")
+                    ffmpeg(
+                        "-f", "lavfi", "-i", f"anullsrc=channel_layout=mono:sample_rate=44100",
+                        "-t", f"{vid_dur:.3f}",
+                        "-c:a", "pcm_s16le",
+                        part_wav,
+                        timeout=30,
+                    )
+                else:
+                    # 切 master_voice 区间，长度可能 < vid_dur，用 apad 补到 vid_dur 对齐 timeline
+                    ffmpeg(
+                        "-ss", f"{mv_start:.3f}", "-t", f"{mv_dur:.3f}",
+                        "-i", master_voice_path,
+                        "-af", f"apad=whole_dur={vid_dur:.3f}",
+                        "-ac", "1", "-ar", "44100",
+                        "-c:a", "pcm_s16le",
+                        part_wav,
+                        timeout=60,
+                    )
             if not os.path.exists(part_wav) or os.path.getsize(part_wav) < 1000:
                 log(f"hybrid audio part {i} 抽取异常，跳过")
                 continue
@@ -10899,8 +11198,53 @@ def _build_voice_clone_hybrid_audio(script: list[dict], master_voice_path: str) 
         return None
     if not os.path.exists(out_mp3) or os.path.getsize(out_mp3) < 1000:
         return None
-    log(f"hybrid voice-clone master audio built ({a_roll_count} A-roll cloned, {len(parts)-a_roll_count} B-roll fallback)：{out_mp3}")
+    log(f"hybrid voice-clone master audio built ({a_roll_count} A-roll cloned, {silent_b_count} silent_b 静音, {len(parts)-a_roll_count-silent_b_count} narrated_b fallback)：{out_mp3}")
     return out_mp3
+
+
+# ── silent_b BGM 动态浮起：silent_b 区间 BGM 音量 +40%（让 BGM 接管呼吸位）───
+def _build_dynamic_bgm(script: list[dict], bgm_path: str | None) -> str | None:
+    """收集 silent_b 时间区间，在这些区间把 BGM 音量从基础 0.6 提升到 0.85。
+
+    实现：用 ffmpeg volume filter 的 timeline 表达式，按 between(t,T0,T1) 叠加 boost。
+    基础音量 0.6（保持 step9 mux 时还会乘 step9 自己的 0.6 → 总 0.36，差不多 BGM 背景级别）
+    silent_b 区间 0.85（step9 再乘 0.6 → 0.51，明显高于背景级别）
+    返回 hybrid_bgm.mp3 路径；无 silent_b 或失败返回 None（让 step9 用原 bgm_path）。
+    """
+    if not bgm_path or not os.path.exists(bgm_path):
+        return None
+    silent_ranges: list[tuple[float, float]] = []
+    for scene in script:
+        if not _is_silent_b(scene):
+            continue
+        t0 = float(scene.get("audio_start", 0.0) or 0.0)
+        dur = float(scene.get("vid_duration", scene.get("dur", 0.0)) or 0.0)
+        if dur <= 0:
+            continue
+        silent_ranges.append((t0, t0 + dur))
+    if not silent_ranges:
+        return None
+    # 构造 between(t,T0_i,T1_i) 叠加表达式
+    base = 1.0
+    boost = 0.4  # silent_b 区 BGM 整体 +40%
+    expr_terms = [f"{base:.3f}"] + [f"{boost:.3f}*between(t,{t0:.3f},{t1:.3f})" for t0, t1 in silent_ranges]
+    vol_expr = "+".join(expr_terms)
+    out_path = str(OUTPUT_DIR / "hybrid_bgm.mp3")
+    try:
+        ffmpeg(
+            "-i", bgm_path,
+            "-af", f"volume='{vol_expr}':eval=frame",
+            "-c:a", "libmp3lame", "-b:a", "192k",
+            out_path,
+            timeout=90,
+        )
+    except Exception as e:
+        log(f"dynamic BGM 构建失败（回退原 BGM）：{e}")
+        return None
+    if not os.path.exists(out_path) or os.path.getsize(out_path) < 1000:
+        return None
+    log(f"dynamic BGM built ({len(silent_ranges)} silent_b 区间浮起 +{int(boost*100)}%)：{out_path}")
+    return out_path
 
 
 # ── 第七步：拼接视频轨 ────────────────────────────────────────────────────────
@@ -11346,8 +11690,17 @@ Style: Default,Arial Unicode MS,{SUBTITLE_FONTSIZE},&H00FFFFFF,&H000000FF,&H0000
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 """
     # LLM 智能断句（一次调用处理所有台词），失败则规则兜底
-    all_texts = [s['text'] for s in script]
-    llm_result = _llm_split_subtitles(all_texts, SUBTITLE_MAX_CHARS)
+    # silent_b 不出字幕：text 为空，不进 LLM 断句也不写 dialogue 行
+    subtitled_idxs = [i for i, s in enumerate(script) if not _is_silent_b(s) and str(s.get('text', '')).strip()]
+    all_texts = [script[i]['text'] for i in subtitled_idxs]
+    llm_result_compact = _llm_split_subtitles(all_texts, SUBTITLE_MAX_CHARS) if all_texts else None
+    # llm_result 按全 script idx 对齐：silent_b 对应位置填 None
+    llm_result: list | None = None
+    if llm_result_compact is not None:
+        llm_result = [None] * len(script)
+        for compact_i, orig_i in enumerate(subtitled_idxs):
+            if compact_i < len(llm_result_compact):
+                llm_result[orig_i] = llm_result_compact[compact_i]
 
     with open(ass_path, "w", encoding="utf-8") as f:
         f.write(header)
@@ -11356,12 +11709,15 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 
         for idx, s in enumerate(script):
             turn = idx + 1
+            if _is_silent_b(s) or not str(s.get('text', '')).strip():
+                # silent_b / 空 text：跳过字幕行
+                continue
             if turn in werydance_caption_turns:
                 werydance_captioned_turns.append(turn)
                 continue
             ass_fallback_turns.append(turn)
             t_start, t_end = s['sub_start'], s['sub_end']
-            if llm_result and idx < len(llm_result):
+            if llm_result and idx < len(llm_result) and llm_result[idx]:
                 segments = [_clean_display(line) for line in llm_result[idx]]
             else:
                 segments = [_clean_display(line) for line in _rule_split(s['text'], SUBTITLE_MAX_CHARS)]
@@ -13695,6 +14051,15 @@ def main():
             tg("⏭️ BGM-only 模式：跳过字幕生成与字幕烧录")
         else:
             t = time.time(); ass_path = step8_subtitles(script);              timings["字幕生成"] = time.time() - t
+        # silent_b BGM 动态浮起：在 silent_b 区间 BGM 音量 +40%
+        if ADS_DIALOGUE_MODE and bgm_path:
+            try:
+                dyn_bgm = _build_dynamic_bgm(script, bgm_path)
+                if dyn_bgm:
+                    bgm_path = dyn_bgm
+                    tg(f"🎵 BGM 动态浮起：silent_b 区间音量 +40%（呼吸位 BGM 接管）")
+            except Exception as e:
+                log(f"动态 BGM 构建异常（保留原 BGM）：{e}")
         t = time.time(); final_path = step9_render(raw_path, voice_path, bgm_path, ass_path, topic); timings["最终合成"] = time.time() - t
         t = time.time(); step10_deliver(final_path, topic, script);           timings["TG 推送"] = time.time() - t
 
