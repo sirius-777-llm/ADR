@@ -10794,7 +10794,12 @@ def _retime_after_audio_dub(script: list[dict]) -> int:
         seg_dur = ffprobe_duration(seg_path)
         if seg_dur <= 0:
             continue
+        old_start = float(scene.get("audio_start", 0.0) or 0.0)
         old_dur = float(scene.get("vid_duration", 0.0) or 0.0)
+        # 保存原 master_voice 上的位置：hybrid B-roll fallback 切 master_voice 时要用
+        # 否则 retiming 后 cursor 移位，按新 audio_start 切 master_voice 会越界（master_voice 时长未变）
+        scene["_master_voice_start"] = old_start
+        scene["_master_voice_dur"] = old_dur
         if seg_dur > old_dur + 0.05:
             extended += 1
         scene["audio_start"] = cursor
