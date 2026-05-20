@@ -1272,7 +1272,32 @@ def _is_rate_limited_response(resp: dict) -> bool:
     )
 
 
+# GPT_IMAGE_2 画质修正后缀（实测能有效消除颗粒感/脏感）
+# 大哥 2026-05-20 给的固定 suffix，避免逐处 prompt 都改
+GPT_IMAGE2_QUALITY_SUFFIX = (
+    " clean illustration, smooth shading, soft lighting, controlled details, "
+    "minimal texture, high clarity, refined edges, smooth gradients "
+    "-- no noise, grain, artifacts, high frequency detail, dirty texture, "
+    "oversharpen, blotchy, chaotic details"
+)
+
+
+def _inject_image2_quality_suffix(payload: dict) -> dict:
+    """所有 GPT_IMAGE_2 prompt 自动追加画质修正后缀（去颗粒感/去脏感）。"""
+    if payload.get("model") != "GPT_IMAGE_2":
+        return payload
+    prompt = payload.get("prompt", "")
+    if not prompt or "clean illustration" in prompt:
+        return payload
+    # GPT_IMAGE_2 prompt 上限 5000 字符。suffix ~250 → 留余量
+    max_prompt = 5000 - len(GPT_IMAGE2_QUALITY_SUFFIX) - 10
+    if len(prompt) > max_prompt:
+        prompt = prompt[:max_prompt]
+    return {**payload, "prompt": prompt + GPT_IMAGE2_QUALITY_SUFFIX}
+
+
 def submit_text_to_image(payload: dict, label: str, timeout: int = 45, max_attempts: int | None = None) -> dict:
+    payload = _inject_image2_quality_suffix(payload)
     attempts = max_attempts or max(1, int(os.environ.get("ADR_IMAGE_SUBMIT_RETRIES", "5")))
     base_backoff = max(1.0, float(os.environ.get("ADR_IMAGE_RATE_LIMIT_BACKOFF", str(IMAGE_RATE_LIMIT_BACKOFF))))
     last_resp: dict | None = None
@@ -10041,6 +10066,50 @@ def _adsd_silent_b_motion_prompt(scene: dict, safe_retry: bool = False) -> str:
     )[:2000]
 
 
+def _adsd_narrated_b_audio_dub_prompt(scene: dict, safe_retry: bool = False) -> str:
+    """narrated_b 旁白 audio_dub 专属 prompt：
+    含 dialogue text 让 WERYDANCE 知道说什么（关键！否则它会脑补杂音）
+    但不要 lip-sync 强约束（旁白画面无嘴部特写：剪影/远景/雕像）
+    """
+    dialogue = re.sub(r"\s+", " ", str(scene.get("text") or "")).strip()[:220]
+    shot = scene.get("shot", "")
+    broll_rule = (scene.get("broll_rule") or "").strip().lower()
+    rule_emphasis = {
+        "silhouette": "Characters as silhouettes against bright backdrop, no facial detail visible.",
+        "back_view": "Characters viewed from behind, no face shown.",
+        "wide_shot": "Extreme wide shot, characters tiny against landscape, no readable mouth.",
+        "crowd": "Group of people in wide framing, no single mouth focus.",
+        "statue": "Statue or monument as primary subject, no living mouth visible.",
+        "historical_painting": "Historical painting / scroll imagery, painted figures, no real-time mouth animation.",
+    }.get(broll_rule, "Background voice-over shot: subjects framed without mouth close-up.")
+    _no_text_ban = (
+        "ABSOLUTELY NO TEXT IN FRAME: no subtitles, no captions, no on-screen typography. "
+    )
+    if safe_retry:
+        return (
+            f"{_no_text_ban}"
+            "Create a Chinese documentary voice-over scene with generated narrator audio. "
+            "Use the uploaded audio purely as voice timbre / speaking-style reference. "
+            f"{_adsd_gender_lock_phrase(scene.get('voice_gender'))} "
+            f"Generate clear Mandarin narration speaking exactly this Chinese line: 「{dialogue}」. "
+            f"{rule_emphasis} No close-up mouth animation needed (voice-over, not lip-sync). "
+            "No speaker labels, no logos, no watermarks."
+        )[:1500]
+    return (
+        f"{_no_text_ban}"
+        "Create a Chinese historical documentary voice-over shot with generated narrator audio. "
+        "Use uploaded audio as voice timbre, pace, age impression, and emotional delivery reference only. "
+        "Generate clear Mandarin narration synchronized to the scene atmosphere (not lip-sync). "
+        "Use uploaded image references only to lock era, location, lighting, costume style. "
+        f"{_adsd_gender_lock_phrase(scene.get('voice_gender'))} "
+        f"The narrator speaks exactly this Chinese line: 「{dialogue}」. "
+        f"Scene action: {shot}. {rule_emphasis} "
+        "No character speaks directly to camera; no mouth close-up; this is voice-over over atmospheric footage. "
+        "Camera: slow contemplative documentary handheld or gimbal glide. "
+        "No speaker labels, no logos, no watermarks, no branded style."
+    )[:1500]
+
+
 def _adsd_almighty_audio_dub_prompt(scene: dict, safe_retry: bool = False) -> str:
     """Experimental: let Almighty Reference generate spoken audio from prompt text using uploaded audio as voice reference."""
     speaker = scene.get("speaker") or "speaker"
@@ -10657,13 +10726,15 @@ def _lip_sync_one_scene(idx: int, scene: dict, target_dur: float, aspect_ratio: 
                 if fast_fallback_enabled:
                     variants.append(("silent_b_motion_fast", "WERYDANCE_2_0_FAST", _adsd_silent_b_motion_prompt(scene, safe_retry=True), "false"))
             elif is_narrated and ADSD_ALMIGHTY_AUDIO_DUB_EXPERIMENT and audio_url:
-                # narrated_b：走 audio_dub 拿克隆旁白音色，画面用 broll prompt (无嘴部特写)
+                # narrated_b：走 audio_dub 拿克隆旁白音色 + 含 dialogue text 的专属 prompt
+                # (之前用 broll prompt 没 dialogue text 导致 WERYDANCE 脑补杂音)
                 variants = [
-                    ("narrated_b_audio_dub", "WERYDANCE_2_0", _adsd_broll_motion_prompt(scene, safe_retry=False), "true"),
+                    ("narrated_b_audio_dub", "WERYDANCE_2_0", _adsd_narrated_b_audio_dub_prompt(scene, safe_retry=False), "true"),
+                    ("narrated_b_audio_dub_safe", "WERYDANCE_2_0", _adsd_narrated_b_audio_dub_prompt(scene, safe_retry=True), "true"),
                     ("narrated_b_motion_fallback", "WERYDANCE_2_0", _adsd_broll_motion_prompt(scene, safe_retry=True), "false"),
                 ]
                 if fast_fallback_enabled:
-                    variants.insert(1, ("narrated_b_audio_dub_safe", "WERYDANCE_2_0_FAST", _adsd_broll_motion_prompt(scene, safe_retry=True), "true"))
+                    variants.insert(2, ("narrated_b_audio_dub_fast", "WERYDANCE_2_0_FAST", _adsd_narrated_b_audio_dub_prompt(scene, safe_retry=True), "true"))
             else:
                 # 兜底（旧 narrated_b 行为）：纯 motion 无 audio
                 variants = [
@@ -13552,13 +13623,13 @@ def _generate_cover_image(topic: str, short_title: str, script: list[dict]) -> s
         _wait_image_submit_slot("封面")
         resp = req_post(
             "/generation/text-to-image",
-            {
+            _inject_image2_quality_suffix({
                 "model": _m,
                 "prompt": cover_prompt,
                 "aspect_ratio": _ar,
                 "image_number": 1,
                 **_extra,
-            },
+            }),
             timeout=30,
         )
         data = resp.get("data", {})
