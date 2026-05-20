@@ -2207,6 +2207,8 @@ def _generate_adsd_dialogue_turns(topic: str, num_turns: int, tone: str, style_g
     role_candidates = _adsd_role_candidates(topic)
     role_hint = " / ".join(role_candidates)
     fallback_role = role_candidates[0]
+    # Speaker IP 关系网络注入：扫描 topic + role_candidates 找匹配 IP，提供关系上下文
+    ip_relationships_block = _build_speaker_ip_context_for_script(topic, role_candidates)
     # narrated_b 全片硬上限：3（开场+结尾+最多 1 个关键转场）
     max_narrated = min(3, num_turns // 4 + 2)
     # silent_b 占比目标：20%-35%
@@ -2218,6 +2220,7 @@ def _generate_adsd_dialogue_turns(topic: str, num_turns: int, tone: str, style_g
         return f"""你是 ADSD 纪录片编剧。{retry_block}
 主题：「{topic}」
 目标：生成 {num_turns} 句视听节奏合理的纪录片镜头脚本。
+{ip_relationships_block}
 
 【纪录片节奏铁律】
 旁白是「框架 + 标点」，不是「主体」。
@@ -6359,12 +6362,118 @@ def _match_speaker_ip(speaker: str) -> dict | None:
     return None
 
 
+def _build_speaker_ip_context_for_script(topic: str, role_candidates: list[str]) -> str:
+    """C · 角色关系网络：扫描 topic 和 role_candidates 找到相关 IP，
+    返回一段 prompt 注入文本，含每个 IP 的性格 + catchphrases + 与其他角色关系。
+    让 LLM 写台词时利用关系冲突 → 戏剧张力 ↑
+    """
+    matched: list[dict] = []
+    seen_speakers: set[str] = set()
+    # 从 topic 中匹配
+    for ip_name, ip in _list_speaker_ips().items():
+        if not ip_name or ip_name in seen_speakers:
+            continue
+        in_topic = ip_name in topic
+        in_topic = in_topic or any(a in topic for a in (ip.get("aliases") or []))
+        in_roles = ip_name in role_candidates
+        if in_topic or in_roles:
+            matched.append(ip)
+            seen_speakers.add(ip_name)
+    if not matched:
+        return ""
+    lines = ["\n【已知角色档案 (Speaker IP)】"]
+    for ip in matched:
+        sp = ip.get("speaker", "")
+        person_lines = [f"- {sp}"]
+        if ip.get("personality"):
+            person_lines.append(f"  性格: {' / '.join(ip['personality'][:4])}")
+        if ip.get("catchphrases"):
+            cps = ip["catchphrases"][:2]
+            person_lines.append(f"  标志台词参考（可化用，避免直接照搬名句）: {' | '.join(cps)}")
+        rels = ip.get("relationships") or {}
+        if rels:
+            other_known = [f"{k}={v}" for k, v in rels.items() if k in seen_speakers]
+            if other_known:
+                person_lines.append(f"  与其他出场角色关系: {' / '.join(other_known)}")
+        if ip.get("era"):
+            person_lines.append(f"  时代: {ip['era']}")
+        lines.extend(person_lines)
+        # B · usage_history 注入：让 LLM 看到该 speaker 之前说过的避免重复
+        history_block = _format_speaker_usage_history_for_prompt(sp, max_lines=6)
+        if history_block:
+            lines.append(history_block)
+    lines.append("\n请充分利用角色档案中的「性格」「关系」让台词有戏剧张力——")
+    lines.append("不同角色对同一件事的看法应反映其性格 + 与其他角色的关系。")
+    lines.append("台词不要直接照搬「标志台词」——可化用其精神或写成同主题的新台词。\n")
+    return "\n".join(lines)
+
+
 def _save_speaker_ip(speaker: str, ip_dict: dict) -> Path:
     """写入 / 更新 speaker IP json。"""
     safe = re.sub(r"[^一-龥A-Za-z0-9]", "", speaker)[:30] or "speaker"
     p = _speaker_ips_dir() / f"{safe}.json"
     p.write_text(json.dumps(ip_dict, ensure_ascii=False, indent=2), encoding="utf-8")
     return p
+
+
+def _record_speaker_usage_history(script: list[dict], topic: str, run_id: str) -> None:
+    """B · 自学习 (2026-05-21): 跑成功后回写每个 speaker 的 usage_history。
+
+    LLM 下次生成同 speaker 台词时看历史 → 避免重复 + 统计 audit 触发关键词。
+    每 IP 保留最近 N 条历史（默认 30），按 turn 简化记录。
+    """
+    if not script:
+        return
+    max_history = int(os.environ.get("ADR_SPEAKER_IP_USAGE_HISTORY_MAX", "30"))
+    by_speaker: dict[str, list[dict]] = {}
+    for s in script:
+        speaker = (s.get("speaker") or "").strip()
+        if not speaker or _is_silent_b(s):
+            continue
+        record = {
+            "run_id": run_id,
+            "topic": topic,
+            "turn": s.get("dialogue_turn") or 0,
+            "turn_type": _resolve_turn_type(s),
+            "text": (s.get("text") or "")[:120],
+            "costume": _infer_meta_grid_costume(s) if not _is_silent_b(s) else "",
+            "pose": _infer_meta_grid_pose(s) if not _is_silent_b(s) else "",
+            "emotion": s.get("emotion", ""),
+            "audit_retried": bool(s.get("_audit_retry", False)),
+        }
+        by_speaker.setdefault(speaker, []).append(record)
+    for speaker, records in by_speaker.items():
+        ip = _match_speaker_ip(speaker)
+        if not ip:
+            continue
+        history = ip.get("usage_history") or []
+        history.extend(records)
+        if len(history) > max_history:
+            history = history[-max_history:]
+        ip["usage_history"] = history
+        try:
+            _save_speaker_ip(ip.get("speaker", speaker), ip)
+            log(f"Speaker IP usage_history: {speaker} +{len(records)} 条 (总 {len(history)})")
+        except Exception as e:
+            log(f"Speaker IP usage_history 写入失败 {speaker}：{e}")
+
+
+def _format_speaker_usage_history_for_prompt(speaker: str, max_lines: int = 8) -> str:
+    """格式化 speaker 的 usage_history 摘要供 LLM 注入。"""
+    ip = _match_speaker_ip(speaker)
+    if not ip:
+        return ""
+    history = ip.get("usage_history") or []
+    if not history:
+        return ""
+    recent = history[-max_lines:]
+    lines = [f"  {speaker} 之前在 ADR 里说过的（避免直接重复）："]
+    for h in recent:
+        topic = h.get("topic", "")
+        text = h.get("text", "")
+        if text:
+            lines.append(f"    · 「{text}」（{topic} 片中）")
+    return "\n".join(lines)
 
 
 def _character_meta_grid_cache_dir() -> Path:
@@ -14820,6 +14929,12 @@ def main():
                 log(f"动态 BGM 构建异常（保留原 BGM）：{e}")
         t = time.time(); final_path = step9_render(raw_path, voice_path, bgm_path, ass_path, topic); timings["最终合成"] = time.time() - t
         t = time.time(); step10_deliver(final_path, topic, script);           timings["TG 推送"] = time.time() - t
+        # B · Speaker IP 自学习：跑完后回写 usage_history
+        try:
+            run_id = OUTPUT_DIR.name
+            _record_speaker_usage_history(script, topic, run_id)
+        except Exception as e:
+            log(f"Speaker IP 自学习回写失败（不影响）：{e}")
 
         total_min = (time.time() - t_start) / 60
         summary = "\n".join(f"  {k}：{v/60:.1f} min" for k, v in timings.items())
