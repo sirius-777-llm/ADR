@@ -6299,8 +6299,22 @@ def _adsd_meta_grid_call_prompt(scene: dict) -> str:
     )[:1500]
 
 
+def _character_meta_grid_cache_dir() -> Path:
+    """人设符 grid 跨 run 缓存目录（按 speaker name hash 文件名复用）。
+    避免同一 speaker 跨多次 ADR run 重复生成。"""
+    p = Path(__file__).resolve().parent / "voice_assets" / "character_meta_grids"
+    p.mkdir(parents=True, exist_ok=True)
+    return p
+
+
+def _character_meta_grid_cache_path(speaker: str) -> Path:
+    """speaker 的 meta_grid 跨 run 缓存路径。"""
+    safe = re.sub(r"[^一-龥A-Za-z0-9]", "", speaker)[:30] or "speaker"
+    return _character_meta_grid_cache_dir() / f"{safe}.png"
+
+
 def _character_meta_grid_path(speaker: str) -> Path:
-    """每个 speaker 的人设符 grid 标准路径。"""
+    """每个 speaker 的人设符 grid 标准路径（当前 OUTPUT_DIR）。"""
     safe = re.sub(r"[^一-龥A-Za-z0-9]", "", speaker)[:20] or "speaker"
     return OUTPUT_DIR / f"meta_grid_{safe}.png"
 
@@ -6315,6 +6329,17 @@ def generate_character_meta_grid_gpt_image2(speaker: str, visual_subject: str, v
     if out_path.exists() and out_path.stat().st_size > 100000:
         log(f"reuse existing meta_grid: {out_path}")
         return str(out_path)
+    # 方向 4: 先查跨 run 缓存（voice_assets/character_meta_grids/{speaker}.png）
+    cache_path = _character_meta_grid_cache_path(speaker)
+    use_cache = os.environ.get("ADR_META_GRID_CACHE", "1").strip().lower() not in ("0", "false", "no", "off")
+    if use_cache and cache_path.exists() and cache_path.stat().st_size > 100000:
+        try:
+            from shutil import copyfile
+            copyfile(cache_path, out_path)
+            log(f"方向 4: meta_grid {speaker} 从跨 run 缓存复用 ({cache_path.stat().st_size // 1024} KB)")
+            return str(out_path)
+        except Exception as e:
+            log(f"meta_grid 缓存复用失败（重新生成）：{e}")
     subject = visual_subject or "an adult Chinese historical figure"
     grid_prompt = (
         f"生成 4 列 × 3 行 人设符参考图，12 个独立 cell，细金色边框。\n"
@@ -6363,6 +6388,14 @@ def generate_character_meta_grid_gpt_image2(speaker: str, visual_subject: str, v
     urllib.request.urlretrieve(urls[0], out_path)
     if out_path.exists() and out_path.stat().st_size > 100000:
         log(f"meta_grid {speaker} ✓ ({out_path.stat().st_size // 1024} KB)：{out_path}")
+        # 方向 4: 存入跨 run 缓存供下次复用
+        if use_cache:
+            try:
+                from shutil import copyfile
+                copyfile(out_path, cache_path)
+                log(f"方向 4: meta_grid {speaker} 已存入缓存 {cache_path}")
+            except Exception as e:
+                log(f"meta_grid 缓存写入失败（不影响）：{e}")
         return str(out_path)
     return None
 
@@ -7333,21 +7366,57 @@ def step6_parallel(script: list[dict], topic: str, pregenerated_bgm_path: str | 
 
         completed = {}  # idx -> True
         approval_sent = set()  # 已推过审批的 idx，避免兜底重发
-        generate_character_sheet_gpt_image2(script, topic)
-        # 人设符 PR (Phase 4)：每个 a_roll/narrated_b unique speaker 并发生成 meta_grid
-        if (
+        # 人设符路径生效时跳过 sidecar QA 图（减时间 ROI）
+        meta_grid_active = (
             ADS_DIALOGUE_MODE and ADSD_LIP_SYNC_EXPERIMENT
             and os.environ.get("ADR_USE_CHARACTER_META_GRID", "1").strip().lower() not in ("0", "false", "no", "off")
-        ):
+        )
+        # 方向 2: 人设符模式下 character_sheet 由 meta_grid 替代，可跳过
+        skip_character_sheet = (
+            meta_grid_active
+            and os.environ.get("ADR_SKIP_CHARACTER_SHEET", "1").strip().lower() not in ("0", "false", "no", "off")
+        )
+        # 方向 1: production_storyboard_page 是 sidecar QA，可关
+        skip_production_sb = os.environ.get("ADR_SKIP_PRODUCTION_STORYBOARD", "1").strip().lower() not in ("0", "false", "no", "off")
+        # 方向 1: motion_bridge_refs 是 sidecar QA，可关
+        skip_motion_bridge = os.environ.get("ADR_SKIP_MOTION_BRIDGE", "1").strip().lower() not in ("0", "false", "no", "off")
+        # 方向 3: 人设符模式下 storyboard_grid 切的 panel 主路径不再用（meta_grid_call variant 用单 grid）
+        # 仅 fallback 切片路径需要 → 默认人设符模式跳过 storyboard_grid
+        skip_storyboard_grid = (
+            meta_grid_active
+            and os.environ.get("ADR_SKIP_STORYBOARD_GRID_WHEN_META", "1").strip().lower() not in ("0", "false", "no", "off")
+        )
+
+        if not skip_character_sheet:
+            generate_character_sheet_gpt_image2(script, topic)
+        else:
+            log("方向 2: 人设符模式 → 跳过 character_sheet 生成 (meta_grid 已含全视角)")
+        # 人设符 PR (Phase 4)：每个 a_roll/narrated_b unique speaker 并发生成 meta_grid
+        if meta_grid_active:
             try:
                 _generate_all_character_meta_grids(script, ex)
             except Exception as e:
                 log(f"人设符 meta_grid 并发生成失败（fallback 切片路径）：{e}")
-        generate_production_storyboard_page_gpt_image2(script, topic)
-        storyboard_used = generate_storyboard_grid_gpt_image2(script, topic) or generate_storyboard_images_gpt_image2(script, topic)
+        if not skip_production_sb:
+            generate_production_storyboard_page_gpt_image2(script, topic)
+        else:
+            log("方向 1: 跳过 production_storyboard_page sidecar QA")
+        if skip_storyboard_grid:
+            log("方向 3: 人设符模式 → 跳过 storyboard_grid (主路径用 meta_grid 不需要切 panel)")
+            storyboard_used = False
+            # 人设符路径下 img_path 没人用，但 step345/step8 可能引用，需要 placeholder
+            # 把 img_path 指向该 turn speaker 的 meta_grid（最坏 fallback 用）
+            for i, scene in enumerate(script):
+                if not scene.get("img_path"):
+                    scene["img_path"] = str(OUTPUT_DIR / f"img_{i}.jpg")
+        else:
+            storyboard_used = generate_storyboard_grid_gpt_image2(script, topic) or generate_storyboard_images_gpt_image2(script, topic)
         if storyboard_used:
             completed = {i: True for i in range(n)}
-            generate_motion_bridge_refs_gpt_image2(script, topic)
+            if not skip_motion_bridge:
+                generate_motion_bridge_refs_gpt_image2(script, topic)
+            else:
+                log("方向 1: 跳过 motion_bridge_refs sidecar QA")
             if not SKIP_APPROVAL:
                 for idx in range(n):
                     _send_for_approval(script[idx]["img_path"], idx, script[idx])
@@ -7402,7 +7471,7 @@ def step6_parallel(script: list[dict], topic: str, pregenerated_bgm_path: str | 
                 except Exception as e:
                     raise RuntimeError(f"图 {idx+1} 兜底失败: {e}")
 
-        if not storyboard_used:
+        if not storyboard_used and not skip_motion_bridge:
             generate_motion_bridge_refs_gpt_image2(script, topic)
 
         generate_gpt_image2_direct_annotated_storyboards(script, topic)
