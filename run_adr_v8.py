@@ -10144,6 +10144,28 @@ def _postprocess_lip_sync_segment(src_video: str, scene: dict, target_dur: float
     return os.path.exists(vid_path) and os.path.getsize(vid_path) > 10000
 
 
+def _detect_audio_leading_silence(src_video: str, threshold_db: int = -30, min_silence: float = 0.5) -> float:
+    """检测视频音轨开头的静音长度（秒）。用于 trim WERYDANCE audio_dub leading silence。"""
+    try:
+        proc = subprocess.run(
+            ["ffmpeg", "-i", src_video, "-af", f"silencedetect=n={threshold_db}dB:d={min_silence}",
+             "-vn", "-sn", "-dn", "-f", "null", "-"],
+            capture_output=True, text=True, timeout=60,
+        )
+        for line in proc.stderr.splitlines():
+            m = re.search(r"silence_start:\s*([0-9.]+)", line)
+            if m and float(m.group(1)) < 0.05:
+                # 开头静音：找对应 silence_end
+                for line2 in proc.stderr.splitlines():
+                    m2 = re.search(r"silence_end:\s*([0-9.]+)", line2)
+                    if m2:
+                        return float(m2.group(1))
+                break
+    except Exception as e:
+        log(f"silence detect 失败：{e}")
+    return 0.0
+
+
 def _postprocess_audio_dub_segment(src_video: str, scene: dict, target_dur: float) -> bool:
     """Normalize Almighty audio-dub video while preserving generated segment audio for QA sidecars.
 
@@ -10153,8 +10175,31 @@ def _postprocess_audio_dub_segment(src_video: str, scene: dict, target_dur: floa
 
     pad 段视频用 panel still + Ken Burns 替代 tpad clone（解决冻人脸 bug）；
     pad 段音频仍走 apad 静音填充。
+
+    Bug B 续修 (2026-05-20)：narrated_b WERYDANCE 输出 audio 经常前置 4-5s 静音再说话
+    → 字幕跟 audio 对齐时画面早于字幕 5s 出现，体感错位
+    → 检测 leading silence >0.5s 时同步 trim audio + video，让语音锚在 seg 开头
     """
     vid_path = scene["vid_path"]
+    leading_silence = _detect_audio_leading_silence(src_video, threshold_db=-30, min_silence=0.5)
+    if leading_silence > 0.5:
+        log(f"[audio-dub postprocess] {scene.get('speaker', '?')} leading silence {leading_silence:.2f}s → 同步 trim audio+video")
+        trimmed = str(OUTPUT_DIR / f"audio_dub_trimmed_{scene.get('dialogue_turn', 0):02d}.mp4")
+        try:
+            ffmpeg(
+                "-ss", f"{leading_silence:.3f}",
+                "-i", src_video,
+                "-c:v", "libx264", "-crf", "20", "-preset", "medium",
+                "-c:a", "aac", "-b:a", "128k",
+                "-pix_fmt", "yuv420p",
+                trimmed,
+                timeout=120,
+            )
+            if os.path.exists(trimmed) and os.path.getsize(trimmed) > 10000:
+                src_video = trimmed
+                scene["_audio_dub_leading_silence_trimmed"] = leading_silence
+        except Exception as e:
+            log(f"[audio-dub postprocess] trim leading silence 失败（保留原 seg）：{e}")
     src_dur = ffprobe_duration(src_video)
     # 不 trim raw audio：克隆语音可能比 master_voice TTS 长，硬截会切掉尾部
     effective_dur = max(target_dur, src_dur)
