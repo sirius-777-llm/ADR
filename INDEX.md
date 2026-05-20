@@ -1,6 +1,6 @@
 # ADR Code Index
 
-Auto-generated. Source: `run_adr_v8.py` (14402 lines). Regenerate: `python3 tools/generate_index.py`.
+Auto-generated. Source: `run_adr_v8.py` (14408 lines). Regenerate: `python3 tools/generate_index.py`.
 
 ## Sections
 
@@ -14,8 +14,8 @@ Auto-generated. Source: `run_adr_v8.py` (14402 lines). Regenerate: `python3 tool
 - [`第七步：拼接视频轨`](#第七步-拼接视频轨) — L11453-11622 (170 lines · 1 fn · 0 sub)
 - [`第八步：生成 ASS 字幕`](#第八步-生成-ass-字幕) — L11623-12410 (788 lines · 9 fn · 1 sub)
 - [`第九步：最终合成`](#第九步-最终合成) — L12411-12651 (241 lines · 1 fn · 0 sub)
-- [`第十步：推送 Telegram`](#第十步-推送-telegram) — L12652-14238 (1587 lines · 16 fn · 5 sub)
-- [`主流程`](#主流程) — L14239-14402 (164 lines · 2 fn · 0 sub)
+- [`第十步：推送 Telegram`](#第十步-推送-telegram) — L12652-14244 (1593 lines · 16 fn · 5 sub)
+- [`主流程`](#主流程) — L14245-14408 (164 lines · 2 fn · 0 sub)
 
 ---
 
@@ -434,14 +434,14 @@ Range: **L12411 – L12651** (241 lines)
 ---
 
 ### 第十步：推送 Telegram
-Range: **L12652 – L14238** (1587 lines)
+Range: **L12652 – L14244** (1593 lines)
 
 **Sub-sections:**
-- _异步封面 + caption（与 step6-9 并发）_ — L13752-14067 (316 lines)
-- _SSL 假阴性防护：见模块级 _tg_probe_send / _tg_probe_delete_ — L14068-14072 (5 lines)
-- _尝试 1：requests（timeout 放大到 600s），前后 probe 跳号检测_ — L14073-14114 (42 lines)
-- _尝试 2：curl fallback（更稳定，不受 httpx/urllib3 限制），同样跳号检测_ — L14115-14160 (46 lines)
-- _尝试 3：小土伯/TG 文件兜底。视频上传链路 SSL 抖动时，压 lite/micro 后用 sendDocument 发文件。_ — L14161-14238 (78 lines)
+- _异步封面 + caption（与 step6-9 并发）_ — L13752-14073 (322 lines)
+- _SSL 假阴性防护：见模块级 _tg_probe_send / _tg_probe_delete_ — L14074-14078 (5 lines)
+- _尝试 1：requests（timeout 放大到 600s），前后 probe 跳号检测_ — L14079-14120 (42 lines)
+- _尝试 2：curl fallback（更稳定，不受 httpx/urllib3 限制），同样跳号检测_ — L14121-14166 (46 lines)
+- _尝试 3：小土伯/TG 文件兜底。视频上传链路 SSL 抖动时，压 lite/micro 后用 sendDocument 发文件。_ — L14167-14244 (78 lines)
 
 **Top-level constants:**
 - `PANTONE_JIEQI` — L13021
@@ -469,10 +469,10 @@ Range: **L12652 – L14238** (1587 lines)
 ---
 
 ### 主流程
-Range: **L14239 – L14402** (164 lines)
+Range: **L14245 – L14408** (164 lines)
 
 **Functions:**
-- `_print_execution_plan` — L14240
-- `main` — L14288
+- `_print_execution_plan` — L14246
+- `main` — L14294
 
 ---

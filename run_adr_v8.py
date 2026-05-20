@@ -13990,8 +13990,14 @@ def step10_deliver(final_path: str, topic: str, script: list[dict]):
         tg(f"🎨 主题专属封面已就绪（{_style_tag}） — 异步预生成 ✓")
         cover_path = _async_cover_path
     else:
-        tg(f"🎨 正在生成主题专属封面（{_style_tag}）...")
-        cover_path = _generate_cover_image(topic, short_title, script)
+        # 优先复用已生成的 cover.jpg（resume 工具 / 重跑场景）—不再无脑重新生成 ~3min
+        existing_cover = OUTPUT_DIR / "cover.jpg"
+        if existing_cover.exists() and existing_cover.stat().st_size > 10000:
+            tg(f"🎨 复用已有封面（跳过重新生成）：{existing_cover.name}")
+            cover_path = str(existing_cover)
+        else:
+            tg(f"🎨 正在生成主题专属封面（{_style_tag}）...")
+            cover_path = _generate_cover_image(topic, short_title, script)
 
     def _upload_cover_photo(send_path: str, caption: str) -> dict:
         """单次 sendPhoto 调用，包成 _tg_upload_with_probe_gap 期望的 result 格式。"""
