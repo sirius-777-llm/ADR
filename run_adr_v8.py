@@ -11488,6 +11488,90 @@ def _werydance_caption_covered_turns() -> set[int]:
     return covered
 
 
+def _word_timings_for_subtitle_align(audio_path: str) -> list[tuple[str, float, float]] | None:
+    """跑 word-level Whisper 拿到每个字符的 (char, start, end)，用于字幕对齐 hybrid voice 真实节奏。
+
+    修复 Bug B：克隆音色节奏 ≠ master_voice TTS 节奏，字幕按字符均分时长导致 drift。
+    用 ASR 真实 word timings 重排，让字幕和实际语音同步。
+    """
+    if not audio_path or not os.path.exists(audio_path):
+        return None
+    try:
+        from faster_whisper import WhisperModel
+        model = WhisperModel("base", compute_type="int8")
+        segments_iter, _ = model.transcribe(audio_path, language="zh", word_timestamps=True)
+        timings: list[tuple[str, float, float]] = []
+        for seg in segments_iter:
+            words = getattr(seg, "words", None) or []
+            for w in words:
+                text = (getattr(w, "word", "") or "").strip()
+                if not text:
+                    continue
+                ws = float(getattr(w, "start", 0.0) or 0.0)
+                we = float(getattr(w, "end", ws) or ws)
+                if we <= ws:
+                    continue
+                n = len(text)
+                if n == 1:
+                    timings.append((text, ws, we))
+                else:
+                    # 中文 word 可能是多字短语 → 等比拆字
+                    for ci, ch in enumerate(text):
+                        if not ch.strip():
+                            continue
+                        s = ws + (we - ws) * ci / n
+                        e = ws + (we - ws) * (ci + 1) / n
+                        timings.append((ch, s, e))
+        log(f"hybrid voice ASR (字幕对齐)：{len(timings)} 个字符 word_timings")
+        return timings if timings else None
+    except Exception as e:
+        log(f"hybrid voice ASR 失败（回退字符比例对齐）：{e}")
+        return None
+
+
+def _align_segments_via_asr(
+    segments: list[str], t_start: float, t_end: float, word_timings: list[tuple[str, float, float]]
+) -> list[tuple[float, float]] | None:
+    """把字幕子段按 ASR word_timings 重新分配开始/结束时间。
+
+    算法：取 [t_start - 0.3, t_end + 0.3] 区间内的 ASR 字符，按字符数累计匹配每个子段。
+    """
+    if not segments or not word_timings:
+        return None
+    region = [w for w in word_timings if w[1] >= t_start - 0.3 and w[2] <= t_end + 0.5]
+    if len(region) < 2:
+        return None
+    seg_char_counts = [len(s.replace(r"\N", "").replace(" ", "")) for s in segments]
+    total_chars = sum(seg_char_counts)
+    if total_chars <= 0:
+        return None
+    # 按字符累计在 region 上滑动；不要求精确字符匹配（标点/差异会让序列偏，按字数累计 fallback 仍可用）
+    n_region = len(region)
+    region_chars_per_seg_char = n_region / max(total_chars, 1)
+    out: list[tuple[float, float]] = []
+    cursor_chars = 0
+    for sc in seg_char_counts:
+        if sc <= 0:
+            # 空段：取 cursor 当前时间到 cursor+epsilon
+            t = region[min(int(cursor_chars * region_chars_per_seg_char), n_region - 1)][1]
+            out.append((t, t + 0.1))
+            continue
+        i0 = int(cursor_chars * region_chars_per_seg_char)
+        i1 = int((cursor_chars + sc) * region_chars_per_seg_char) - 1
+        i0 = max(0, min(i0, n_region - 1))
+        i1 = max(i0, min(i1, n_region - 1))
+        s = region[i0][1]
+        e = region[i1][2]
+        # 边界保护：起止不能超出 turn 区间
+        s = max(s, t_start)
+        e = min(e, t_end)
+        if e <= s:
+            e = s + 0.3
+        out.append((s, e))
+        cursor_chars += sc
+    return out
+
+
 def step8_subtitles(script: list[dict]) -> str:
     werydance_caption_turns = _werydance_caption_covered_turns() if WERYDANCE_CAPTIONS else set()
     ass_fallback_turns: list[int] = []
@@ -11746,6 +11830,18 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
             if compact_i < len(llm_result_compact):
                 llm_result[orig_i] = llm_result_compact[compact_i]
 
+    # Bug B fix (2026-05-20)：跑 hybrid voice word-level ASR，让字幕按真实节奏对齐
+    # 克隆音色节奏 ≠ master_voice TTS 节奏，字符均分会 drift（"今天下英雄|唯使君与操耳" 字幕错位）
+    word_timings: list[tuple[str, float, float]] | None = None
+    use_asr_align = (
+        ADS_DIALOGUE_MODE and ADSD_ALMIGHTY_AUDIO_DUB_EXPERIMENT
+        and os.environ.get("ADR_SUBTITLE_ASR_ALIGN", "1").strip().lower() not in ("0", "false", "no", "off")
+    )
+    if use_asr_align:
+        hybrid_voice_path = OUTPUT_DIR / "hybrid_master_voice.mp3"
+        if hybrid_voice_path.exists():
+            word_timings = _word_timings_for_subtitle_align(str(hybrid_voice_path))
+
     with open(ass_path, "w", encoding="utf-8") as f:
         f.write(header)
         SUB_GAP = 0.10
@@ -11788,25 +11884,36 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
                 for chunk in _wrap_card(seg)
             ]
 
-            total_chars = sum(len(c.replace(r"\N", "")) for c in segments) or 1
-            duration = t_end - t_start
-            total_gaps = max(0, len(segments) - 1) * SUB_GAP
-            content_dur = max(duration - total_gaps, duration * 0.5)
-            cursor = t_start
-            # 跨 turn 边界保护：紧凑模式 pause=0 时本 turn 末尾 segment 跟下 turn 首段会贴死
-            # 末段 seg_end 收 SUB_GAP，确保跨 turn 也有 SUB_GAP 间隙
+            # 优先用 ASR word-level timings 对齐字幕子段；失败回退字符比例
+            asr_aligned = _align_segments_via_asr(segments, t_start, t_end, word_timings) if word_timings else None
             has_next_turn = (idx + 1) < len(script)
-            for seg_i, seg in enumerate(segments):
-                seg_dur = max(content_dur * len(seg.replace(r"\N", "")) / total_chars, 0.8)
-                is_last_seg = (seg_i == len(segments) - 1)
-                cap_end = (t_end - SUB_GAP) if (is_last_seg and has_next_turn) else t_end
-                seg_end = min(cursor + seg_dur, cap_end)
-                if seg.strip():
-                    f.write(
-                        f"Dialogue: 0,{ass_time(cursor)},{ass_time(seg_end)},"
-                        f"Default,,0,0,0,,{FADE_TAG}{seg}\n"
-                    )
-                cursor = seg_end + SUB_GAP
+            if asr_aligned:
+                for seg_i, (seg, (s, e)) in enumerate(zip(segments, asr_aligned)):
+                    is_last_seg = (seg_i == len(segments) - 1)
+                    cap_end = (t_end - SUB_GAP) if (is_last_seg and has_next_turn) else t_end
+                    seg_end = min(e, cap_end)
+                    if seg.strip():
+                        f.write(
+                            f"Dialogue: 0,{ass_time(s)},{ass_time(seg_end)},"
+                            f"Default,,0,0,0,,{FADE_TAG}{seg}\n"
+                        )
+            else:
+                total_chars = sum(len(c.replace(r"\N", "")) for c in segments) or 1
+                duration = t_end - t_start
+                total_gaps = max(0, len(segments) - 1) * SUB_GAP
+                content_dur = max(duration - total_gaps, duration * 0.5)
+                cursor = t_start
+                for seg_i, seg in enumerate(segments):
+                    seg_dur = max(content_dur * len(seg.replace(r"\N", "")) / total_chars, 0.8)
+                    is_last_seg = (seg_i == len(segments) - 1)
+                    cap_end = (t_end - SUB_GAP) if (is_last_seg and has_next_turn) else t_end
+                    seg_end = min(cursor + seg_dur, cap_end)
+                    if seg.strip():
+                        f.write(
+                            f"Dialogue: 0,{ass_time(cursor)},{ass_time(seg_end)},"
+                            f"Default,,0,0,0,,{FADE_TAG}{seg}\n"
+                        )
+                    cursor = seg_end + SUB_GAP
 
     caption_qa = {
         "enabled": WERYDANCE_CAPTIONS,

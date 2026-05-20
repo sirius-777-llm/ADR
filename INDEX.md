@@ -1,6 +1,6 @@
 # ADR Code Index
 
-Auto-generated. Source: `run_adr_v8.py` (14127 lines). Regenerate: `python3 tools/generate_index.py`.
+Auto-generated. Source: `run_adr_v8.py` (14234 lines). Regenerate: `python3 tools/generate_index.py`.
 
 ## Sections
 
@@ -12,10 +12,10 @@ Auto-generated. Source: `run_adr_v8.py` (14127 lines). Regenerate: `python3 tool
 - [`第六步：并行生成图片 + BGM + 视频片段`](#第六步-并行生成图片---bgm---视频片段) — L5110-7348 (2239 lines · 42 fn · 2 sub)
 - [`第 6.5 步：动态化（可选，--with-motion 开启）`](#第-6-5-步-动态化-可选---with-motion-开启) — L7349-11293 (3945 lines · 95 fn · 3 sub)
 - [`第七步：拼接视频轨`](#第七步-拼接视频轨) — L11294-11463 (170 lines · 1 fn · 0 sub)
-- [`第八步：生成 ASS 字幕`](#第八步-生成-ass-字幕) — L11464-12139 (676 lines · 7 fn · 1 sub)
-- [`第九步：最终合成`](#第九步-最终合成) — L12140-12381 (242 lines · 1 fn · 0 sub)
-- [`第十步：推送 Telegram`](#第十步-推送-telegram) — L12382-13968 (1587 lines · 16 fn · 5 sub)
-- [`主流程`](#主流程) — L13969-14127 (159 lines · 2 fn · 0 sub)
+- [`第八步：生成 ASS 字幕`](#第八步-生成-ass-字幕) — L11464-12246 (783 lines · 9 fn · 1 sub)
+- [`第九步：最终合成`](#第九步-最终合成) — L12247-12488 (242 lines · 1 fn · 0 sub)
+- [`第十步：推送 Telegram`](#第十步-推送-telegram) — L12489-14075 (1587 lines · 16 fn · 5 sub)
+- [`主流程`](#主流程) — L14076-14234 (159 lines · 2 fn · 0 sub)
 
 ---
 
@@ -400,70 +400,72 @@ Range: **L11294 – L11463** (170 lines)
 ---
 
 ### 第八步：生成 ASS 字幕
-Range: **L11464 – L12139** (676 lines)
+Range: **L11464 – L12246** (783 lines)
 
 **Sub-sections:**
-- _字幕分段：LLM 智能语义断句_ — L11503-12139 (637 lines)
+- _字幕分段：LLM 智能语义断句_ — L11587-12246 (660 lines)
 
 **Functions:**
 - `_werydance_caption_covered_turns` — L11465
-- `step8_subtitles` — L11491
-- `_read_output_json` — L11871
-- `_qa_file_pass` — L11882
-- `_ass_has_dialogue` — L11889
-- `_write_adsd_delivery_qa` — L11899
-- `_write_bgm_only_qa` — L12028
+- `_word_timings_for_subtitle_align` — L11491
+- `_align_segments_via_asr` — L11532
+- `step8_subtitles` — L11575
+- `_read_output_json` — L11978
+- `_qa_file_pass` — L11989
+- `_ass_has_dialogue` — L11996
+- `_write_adsd_delivery_qa` — L12006
+- `_write_bgm_only_qa` — L12135
 
 ---
 
 ### 第九步：最终合成
-Range: **L12140 – L12381** (242 lines)
+Range: **L12247 – L12488** (242 lines)
 
 **Functions:**
-- `step9_render` — L12141
+- `step9_render` — L12248
 
 ---
 
 ### 第十步：推送 Telegram
-Range: **L12382 – L13968** (1587 lines)
+Range: **L12489 – L14075** (1587 lines)
 
 **Sub-sections:**
-- _异步封面 + caption（与 step6-9 并发）_ — L13482-13797 (316 lines)
-- _SSL 假阴性防护：见模块级 _tg_probe_send / _tg_probe_delete_ — L13798-13802 (5 lines)
-- _尝试 1：requests（timeout 放大到 600s），前后 probe 跳号检测_ — L13803-13844 (42 lines)
-- _尝试 2：curl fallback（更稳定，不受 httpx/urllib3 限制），同样跳号检测_ — L13845-13890 (46 lines)
-- _尝试 3：小土伯/TG 文件兜底。视频上传链路 SSL 抖动时，压 lite/micro 后用 sendDocument 发文件。_ — L13891-13968 (78 lines)
+- _异步封面 + caption（与 step6-9 并发）_ — L13589-13904 (316 lines)
+- _SSL 假阴性防护：见模块级 _tg_probe_send / _tg_probe_delete_ — L13905-13909 (5 lines)
+- _尝试 1：requests（timeout 放大到 600s），前后 probe 跳号检测_ — L13910-13951 (42 lines)
+- _尝试 2：curl fallback（更稳定，不受 httpx/urllib3 限制），同样跳号检测_ — L13952-13997 (46 lines)
+- _尝试 3：小土伯/TG 文件兜底。视频上传链路 SSL 抖动时，压 lite/micro 后用 sendDocument 发文件。_ — L13998-14075 (78 lines)
 
 **Top-level constants:**
-- `PANTONE_JIEQI` — L12751
-- `PANTONE_FALLBACK` — L12778
-- `FESTIVAL_DATE_TAG` — L12891
+- `PANTONE_JIEQI` — L12858
+- `PANTONE_FALLBACK` — L12885
+- `FESTIVAL_DATE_TAG` — L12998
 
 **Functions:**
-- `_generate_caption` — L12383
-- `_overlay_title_on_cover` — L12621
-- `_prepare_tg_photo` — L12731
-- `_get_pantone_for_date` — L12781
-- `_llm_bottom_note` — L12806
-- `_get_bottom_note` — L12835
-- `_get_date_tag` — L12913
-- `_shrink_to_b64` — L12935
-- `_llm_check_scenes_anomalies` — L12951
-- `_llm_check_cover_unique` — L13004
-- `_llm_check_cover_quality` — L13034
-- `_try_almanac_cover` — L13076
-- `_generate_cover_image` — L13247
-- `_async_kickoff_cover_caption` — L13489
-- `_await_async_cover_caption` — L13519
-- `step10_deliver` — L13543
+- `_generate_caption` — L12490
+- `_overlay_title_on_cover` — L12728
+- `_prepare_tg_photo` — L12838
+- `_get_pantone_for_date` — L12888
+- `_llm_bottom_note` — L12913
+- `_get_bottom_note` — L12942
+- `_get_date_tag` — L13020
+- `_shrink_to_b64` — L13042
+- `_llm_check_scenes_anomalies` — L13058
+- `_llm_check_cover_unique` — L13111
+- `_llm_check_cover_quality` — L13141
+- `_try_almanac_cover` — L13183
+- `_generate_cover_image` — L13354
+- `_async_kickoff_cover_caption` — L13596
+- `_await_async_cover_caption` — L13626
+- `step10_deliver` — L13650
 
 ---
 
 ### 主流程
-Range: **L13969 – L14127** (159 lines)
+Range: **L14076 – L14234** (159 lines)
 
 **Functions:**
-- `_print_execution_plan` — L13970
-- `main` — L14018
+- `_print_execution_plan` — L14077
+- `main` — L14125
 
 ---
