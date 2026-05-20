@@ -273,6 +273,219 @@ def spike_3():
         run_spec(spec, OUT_DIR / f"{spec['name']}.mp4")
 
 
+def generate_labeled_grid(out_path: Path) -> str | None:
+    """用 GPT_IMAGE_2 生成带文字标签的 4×3 人设融合 grid，返回 grid 文件路径。"""
+    print("\n[5A] 生成带标签 12-panel grid...")
+    grid_prompt = (
+        "Create a 4 columns × 3 rows reference sheet (16:9), 12 separate cells with thin gold borders. "
+        "Subject: a Chinese late Han era warlord, mid-40s, beard, sharp eyes (CaoCao archetype). "
+        "Each cell must include a SMALL, CRISP, READABLE Latin-letter text label rendered in the upper-left corner of that cell "
+        "(black serif, white outline, about 4% of cell height). Layout:\n"
+        "Row 1: cell 1 'CaoCao | armor | speak' (medium shot, battle armor, mid-sentence, mouth visible). "
+        "cell 2 'CaoCao | armor | command' (raising arm, commanding troops). "
+        "cell 3 'CaoCao | court | speak' (court robe, palace pillar background). "
+        "cell 4 'CaoCao | court | contemplate' (court robe, eyes downcast).\n"
+        "Row 2: cell 5 'CaoCao | private | contemplate' (private silk wear, lit by oil lamp). "
+        "cell 6 'CaoCao | private | write' (writing on bamboo scroll). "
+        "cell 7 'CaoCao | armor | ride' (on horse, dust). "
+        "cell 8 'CaoCao | armor | sword' (sword raised, battle).\n"
+        "Row 3: cell 9 'scene | battlefield' (wide shot, banners, no faces). "
+        "cell 10 'scene | palace' (interior, pillars, dim light). "
+        "cell 11 'scene | night camp' (campfire, tents). "
+        "cell 12 'prop | bamboo scroll' (close-up of scroll on table).\n"
+        "Consistent character identity, costume continuity within each label group. "
+        "Each cell is photoreal cinematic documentary style. "
+        "Labels must be flat, sharp, unambiguous — they are functional metadata."
+    )
+    payload = {
+        "model": "GPT_IMAGE_2",
+        "prompt": grid_prompt,
+        "aspect_ratio": "16:9(4k)",
+        "image_number": 1,
+        "quality": "high",
+    }
+    payload = adr._inject_image2_quality_suffix(payload)
+    try:
+        r = adr.submit_text_to_image(payload, "spike5 labeled grid", timeout=60)
+    except Exception as e:
+        print(f"  GPT_IMAGE_2 提交失败：{e}")
+        return None
+    task_id = r.get("data", {}).get("task_id") or (r.get("data", {}).get("task_ids") or [None])[0]
+    if not task_id:
+        print(f"  GPT_IMAGE_2 无 task_id: {r}")
+        return None
+    print(f"  GPT_IMAGE_2 task_id={task_id}, polling...")
+    try:
+        data = adr.poll_storyboard_task(task_id, "spike5 grid", 300)
+    except Exception as e:
+        print(f"  poll 失败：{e}")
+        return None
+    urls = adr._extract_img_urls(data) if hasattr(adr, "_extract_img_urls") else (data.get("images") or [])
+    if isinstance(urls, list) and urls and isinstance(urls[0], dict):
+        urls = [u.get("url") for u in urls if u.get("url")]
+    if not urls:
+        print(f"  no image url: {data}")
+        return None
+    urllib.request.urlretrieve(urls[0], out_path)
+    print(f"  downloaded labeled grid: {out_path}")
+    # 推 TG 让人眼检查标签是否清晰
+    token = os.environ.get("TG_BOT_TOKEN") or os.environ.get("TELEGRAM_TOKEN")
+    chat = os.environ.get("TG_CHAT_ID") or os.environ.get("OWNER_CHAT_ID")
+    if token and chat:
+        subprocess.run([
+            "curl", "-s", "--max-time", "120",
+            "-F", f"chat_id={chat}",
+            "-F", "caption=Spike 5A 带标签人设融合 grid（人眼验证标签可读性）",
+            "-F", f"photo=@{out_path}",
+            f"https://api.telegram.org/bot{token}/sendPhoto",
+        ], capture_output=True, text=True, timeout=130)
+    return str(out_path)
+
+
+def generate_labeled_grid_zh(out_path: Path) -> str | None:
+    """中文标签人设融合 grid（spike 5b）。"""
+    print("\n[5b-A] 生成中文标签 12-panel grid...")
+    grid_prompt = (
+        "生成 4 列 × 3 行 参考图（16:9），12 个独立 cell，细金色边框。\n"
+        "主体：东汉末年大军阀，约 45 岁，蓄须，眼神锐利（曹操原型）。\n"
+        "每个 cell 左上角必须有清晰可读的中文文字标签（黑色衬线字体，白色描边，约 cell 高度 4%）。\n"
+        "布局：\n"
+        "第 1 行：cell 1「曹操｜战袍｜说话」（中景，战甲，开口讲话，嘴部可见）；"
+        "cell 2「曹操｜战袍｜发令」（举臂下令，指挥兵卒）；"
+        "cell 3「曹操｜朝服｜说话」（朝服，宫殿柱旁）；"
+        "cell 4「曹操｜朝服｜沉思」（朝服，低头沉思）。\n"
+        "第 2 行：cell 5「曹操｜私服｜沉思」（私服丝绸便装，油灯光照）；"
+        "cell 6「曹操｜私服｜书写」（在竹简上书写）；"
+        "cell 7「曹操｜战袍｜骑马」（骑马，尘土飞扬）；"
+        "cell 8「曹操｜战袍｜持剑」（举剑，战斗场面）。\n"
+        "第 3 行：cell 9「场景｜战场」（远景，旗帜，无人脸特写）；"
+        "cell 10「场景｜宫殿」（室内，柱子，昏暗）；"
+        "cell 11「场景｜夜营」（营火，帐篷）；"
+        "cell 12「道具｜竹简」（桌上竹简特写）。\n"
+        "整体要求：同角色身份贯穿，同标签组服装连续；每个 cell 是纪录片风格电影质感；"
+        "中文标签必须清晰锐利、不变形、明确可读——这是功能性元数据。"
+    )
+    payload = {
+        "model": "GPT_IMAGE_2",
+        "prompt": grid_prompt,
+        "aspect_ratio": "16:9(4k)",
+        "image_number": 1,
+        "quality": "high",
+    }
+    payload = adr._inject_image2_quality_suffix(payload)
+    try:
+        r = adr.submit_text_to_image(payload, "spike5b labeled grid zh", timeout=60)
+    except Exception as e:
+        print(f"  GPT_IMAGE_2 提交失败：{e}")
+        return None
+    task_id = r.get("data", {}).get("task_id") or (r.get("data", {}).get("task_ids") or [None])[0]
+    if not task_id:
+        print(f"  no task_id: {r}")
+        return None
+    print(f"  GPT_IMAGE_2 task_id={task_id}, polling...")
+    data = adr.poll_storyboard_task(task_id, "spike5b grid zh", 300)
+    urls = adr._extract_img_urls(data) if hasattr(adr, "_extract_img_urls") else (data.get("images") or [])
+    if isinstance(urls, list) and urls and isinstance(urls[0], dict):
+        urls = [u.get("url") for u in urls if u.get("url")]
+    if not urls:
+        print(f"  no image url: {data}")
+        return None
+    urllib.request.urlretrieve(urls[0], out_path)
+    print(f"  downloaded zh labeled grid: {out_path}")
+    # 压 JPEG 推 TG (PNG 太大 TG 拒)
+    jpg_path = str(out_path).replace(".png", ".jpg")
+    subprocess.run(["ffmpeg", "-y", "-i", str(out_path), "-qscale:v", "4", jpg_path],
+                   capture_output=True, timeout=60)
+    token = os.environ.get("TG_BOT_TOKEN") or os.environ.get("TELEGRAM_TOKEN")
+    chat = os.environ.get("TG_CHAT_ID") or os.environ.get("OWNER_CHAT_ID")
+    if token and chat:
+        subprocess.run([
+            "curl", "-s", "--max-time", "120",
+            "-F", f"chat_id={chat}",
+            "-F", "caption=Spike 5b-A 中文标签人设融合 grid（人眼验证中文标签可读性）",
+            "-F", f"photo=@{jpg_path}",
+            f"https://api.telegram.org/bot{token}/sendPhoto",
+        ], capture_output=True, text=True, timeout=130)
+    return str(out_path)
+
+
+def spike_5b():
+    """中文标签人设符 grid 召唤对照 spike 5 (英文)。"""
+    voice = pick_voice_asset_ref()
+    labeled_grid = OUT_DIR / "5b_labeled_grid_zh.png"
+    if not labeled_grid.exists():
+        if not generate_labeled_grid_zh(labeled_grid):
+            print("  5b-A 中文标签 grid 生成失败，spike 5b 中止")
+            return
+    else:
+        print(f"  reuse existing zh labeled grid: {labeled_grid}")
+
+    # 5b-B 召唤「战袍｜说话」
+    prompt_armor = (
+        "纪录片场景。使用上传的参考图作为视觉指引——"
+        "重点关注标记为「曹操｜战袍｜说话」的 panel（讲话中，身穿战甲，嘴部可见）。"
+        "生成普通话语音，演讲者准确说出：「奉天子以令不臣」。"
+        "上传的音频仅作为音色、语速、年龄感参考。"
+        "嘴部可见，面部稳定，嘴型自然同步，符合真人节奏。"
+    )
+    # 5b-C 召唤「私服｜沉思」
+    prompt_private = (
+        "纪录片场景。使用上传的参考图作为视觉指引——"
+        "重点关注标记为「曹操｜私服｜沉思」的 panel（私服丝绸便装，油灯光下沉思）。"
+        "生成普通话语音，演讲者低声自语：「孤一生求贤若渴」。"
+        "上传的音频仅作为音色、语速、年龄感参考。"
+        "嘴部可见，柔和打光，嘴型自然同步。"
+    )
+
+    specs = [
+        {"name": "5bB_zh_call_armor_speak", "desc": "中文召唤 战袍+说话",
+         "images": [str(labeled_grid)], "audio": voice, "prompt": prompt_armor, "duration": 5},
+        {"name": "5bC_zh_call_private_contemplate", "desc": "中文召唤 私服+沉思",
+         "images": [str(labeled_grid)], "audio": voice, "prompt": prompt_private, "duration": 5},
+    ]
+    for spec in specs:
+        run_spec(spec, OUT_DIR / f"{spec['name']}.mp4")
+
+
+def spike_5():
+    """标签人设融合 grid 验证：almighty 能否按 prompt 召唤 grid 内特定 panel？"""
+    voice = pick_voice_asset_ref()
+    labeled_grid = OUT_DIR / "5_labeled_grid.png"
+    if not labeled_grid.exists():
+        grid_path = generate_labeled_grid(labeled_grid)
+        if not grid_path:
+            print("  5A 标签 grid 生成失败，spike 5 中止")
+            return
+    else:
+        print(f"  reuse existing labeled grid: {labeled_grid}")
+
+    # 5B 召唤 "armor | speak"
+    prompt_armor = (
+        "Cinematic documentary scene. Use the uploaded grid as visual reference — "
+        "FOCUS on the panel labeled 'CaoCao | armor | speak' (mid-sentence, battle armor). "
+        "Generate Mandarin speech with the speaker saying exactly: 「奉天子以令不臣」. "
+        "Use uploaded audio as voice timbre reference only. "
+        "Visible mouth, stable face, natural lip sync, realistic human timing."
+    )
+    # 5C 召唤 "private | contemplate"
+    prompt_private = (
+        "Cinematic documentary scene. Use the uploaded grid as visual reference — "
+        "FOCUS on the panel labeled 'CaoCao | private | contemplate' (private silk wear, oil lamp, contemplating). "
+        "Generate Mandarin speech with the speaker quietly thinking aloud: 「孤一生求贤若渴」. "
+        "Use uploaded audio as voice timbre reference only. "
+        "Visible mouth, soft lighting, natural lip sync."
+    )
+
+    specs = [
+        {"name": "5B_call_armor_speak", "desc": "召唤 armor+speak panel",
+         "images": [str(labeled_grid)], "audio": voice, "prompt": prompt_armor, "duration": 5},
+        {"name": "5C_call_private_contemplate", "desc": "召唤 private+contemplate panel",
+         "images": [str(labeled_grid)], "audio": voice, "prompt": prompt_private, "duration": 5},
+    ]
+    for spec in specs:
+        run_spec(spec, OUT_DIR / f"{spec['name']}.mp4")
+
+
 def spike_4():
     """a_roll 整 grid 当 ref vs 切片对比：能否取代当前主路径切 panel？"""
     voice = pick_voice_asset_ref()
@@ -321,6 +534,12 @@ def main():
     if "4" in args or "all" in args:
         print("\n#### SPIKE 4 · a_roll 整 grid 当 ref ####")
         spike_4()
+    if "5" in args or "all" in args:
+        print("\n#### SPIKE 5 · 英文标签人设融合 grid ####")
+        spike_5()
+    if "5b" in args or "all" in args:
+        print("\n#### SPIKE 5b · 中文标签人设融合 grid ####")
+        spike_5b()
     print(f"\n=== all spikes done. outputs in {OUT_DIR}/ ===")
 
 
