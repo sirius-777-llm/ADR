@@ -273,6 +273,40 @@ def spike_3():
         run_spec(spec, OUT_DIR / f"{spec['name']}.mp4")
 
 
+def spike_4():
+    """a_roll 整 grid 当 ref vs 切片对比：能否取代当前主路径切 panel？"""
+    voice = pick_voice_asset_ref()
+    grids = sorted(Path("/tmp").glob("adr_v8_*/storyboard_grid_*.png"))
+    sheets = sorted(Path("/tmp").glob("adr_v8_*/character_sheet.png"))
+    panels = sorted(Path("/tmp").glob("adr_v8_*/img_*.jpg"))
+    if not grids or not sheets or not panels:
+        print(f"缺素材: grid={len(grids)} sheet={len(sheets)} panel={len(panels)}, spike 4 跳过")
+        return
+    grid_full = str(grids[-1])
+    sheet = str(sheets[-1])
+    single_panel = str(panels[-1])
+
+    dialogue = "奉天子以令不臣"
+    prompt = (
+        "Cinematic documentary scene with generated Mandarin speech. "
+        "Use uploaded audio purely as voice timbre, pace, age impression reference. "
+        "Use uploaded image references for identity, costume, era, lighting. "
+        f"The speaker says exactly this Chinese line: 「{dialogue}」 and nothing else. "
+        "Natural lip sync, visible mouth, stable face, realistic human timing."
+    )
+
+    specs = [
+        {"name": "4A_single_panel_baseline", "desc": "a_roll baseline: single panel only",
+         "images": [single_panel], "audio": voice, "prompt": prompt, "duration": 5},
+        {"name": "4B_sheet_plus_panel", "desc": "a_roll: character_sheet + single panel (current main)",
+         "images": [sheet, single_panel], "audio": voice, "prompt": prompt, "duration": 5},
+        {"name": "4C_sheet_plus_full_grid", "desc": "a_roll: character_sheet + 整 12-panel grid (new)",
+         "images": [sheet, grid_full], "audio": voice, "prompt": prompt, "duration": 5},
+    ]
+    for spec in specs:
+        run_spec(spec, OUT_DIR / f"{spec['name']}.mp4")
+
+
 def main():
     args = sys.argv[1:] if len(sys.argv) > 1 else ["all"]
     if "1" in args or "all" in args:
@@ -284,6 +318,9 @@ def main():
     if "3" in args or "all" in args:
         print("\n#### SPIKE 3 · 12-panel grid multi-ref ####")
         spike_3()
+    if "4" in args or "all" in args:
+        print("\n#### SPIKE 4 · a_roll 整 grid 当 ref ####")
+        spike_4()
     print(f"\n=== all spikes done. outputs in {OUT_DIR}/ ===")
 
 
