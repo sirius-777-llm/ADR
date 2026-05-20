@@ -6205,6 +6205,134 @@ Story context:
 {chr(10).join(beats)}"""
 
 
+# ── 人设符 PR (2026-05-20) ─────────────────────────────────────────────────
+# 4×3 grid 中文标签人设符：取代「sheet + 切 panel + alt_panel」的多 ref 拼装
+# 每个 speaker 一张 grid，含多套服装/动作/场景，almighty 按召唤标签精准取片段
+# Spike 5/5b 验证：召唤生效，中文标签可读，audio 质量好
+
+# 人设符 grid 内的预设标签（推断函数从 scene 推到这些标签）
+CHARACTER_META_GRID_COSTUMES = ["战袍", "朝服", "私服", "夜行"]
+CHARACTER_META_GRID_POSES = ["说话", "发令", "沉思", "书写", "惊愤", "微笑"]
+CHARACTER_META_GRID_SCENES = ["战场", "宫殿", "夜营", "书房"]
+
+# 高敏感诗句清单（命中时 retry 改 paraphrase）
+ADR_SENSITIVE_DIALOGUE_PHRASES = [
+    "奉天子以令不臣", "出师未捷身先死", "周公吐哺天下归心", "对酒当歌人生几何",
+    "宁我负人毋人负我", "天行健君子以自强不息",
+]
+
+
+def _infer_meta_grid_costume(scene: dict) -> str:
+    """从 scene 推断应召唤的服装标签。"""
+    text = (scene.get("text", "") or "") + " " + (scene.get("shot", "") or "")
+    if any(k in text for k in ("战", "兵", "马", "甲", "刀剑", "战场", "出征", "厮杀")):
+        return "战袍"
+    if any(k in text for k in ("夜", "深夜", "暗中", "潜行", "刺")):
+        return "夜行"
+    if any(k in text for k in ("私下", "书房", "私服", "独处", "灯下", "夜读")):
+        return "私服"
+    return "朝服"  # 默认 - 中性场景
+
+
+def _infer_meta_grid_pose(scene: dict) -> str:
+    """从 scene 推断应召唤的动作/表情标签。"""
+    text = (scene.get("text", "") or "") + " " + (scene.get("shot", "") or "")
+    emotion = (scene.get("emotion", "") or "").lower()
+    if any(k in text for k in ("写", "笔", "竹简", "纸")):
+        return "书写"
+    if any(k in text for k in ("令", "命", "传令", "下令", "全军")):
+        return "发令"
+    if emotion == "tense" or any(k in text for k in ("怒", "恨", "愤", "斥")):
+        return "惊愤"
+    if emotion == "solemn" or any(k in text for k in ("思", "想", "念", "回忆", "沉思", "默")):
+        return "沉思"
+    return "说话"  # 默认 a_roll
+
+
+def _adsd_meta_grid_call_prompt(scene: dict) -> str:
+    """人设符召唤式 prompt：让 almighty 用 meta_grid 中标签对应 panel 渲染。"""
+    speaker = scene.get("speaker", "speaker")
+    dialogue = re.sub(r"\s+", " ", str(scene.get("text") or "")).strip()[:220]
+    costume = _infer_meta_grid_costume(scene)
+    pose = _infer_meta_grid_pose(scene)
+    return (
+        f"纪录片场景。使用上传的人设符参考图作为视觉指引——"
+        f"重点关注标记为「{speaker}｜{costume}｜{pose}」的 panel，提取其中的服装、表情、动作。"
+        f"生成普通话语音，演讲者准确说出：「{dialogue}」。"
+        f"上传的音频仅作为音色、语速、年龄感参考。"
+        f"嘴部可见，面部稳定，嘴型自然同步，符合真人节奏。"
+        f"不要在画面上渲染任何文字、字幕、标签——人设符上的标签只是给 AI 看的元数据。"
+    )[:1500]
+
+
+def _character_meta_grid_path(speaker: str) -> Path:
+    """每个 speaker 的人设符 grid 标准路径。"""
+    safe = re.sub(r"[^一-龥A-Za-z0-9]", "", speaker)[:20] or "speaker"
+    return OUTPUT_DIR / f"meta_grid_{safe}.png"
+
+
+def generate_character_meta_grid_gpt_image2(speaker: str, visual_subject: str, voice_gender: str = "male") -> str | None:
+    """人设符 PR：生成单个 speaker 的 4×3 中文标签 grid。
+
+    返回 grid 文件路径；失败返回 None。
+    Spike 5/5b 已验证：GPT_IMAGE_2 中文标签可读 + almighty 按标签召唤生效。
+    """
+    out_path = _character_meta_grid_path(speaker)
+    if out_path.exists() and out_path.stat().st_size > 100000:
+        log(f"reuse existing meta_grid: {out_path}")
+        return str(out_path)
+    subject = visual_subject or "an adult Chinese historical figure"
+    grid_prompt = (
+        f"生成 4 列 × 3 行 人设符参考图，12 个独立 cell，细金色边框。\n"
+        f"角色主体：{subject}（{speaker} 原型，性别 {voice_gender}）。\n"
+        f"每个 cell 左上角必须有清晰可读的中文文字标签（黑色衬线字体，白色描边，"
+        f"字号约 cell 高度 5%，不变形、不糊、不错字）——这是功能性元数据。\n"
+        f"布局：\n"
+        f"第 1 行：cell 1「{speaker}｜战袍｜说话」（中景战甲，开口讲话，嘴部清晰可见）；"
+        f"cell 2「{speaker}｜战袍｜发令」（举臂下令）；"
+        f"cell 3「{speaker}｜朝服｜说话」（朝服，宫殿柱旁）；"
+        f"cell 4「{speaker}｜朝服｜沉思」（朝服，低头思考）。\n"
+        f"第 2 行：cell 5「{speaker}｜私服｜沉思」（私服丝绸便装，油灯光照）；"
+        f"cell 6「{speaker}｜私服｜书写」（竹简书写）；"
+        f"cell 7「{speaker}｜战袍｜骑马」（马上，尘土飞扬）；"
+        f"cell 8「{speaker}｜表情｜惊愤」（特写，怒目）。\n"
+        f"第 3 行：cell 9「场景｜战场」（远景，旗帜，无人脸特写）；"
+        f"cell 10「场景｜宫殿」（室内，柱子，昏暗）；"
+        f"cell 11「场景｜夜营」（营火，帐篷）；"
+        f"cell 12「道具｜竹简」（桌上竹简特写）。\n"
+        f"同标签组内服装连续；同角色身份贯穿；每个 cell 是纪录片电影质感。"
+    )
+    payload = {
+        "model": "GPT_IMAGE_2",
+        "prompt": grid_prompt,
+        "aspect_ratio": "16:9(4k)",
+        "image_number": 1,
+        "quality": "high",
+    }
+    try:
+        r = submit_text_to_image(payload, f"meta_grid {speaker}", timeout=60)
+    except Exception as e:
+        log(f"meta_grid {speaker} 提交失败：{e}")
+        return None
+    task_id = r.get("data", {}).get("task_id") or (r.get("data", {}).get("task_ids") or [None])[0]
+    if not task_id:
+        log(f"meta_grid {speaker} 无 task_id：{r}")
+        return None
+    try:
+        data = poll_storyboard_task(task_id, f"meta_grid {speaker}", 300)
+    except Exception as e:
+        log(f"meta_grid {speaker} poll 失败：{e}")
+        return None
+    urls = _extract_img_urls(data)
+    if not urls:
+        return None
+    urllib.request.urlretrieve(urls[0], out_path)
+    if out_path.exists() and out_path.stat().st_size > 100000:
+        log(f"meta_grid {speaker} ✓ ({out_path.stat().st_size // 1024} KB)：{out_path}")
+        return str(out_path)
+    return None
+
+
 def _write_character_sheet_qa(payload: dict) -> None:
     try:
         (OUTPUT_DIR / "character_sheet_qa.json").write_text(
@@ -10708,6 +10836,20 @@ def _lip_sync_one_scene(idx: int, scene: dict, target_dur: float, aspect_ratio: 
             ref_images.append(sheet_url)
         ref_images.extend(alt_panel_urls)
         ref_images.append(image_url)
+        # 人设符 PR (Phase 2)：meta_grid 当 召唤 variant 专用 ref（单张大图）
+        # spike 5/5b 验证：单 meta_grid + 召唤 prompt 比 sheet+panel+alt 效果更稳
+        meta_grid_url: str | None = None
+        if (
+            os.environ.get("ADR_USE_CHARACTER_META_GRID", "1").strip().lower() not in ("0", "false", "no", "off")
+            and (needs_lip or is_narrated)
+        ):
+            mg_path = _character_meta_grid_path(scene.get("speaker", ""))
+            if mg_path.exists() and mg_path.stat().st_size > 100000:
+                try:
+                    meta_grid_url = _upload_to_weryai(str(mg_path))
+                except Exception as e:
+                    log(f"[lip-sync {idx}] meta_grid upload 失败（fallback 切片）：{e}")
+                    meta_grid_url = None
         # duration 计算：TTS 时长可能因 prosody 波动偏短，导致 WERYDANCE 被强制加速朗读 (~2x)
         # 用 ceil(字数/6) 做最小值兜底（6 字/秒是中文播报舒适上限）
         # 最终 cap 在 WERYDANCE 硬上限 15s
@@ -10748,8 +10890,12 @@ def _lip_sync_one_scene(idx: int, scene: dict, target_dur: float, aspect_ratio: 
                 ("audio_dub_primary", "WERYDANCE_2_0", _adsd_almighty_audio_dub_prompt(scene, safe_retry=False), "true"),
                 ("silent_lips_fallback", "WERYDANCE_2_0", _adsd_lip_sync_prompt(scene, safe_retry=True), "false"),
             ]
+            if meta_grid_url:
+                # 人设符召唤 variant 排首位，失败回退原切片路径
+                variants.insert(0, ("meta_grid_call", "WERYDANCE_2_0", _adsd_meta_grid_call_prompt(scene), "true"))
+                log(f"[lip-sync {idx}] 启用人设符召唤路径：speaker={scene.get('speaker', '?')}")
             if fast_fallback_enabled:
-                variants.insert(1, ("audio_dub_safe", "WERYDANCE_2_0_FAST", _adsd_almighty_audio_dub_prompt(scene, safe_retry=True), "true"))
+                variants.insert(2 if meta_grid_url else 1, ("audio_dub_safe", "WERYDANCE_2_0_FAST", _adsd_almighty_audio_dub_prompt(scene, safe_retry=True), "true"))
         else:
             variants = [
                 ("primary", "WERYDANCE_2_0", _adsd_lip_sync_prompt(scene, safe_retry=False), "false"),
@@ -10762,12 +10908,14 @@ def _lip_sync_one_scene(idx: int, scene: dict, target_dur: float, aspect_ratio: 
             r = None
             task_id = None
             scene["_almighty_audio_dub_attempt"] = generate_audio == "true"
+            # meta_grid_call variant 用单张人设符 grid；其他 variants 用原 sheet+panel+alt 拼装
+            current_ref_images = [meta_grid_url] if (variant_name == "meta_grid_call" and meta_grid_url) else ref_images
             for submit_attempt in range(3):
                 try:
                     _wait_motion_submit_slot(f"lip-sync {idx+1}")
                     payload = {
                         "model": model,
-                        "images": ref_images,
+                        "images": current_ref_images,
                         "prompt": prompt,
                         "negative_prompt": _werydance_negative_prompt(scene),
                         "duration": api_dur,
