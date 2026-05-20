@@ -12047,10 +12047,15 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
             asr_aligned = _align_segments_via_asr(segments, t_start, t_end, word_timings) if word_timings else None
             has_next_turn = (idx + 1) < len(script)
             if asr_aligned:
+                # Bug E fix (2026-05-20)：ASR aligned 路径也加 SUB_GAP，避免相邻字幕 fade in/out 视觉重叠
                 for seg_i, (seg, (s, e)) in enumerate(zip(segments, asr_aligned)):
                     is_last_seg = (seg_i == len(segments) - 1)
                     cap_end = (t_end - SUB_GAP) if (is_last_seg and has_next_turn) else t_end
-                    seg_end = min(e, cap_end)
+                    # 收前一段结尾 SUB_GAP，确保字幕间有间隙（不要紧贴上一行）
+                    next_start = asr_aligned[seg_i + 1][0] if not is_last_seg else cap_end + 1
+                    seg_end = min(e, next_start - SUB_GAP, cap_end)
+                    if seg_end <= s:
+                        seg_end = s + 0.3
                     if seg.strip():
                         f.write(
                             f"Dialogue: 0,{ass_time(s)},{ass_time(seg_end)},"
@@ -12545,15 +12550,14 @@ def step9_render(raw_path: str, voice_path: str, bgm_path: str | None, ass_path:
                 final_path,
             )
         else:
-            # Bug A fix (2026-05-20)：voice 1.5→1.0 + BGM 0.6→0.85
-            # 之前 voice 经 loudnorm + ×1.5 接近 clipping，把 BGM 完全压在 voice 段听不到
-            # 调整为更平衡的混音比例，让 a_roll/narrated_b 段也保留 BGM 存在感
+            # Bug A fix (2026-05-20)：voice 1.5→1.0 + BGM 0.6→0.85（让 a_roll 段也保留 BGM 存在感）
+            # Bug D fix (2026-05-20)：BGM aloop 无限循环，避免 BGM < voice 时片尾静音
             ffmpeg(
                 "-i", raw_path,
                 "-itsoffset", offset, "-i", voice_path,
                 "-itsoffset", offset, "-i", bgm_path,
                 "-filter_complex",
-                "[1:a]apad=pad_dur=1.5,volume=1.0[va];[2:a]volume=0.85[ba];[va][ba]amix=inputs=2:duration=first[aout]",
+                "[1:a]apad=pad_dur=1.5,volume=1.0[va];[2:a]aloop=loop=-1:size=2147483647,volume=0.85[ba];[va][ba]amix=inputs=2:duration=first[aout]",
                 "-map", "0:v",
                 "-map", "[aout]",
                 "-vf", vf_with_subtitles,

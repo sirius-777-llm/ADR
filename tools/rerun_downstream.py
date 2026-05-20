@@ -63,8 +63,21 @@ def main() -> int:
     if "TG_CHAT_ID" not in os.environ and "OWNER_CHAT_ID" in os.environ:
         os.environ["TG_CHAT_ID"] = os.environ["OWNER_CHAT_ID"]
 
+    # 关键：sys.argv 必须含 ADSD 标志，因为 run_adr_v8.py module 顶层会读 sys.argv
+    # 决定 ADS_DIALOGUE_MODE / ADSD_LIP_SYNC_EXPERIMENT / ADSD_ALMIGHTY_AUDIO_DUB_EXPERIMENT
+    # 不设的话这些 global 都 False，_build_voice_clone_hybrid_audio 直接 return None
+    state_preview = json.loads(state_path.read_text(encoding="utf-8"))
+    if state_preview.get("ads_dialogue_mode"):
+        sys.argv = ["run_adr_v8.py", state_preview.get("topic", "resume"), "h", "--adsd"]
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
     import run_adr_v8 as adr
+    # 兜底：state 标记了但 module 没 pick up（sys.argv 顺序敏感）→ 手动 patch
+    if state_preview.get("ads_dialogue_mode") and not getattr(adr, "ADS_DIALOGUE_MODE", False):
+        adr.ADS_DIALOGUE_MODE = True
+    if state_preview.get("adsd_lip_sync_experiment") and not getattr(adr, "ADSD_LIP_SYNC_EXPERIMENT", False):
+        adr.ADSD_LIP_SYNC_EXPERIMENT = True
+    if state_preview.get("adsd_almighty_audio_dub_experiment") and not getattr(adr, "ADSD_ALMIGHTY_AUDIO_DUB_EXPERIMENT", False):
+        adr.ADSD_ALMIGHTY_AUDIO_DUB_EXPERIMENT = True
 
     state = json.loads(state_path.read_text(encoding="utf-8"))
     script = state["script"]
