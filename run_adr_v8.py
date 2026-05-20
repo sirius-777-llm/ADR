@@ -11191,6 +11191,49 @@ def step65_grid_multiref_motion_qa(script: list[dict]):
     _write_storyboard_motion_compare_qa(grid_motion_qa, previs_qa, seg_qa, trailer_qa, character_trailer_qa)
 
 
+# ── pipeline state 持久化：让 tools/rerun_downstream.py 跳过 step1-66 局部重跑下游 ──
+def _sanitize_scene_for_state(scene: dict) -> dict:
+    """把 scene dict 里 non-JSON-serializable 字段转字符串/丢弃，供 pipeline_state.json 持久化。"""
+    out = {}
+    for k, v in scene.items():
+        try:
+            json.dumps(v, ensure_ascii=False)
+            out[k] = v
+        except (TypeError, ValueError):
+            if isinstance(v, Path):
+                out[k] = str(v)
+            else:
+                # 复杂对象（如 list of dict 含 Path）尝试 str()
+                try:
+                    out[k] = json.loads(json.dumps(v, default=str, ensure_ascii=False))
+                except Exception:
+                    pass  # 完全无法序列化的字段直接丢
+    return out
+
+
+def _save_pipeline_state(script: list[dict], voice_path: str, bgm_path: str | None, topic: str) -> None:
+    """保存 step66 后的完整 pipeline state，供 tools/rerun_downstream.py 复用。"""
+    state_path = OUTPUT_DIR / "pipeline_state.json"
+    state = {
+        "schema": "adr_pipeline_state_v1",
+        "saved_at": datetime.now().isoformat(timespec="seconds"),
+        "topic": topic,
+        "voice_path": voice_path,
+        "bgm_path": bgm_path,
+        "output_dir": str(OUTPUT_DIR),
+        "ads_dialogue_mode": ADS_DIALOGUE_MODE,
+        "adsd_lip_sync_experiment": ADSD_LIP_SYNC_EXPERIMENT,
+        "adsd_almighty_audio_dub_experiment": ADSD_ALMIGHTY_AUDIO_DUB_EXPERIMENT,
+        "video_w": VIDEO_W,
+        "video_h": VIDEO_H,
+        "aspect_ratio": ASPECT_RATIO,
+        "is_vertical": IS_VERTICAL,
+        "script": [_sanitize_scene_for_state(s) for s in script],
+    }
+    state_path.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+    log(f"pipeline_state.json 已保存（{len(script)} turn）：{state_path}")
+
+
 # ── audio_dub retiming：按 seg 真实长度重算 timeline，避免克隆语音被截 ─────────
 def _retime_after_audio_dub(script: list[dict]) -> int:
     """audio_dub 跑完后，用 seg_N.mp4 真实时长重算每个 turn 的 timeline。
@@ -14286,6 +14329,11 @@ def main():
         t = time.time(); bgm_path   = step6_parallel(script, topic, bgm_path if NO_VOICE else None); timings["图片+BGM 并发"] = time.time() - t
         if ADS_DIALOGUE_MODE and ADSD_LIP_SYNC_EXPERIMENT:
             t = time.time(); step66_adsd_lip_sync(script);                    timings["ADSD 口型同步"] = time.time() - t
+            # 保存 pipeline state 供 tools/rerun_downstream.py 局部重跑下游
+            try:
+                _save_pipeline_state(script, voice_path, bgm_path, topic)
+            except Exception as e:
+                log(f"pipeline_state.json 保存失败（不影响主流程）：{e}")
             # audio_dub retiming：按 seg_N.mp4 真实时长重算 timeline，
             # 防 master_voice TTS 短于克隆语音时 hybrid voice 被截尾
             try:
