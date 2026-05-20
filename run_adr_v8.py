@@ -6222,6 +6222,40 @@ ADR_SENSITIVE_DIALOGUE_PHRASES = [
 ]
 
 
+# 高敏感诗句 paraphrase 映射（命中后 audit_blocked retry 用）
+ADR_SENSITIVE_DIALOGUE_PARAPHRASE: dict[str, str] = {
+    "奉天子以令不臣": "孤要安定大局",
+    "出师未捷身先死": "未及功成便已陨落",
+    "周公吐哺天下归心": "广纳贤士定天下",
+    "对酒当歌人生几何": "举杯感叹人生短暂",
+    "宁我负人毋人负我": "孤宁负天下不愿被负",
+    "天行健君子以自强不息": "勇者当自强不息",
+}
+
+
+def _is_audit_blocked(info: dict) -> bool:
+    """检测 WERYDANCE 是否因 audit / copyright 拒绝。"""
+    resp = info.get("response") if isinstance(info, dict) else None
+    msg_pool = []
+    if isinstance(resp, dict):
+        msg_pool.append(str(resp.get("msg", "")))
+        msg_pool.append(str(resp.get("desc", "")))
+        msg_pool.append(str(resp.get("message", "")))
+    msg_pool.append(str(info.get("reason", "")) if isinstance(info, dict) else "")
+    blob = " ".join(msg_pool).lower()
+    return any(k in blob for k in ["audit", "copyright", "restriction", "asset audit"])
+
+
+def _paraphrase_sensitive_dialogue(text: str) -> tuple[str, bool]:
+    """命中高敏感名句 → 返回 paraphrase + True；否则返回原文 + False。"""
+    if not text:
+        return text, False
+    for sensitive, paraphrase in ADR_SENSITIVE_DIALOGUE_PARAPHRASE.items():
+        if sensitive in text:
+            return text.replace(sensitive, paraphrase), True
+    return text, False
+
+
 def _infer_meta_grid_costume(scene: dict) -> str:
     """从 scene 推断应召唤的服装标签。"""
     text = (scene.get("text", "") or "") + " " + (scene.get("shot", "") or "")
@@ -6331,6 +6365,47 @@ def generate_character_meta_grid_gpt_image2(speaker: str, visual_subject: str, v
         log(f"meta_grid {speaker} ✓ ({out_path.stat().st_size // 1024} KB)：{out_path}")
         return str(out_path)
     return None
+
+
+def _generate_all_character_meta_grids(script: list[dict], executor) -> dict[str, str]:
+    """ADR step6 阶段：为脚本中每个 unique a_roll/narrated_b speaker 并发生成人设符 grid。
+    silent_b 不需要人设符（无主体）。
+    返回 {speaker: grid_path}（含已存在的）。
+    """
+    seen: dict[str, dict] = {}
+    for s in script:
+        if _is_silent_b(s):
+            continue
+        speaker = (s.get("speaker") or "").strip()
+        if not speaker or speaker in seen:
+            continue
+        seen[speaker] = {
+            "visual_subject": s.get("visual_subject", ""),
+            "voice_gender": s.get("voice_gender", "male"),
+        }
+    if not seen:
+        log("人设符 meta_grid：脚本无 a_roll/narrated_b speaker，跳过")
+        return {}
+    log(f"人设符 meta_grid：{len(seen)} 个 unique speaker 待生成 [{' / '.join(seen.keys())}]")
+    futures = {
+        executor.submit(
+            generate_character_meta_grid_gpt_image2,
+            speaker, meta["visual_subject"], meta["voice_gender"],
+        ): speaker
+        for speaker, meta in seen.items()
+    }
+    result: dict[str, str] = {}
+    for fut in as_completed(futures):
+        speaker = futures[fut]
+        try:
+            path = fut.result(timeout=600)
+            if path:
+                result[speaker] = path
+        except Exception as e:
+            log(f"人设符 meta_grid {speaker} 异常：{e}")
+    if result:
+        tg(f"🧬 人设符 meta_grid 就绪：{len(result)}/{len(seen)} speaker（{' / '.join(result.keys())}）")
+    return result
 
 
 def _write_character_sheet_qa(payload: dict) -> None:
@@ -7259,6 +7334,15 @@ def step6_parallel(script: list[dict], topic: str, pregenerated_bgm_path: str | 
         completed = {}  # idx -> True
         approval_sent = set()  # 已推过审批的 idx，避免兜底重发
         generate_character_sheet_gpt_image2(script, topic)
+        # 人设符 PR (Phase 4)：每个 a_roll/narrated_b unique speaker 并发生成 meta_grid
+        if (
+            ADS_DIALOGUE_MODE and ADSD_LIP_SYNC_EXPERIMENT
+            and os.environ.get("ADR_USE_CHARACTER_META_GRID", "1").strip().lower() not in ("0", "false", "no", "off")
+        ):
+            try:
+                _generate_all_character_meta_grids(script, ex)
+            except Exception as e:
+                log(f"人设符 meta_grid 并发生成失败（fallback 切片路径）：{e}")
         generate_production_storyboard_page_gpt_image2(script, topic)
         storyboard_used = generate_storyboard_grid_gpt_image2(script, topic) or generate_storyboard_images_gpt_image2(script, topic)
         if storyboard_used:
@@ -10973,10 +11057,20 @@ def _lip_sync_one_scene(idx: int, scene: dict, target_dur: float, aspect_ratio: 
                 info["pass"] = ok
                 if ok:
                     info["candidate"] = "almighty_reference_then_video_lips_change"
+            audit_blocked_now = _is_audit_blocked(info)
             attempts.append({k: v for k, v in info.items() if k not in ("image_url", "audio_url", "response")})
             if ok:
                 info["attempts"] = attempts
                 return idx, ok, info
+            # 敏感词 retry (Phase 3)：audit blocked + 含敏感名句 + 未 retry → paraphrase 重新跑一次
+            if audit_blocked_now and not scene.get("_audit_retry"):
+                paraphrased, did_paraphrase = _paraphrase_sensitive_dialogue(scene.get("text", ""))
+                if did_paraphrase:
+                    log(f"[lip-sync {idx}] audit blocked → paraphrase 重试: 「{scene.get('text', '')[:30]}」→「{paraphrased[:30]}」")
+                    scene["text"] = paraphrased
+                    scene["_audit_retry"] = True
+                    scene["_audit_retry_original_text"] = scene.get("_audit_retry_original_text") or scene.get("text", "")
+                    return _lip_sync_one_scene(idx, scene, target_dur, aspect_ratio)
         final = dict(attempts[-1]) if attempts else {"turn": idx + 1, "pass": False, "reason": "no_attempts"}
         final.update({
             "turn": idx + 1,
