@@ -11133,15 +11133,19 @@ def _build_voice_clone_hybrid_audio(script: list[dict], master_voice_path: str) 
     work_dir.mkdir(exist_ok=True)
     master_voice_dur = ffprobe_duration(master_voice_path)
     silent_b_count = 0
+    narrated_clone_count = 0
     for i, scene in enumerate(script):
         needs_lip = bool(scene.get("needs_lip_sync", True))
+        is_narrated = _is_narrated_b(scene)
         seg_path = scene.get("vid_path") or ""
         vid_dur = float(scene.get("vid_duration", 0.0) or 0.0)
         if vid_dur <= 0:
             continue
         part_wav = str(work_dir / f"part_{i:02d}.wav")
-        a_roll_seg_has_audio = (
-            needs_lip and seg_path and os.path.exists(seg_path) and _has_audio_stream(seg_path)
+        # a_roll 和 narrated_b（已跑 audio_dub）都用 seg 内嵌克隆音色
+        seg_has_clone_audio = (
+            (needs_lip or is_narrated)
+            and seg_path and os.path.exists(seg_path) and _has_audio_stream(seg_path)
         )
         try:
             if _is_silent_b(scene):
@@ -11154,7 +11158,7 @@ def _build_voice_clone_hybrid_audio(script: list[dict], master_voice_path: str) 
                     timeout=30,
                 )
                 silent_b_count += 1
-            elif a_roll_seg_has_audio:
+            elif seg_has_clone_audio:
                 ffmpeg(
                     "-i", seg_path,
                     "-vn", "-ac", "1", "-ar", "44100",
@@ -11162,7 +11166,10 @@ def _build_voice_clone_hybrid_audio(script: list[dict], master_voice_path: str) 
                     part_wav,
                     timeout=60,
                 )
-                a_roll_count += 1
+                if needs_lip:
+                    a_roll_count += 1
+                else:
+                    narrated_clone_count += 1
             else:
                 # B-roll fallback：必须用原 master_voice 上的位置（retiming 前），
                 # 否则 retiming 把 cursor 推过 master_voice 总长，-ss 越界读空
@@ -11232,7 +11239,8 @@ def _build_voice_clone_hybrid_audio(script: list[dict], master_voice_path: str) 
         return None
     if not os.path.exists(out_mp3) or os.path.getsize(out_mp3) < 1000:
         return None
-    log(f"hybrid voice-clone master audio built ({a_roll_count} A-roll cloned, {silent_b_count} silent_b 静音, {len(parts)-a_roll_count-silent_b_count} narrated_b fallback)：{out_mp3}")
+    fallback_count = len(parts) - a_roll_count - silent_b_count - narrated_clone_count
+    log(f"hybrid voice-clone master audio built ({a_roll_count} A-roll cloned, {narrated_clone_count} narrated_b cloned, {silent_b_count} silent_b 静音, {fallback_count} fallback)：{out_mp3}")
     return out_mp3
 
 
