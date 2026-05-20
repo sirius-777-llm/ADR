@@ -2027,8 +2027,36 @@ def _parse_adsd_override_turns(raw_lines: list[str], topic: str) -> list[dict]:
     fallback_role = role_candidates[0]
     known: list[str] = []
     turns: list[dict] = []
+    # silent_b 单行标记：(silent) / [silent] / 空 visual hint
+    SILENT_LINE_RE = _re.compile(r"^[\[\(]?\s*silent\s*[\]\)]?(?:\s*:\s*(.*))?$", _re.IGNORECASE)
     for i, raw in enumerate(raw_lines):
         line = str(raw).strip()
+        silent_match = SILENT_LINE_RE.match(line)
+        if silent_match or line in {"(silent)", "[silent]", "(无)", "空镜"}:
+            visual_hint = (silent_match.group(1) if silent_match else "").strip() if silent_match else ""
+            speaker = "(silent)"
+            text = ""
+            voice_gender = "male"
+            voice = _voice_for_speaker(speaker, voice_gender)
+            inferred_emotion = "neutral"
+            shot_desc = visual_hint or "空镜 + 环境氛围呼吸位"
+            turns.append({
+                "dialogue_turn": i + 1,
+                "speaker": speaker,
+                "voice_gender": voice_gender,
+                "speaker_id": voice["voice_id"],
+                "speaker_name": voice["voice_name"],
+                "voice_asset_id": ADSD_GENDER_FALLBACK_VOICE_ASSET.get("male", ADSD_DEFAULT_MALE_VOICE_ASSET),
+                "needs_lip_sync": False,
+                "turn_type": "silent_b",
+                "text": "",
+                "shot": shot_desc,
+                "emotion": inferred_emotion,
+                "broll_rule": "environmental",
+                "duration_hint": 4.0,
+                "injected_script": True,
+            })
+            continue
         m = _re.match(r"^([^：:]{2,12})[：:]\s*(.+)$", line)
         if m:
             speaker = m.group(1).strip()
@@ -2047,10 +2075,8 @@ def _parse_adsd_override_turns(raw_lines: list[str], topic: str) -> list[dict]:
         inferred_gender = _adsd_infer_gender_from_speaker(speaker)
         voice = _voice_for_speaker(speaker, inferred_gender or None)
         voice_gender = inferred_gender or _adsd_gender_from_voice(voice) or "male"
-        # P3 音色库智能匹配：speaker name 关键字 → voice_assets.json 注册 asset
         voice_asset_id = _voice_asset_id_for_speaker(speaker, voice_gender)
         needs_lip_sync = _infer_needs_lip_sync(speaker, text)
-        # 旁白类自动 B-roll；shot 描述也改成动态镜头而非"现场说话"
         shot_desc = (
             f"{speaker}在现场说出这一句，旁人只作倾听或反应"
             if needs_lip_sync
@@ -10533,17 +10559,25 @@ def _lip_sync_one_scene(idx: int, scene: dict, target_dur: float, aspect_ratio: 
         return idx, ok, info
     try:
         image_url = _upload_to_weryai(scene["img_path"])
-        broll_use_sheet = os.environ.get("ADR_ADSD_BROLL_USE_CHARACTER_SHEET", "0").strip().lower() in ("1", "true", "yes", "on")
+        # multi-ref 默认启用 (Phase 6)：
+        # a_roll        → sheet + alt_panels + image
+        # narrated_b    → sheet + image (旁白也需要 character 一致性，但不要 alt_panels 因为旁白用统一画面风格)
+        # silent_b      → 只 image (无主体角色，sheet 反而干扰)
+        multi_ref_default = os.environ.get("ADR_MULTI_REF_DEFAULT", "1").strip().lower() not in ("0", "false", "no", "off")
+        broll_use_sheet = (
+            multi_ref_default
+            or os.environ.get("ADR_ADSD_BROLL_USE_CHARACTER_SHEET", "0").strip().lower() in ("1", "true", "yes", "on")
+        )
         broll_use_alt_panels = os.environ.get("ADR_ADSD_BROLL_ALT_PANELS", "0").strip().lower() in ("1", "true", "yes", "on")
         sheet_path = OUTPUT_DIR / "character_sheet.png"
         sheet_url = None
-        if (needs_lip or broll_use_sheet) and sheet_path.exists() and sheet_path.stat().st_size > 10000:
+        # silent_b 不用 character_sheet（没主体角色）；a_roll/narrated_b 默认带 sheet
+        if (needs_lip or (is_narrated and broll_use_sheet)) and sheet_path.exists() and sheet_path.stat().st_size > 10000:
             try:
                 sheet_url = _upload_to_weryai(str(sheet_path))
             except Exception as e:
                 log(f"[lip-sync {idx}] character sheet upload skipped: {e}")
-        # 同 speaker 的其他 panel 作为跨 turn 一致性 reference（最多 2 张）
-        # _alt_speaker_panels 由 step66_adsd_lip_sync 在线程外预先计算并塞进 scene
+        # alt_panels 只给 a_roll（同 speaker 跨 turn 一致性）；narrated_b/silent_b 不需要
         alt_panel_urls: list[str] = []
         for alt_path in (scene.get("_alt_speaker_panels", [])[:2] if (needs_lip or broll_use_alt_panels) else []):
             if not (alt_path and os.path.exists(alt_path)):
