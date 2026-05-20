@@ -14077,6 +14077,8 @@ def step10_deliver(final_path: str, topic: str, script: list[dict]):
     _delete_probe = _tg_probe_delete
 
     # ── 尝试 1：requests（timeout 放大到 600s），前后 probe 跳号检测 ──
+    # Round 8 假阴性 bug fix (2026-05-20)：必须验证 response body {"ok":true}，
+    # 不能只看 status_code 200。requests 在 SSL 半失败时可能返回 200 但视频未真发送
     probe_before = _send_probe("up-start")
     for attempt in range(2):
         try:
@@ -14089,8 +14091,28 @@ def step10_deliver(final_path: str, topic: str, script: list[dict]):
                     "height":            str(VIDEO_H),
                 }, files={"video": (os.path.basename(final_path), f, "video/mp4")}, timeout=(30, 600))
             if r.status_code == 200:
-                video_ok = True
-                break
+                try:
+                    resp_body = r.json()
+                except Exception:
+                    resp_body = None
+                if isinstance(resp_body, dict) and resp_body.get("ok") and isinstance(resp_body.get("result"), dict):
+                    video_ok = True
+                    log(f"requests 上传成功（第 {attempt+1} 次） message_id={resp_body['result'].get('message_id')}")
+                    break
+                else:
+                    log(f"requests 上传 status=200 但 body 不 ok（第 {attempt+1} 次）：{r.text[:200]}")
+                    # 用 probe 跳号 double-check：万一 body 解析问题但视频真发了
+                    time.sleep(2)
+                    probe_after = _send_probe("up-200-check")
+                    if probe_before is not None and probe_after is not None:
+                        gap = probe_after - probe_before
+                        if gap >= 2:
+                            log(f"probe 跳号确认：间隔 {gap} → 视频实际已落到 chat")
+                            video_ok = True
+                            _delete_probe(probe_after)
+                            break
+                        _delete_probe(probe_after)
+                        probe_before = _send_probe("up-retry")
             else:
                 log(f"requests 上传失败（{r.status_code}），第 {attempt+1} 次")
         except Exception as e:
