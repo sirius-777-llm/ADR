@@ -475,9 +475,14 @@ def _is_a_roll(scene: dict) -> bool:
 
 
 def _voice_asset_id_for_speaker(speaker: str, gender: str | None = None) -> str:
-    """根据 speaker name 关键字命中音色库的 voice_id；命中失败按 gender 走 fallback。"""
+    """根据 speaker name 关键字命中音色库的 voice_id；命中失败按 gender 走 fallback。
+    Speaker IP 集成：优先用 IP 中绑定的 voice_asset_id。"""
     s = str(speaker or "")
     g = (gender or "").strip().lower()
+    # Speaker IP 优先（如果 IP 含 voice_asset_id）
+    ip = _match_speaker_ip(s) if s else None
+    if ip and ip.get("voice_asset_id"):
+        return ip["voice_asset_id"]
     if not s:
         return ADSD_GENDER_FALLBACK_VOICE_ASSET.get(g, ADSD_DEFAULT_MALE_VOICE_ASSET)
     for keywords, asset_id in ADSD_SPEAKER_KEYWORD_TO_ASSET:
@@ -6284,19 +6289,82 @@ def _infer_meta_grid_pose(scene: dict) -> str:
 
 
 def _adsd_meta_grid_call_prompt(scene: dict) -> str:
-    """人设符召唤式 prompt：让 almighty 用 meta_grid 中标签对应 panel 渲染。"""
+    """人设符召唤式 prompt：让 almighty 用 meta_grid 中标签对应 panel 渲染。
+    Speaker IP 集成：若 IP 存在，注入 personality + era 让召唤更精准。"""
     speaker = scene.get("speaker", "speaker")
     dialogue = re.sub(r"\s+", " ", str(scene.get("text") or "")).strip()[:220]
     costume = _infer_meta_grid_costume(scene)
     pose = _infer_meta_grid_pose(scene)
+    ip = _match_speaker_ip(speaker)
+    ip_flavor = ""
+    if ip:
+        personality = ip.get("personality") or []
+        if personality:
+            ip_flavor += f"角色性格：{' / '.join(str(p) for p in personality[:3])}。"
+        era = ip.get("era", "")
+        if era:
+            ip_flavor += f"时代背景：{era}。"
     return (
         f"纪录片场景。使用上传的人设符参考图作为视觉指引——"
         f"重点关注标记为「{speaker}｜{costume}｜{pose}」的 panel，提取其中的服装、表情、动作。"
+        f"{ip_flavor}"
         f"生成普通话语音，演讲者准确说出：「{dialogue}」。"
         f"上传的音频仅作为音色、语速、年龄感参考。"
         f"嘴部可见，面部稳定，嘴型自然同步，符合真人节奏。"
         f"不要在画面上渲染任何文字、字幕、标签——人设符上的标签只是给 AI 看的元数据。"
     )[:1500]
+
+
+# ── Speaker IP Card (2026-05-21) ──────────────────────────────────────────
+# Speaker IP = 一个角色的完整档案：voice_asset + 人设符 + 性格 + 标志服装/姿势 + 标志台词
+# 跨片复用 + LLM 生成更贴合角色 + 召唤 prompt 更精准
+def _speaker_ips_dir() -> Path:
+    """speaker IP 卡目录。每个 speaker 一个 json 文件。"""
+    p = Path(__file__).resolve().parent / "voice_assets" / "speaker_ips"
+    p.mkdir(parents=True, exist_ok=True)
+    return p
+
+
+def _list_speaker_ips() -> dict[str, dict]:
+    """扫描 IP 库，返回 {规范化名: ip_dict}。"""
+    out: dict[str, dict] = {}
+    for f in _speaker_ips_dir().glob("*.json"):
+        try:
+            data = json.loads(f.read_text(encoding="utf-8"))
+            name = str(data.get("speaker", f.stem)).strip()
+            if name:
+                out[name] = data
+        except Exception as e:
+            log(f"speaker_ip {f.name} 解析失败：{e}")
+    return out
+
+
+def _match_speaker_ip(speaker: str) -> dict | None:
+    """按 speaker name 或 aliases 匹配 IP。"""
+    if not speaker:
+        return None
+    speaker = str(speaker).strip()
+    ips = _list_speaker_ips()
+    if speaker in ips:
+        return ips[speaker]
+    # alias 匹配
+    for ip in ips.values():
+        aliases = ip.get("aliases") or []
+        if speaker in aliases:
+            return ip
+    # 子串包含（例如 "曹操元嘉" 命中 "曹操"）
+    for name, ip in ips.items():
+        if name in speaker:
+            return ip
+    return None
+
+
+def _save_speaker_ip(speaker: str, ip_dict: dict) -> Path:
+    """写入 / 更新 speaker IP json。"""
+    safe = re.sub(r"[^一-龥A-Za-z0-9]", "", speaker)[:30] or "speaker"
+    p = _speaker_ips_dir() / f"{safe}.json"
+    p.write_text(json.dumps(ip_dict, ensure_ascii=False, indent=2), encoding="utf-8")
+    return p
 
 
 def _character_meta_grid_cache_dir() -> Path:
@@ -6324,11 +6392,30 @@ def generate_character_meta_grid_gpt_image2(speaker: str, visual_subject: str, v
 
     返回 grid 文件路径；失败返回 None。
     Spike 5/5b 已验证：GPT_IMAGE_2 中文标签可读 + almighty 按标签召唤生效。
+    Speaker IP 集成 (2026-05-21)：优先复用 IP 中绑定的 meta_grid，IP 含 visual_subject 时覆盖参数。
     """
     out_path = _character_meta_grid_path(speaker)
     if out_path.exists() and out_path.stat().st_size > 100000:
         log(f"reuse existing meta_grid: {out_path}")
         return str(out_path)
+    # Speaker IP 集成：优先用 IP 绑定的 meta_grid（如已有）+ 用 IP visual_subject 描述
+    ip = _match_speaker_ip(speaker)
+    if ip:
+        ip_meta_grid_rel = ip.get("meta_grid", "")
+        if ip_meta_grid_rel:
+            ip_meta_grid = Path(__file__).resolve().parent / ip_meta_grid_rel
+            if ip_meta_grid.exists() and ip_meta_grid.stat().st_size > 100000:
+                try:
+                    from shutil import copyfile
+                    copyfile(ip_meta_grid, out_path)
+                    log(f"Speaker IP: meta_grid {speaker} 从 IP 绑定路径复用 ({ip_meta_grid.stat().st_size // 1024} KB)")
+                    return str(out_path)
+                except Exception as e:
+                    log(f"IP meta_grid 复用失败（继续）：{e}")
+        # 用 IP 中的 visual_subject 替代参数（更精准）
+        if ip.get("visual_subject"):
+            visual_subject = ip["visual_subject"]
+            log(f"Speaker IP: {speaker} 用 IP visual_subject 覆盖")
     # 方向 4: 先查跨 run 缓存（voice_assets/character_meta_grids/{speaker}.png）
     cache_path = _character_meta_grid_cache_path(speaker)
     use_cache = os.environ.get("ADR_META_GRID_CACHE", "1").strip().lower() not in ("0", "false", "no", "off")
@@ -7402,13 +7489,23 @@ def step6_parallel(script: list[dict], topic: str, pregenerated_bgm_path: str | 
         else:
             log("方向 1: 跳过 production_storyboard_page sidecar QA")
         if skip_storyboard_grid:
-            log("方向 3: 人设符模式 → 跳过 storyboard_grid (主路径用 meta_grid 不需要切 panel)")
-            storyboard_used = False
-            # 人设符路径下 img_path 没人用，但 step345/step8 可能引用，需要 placeholder
-            # 把 img_path 指向该 turn speaker 的 meta_grid（最坏 fallback 用）
+            log("方向 3: 人设符模式 → 跳过 storyboard_grid 和 12 张 panel 单图生成 (主路径用 meta_grid)")
+            # 关键 fix: 把 storyboard_used 设 True，避免下游走 legacy 逐张 panel fallback (那也是 12 张图)
+            # img_path 指向 speaker meta_grid 当兜底 ref（最坏 fallback 用单 panel 模式时）
+            storyboard_used = True
             for i, scene in enumerate(script):
-                if not scene.get("img_path"):
-                    scene["img_path"] = str(OUTPUT_DIR / f"img_{i}.jpg")
+                speaker = scene.get("speaker", "")
+                mg_path = _character_meta_grid_path(speaker) if speaker else None
+                if mg_path and mg_path.exists():
+                    scene["img_path"] = str(mg_path)
+                else:
+                    # fallback: 任何已生成的 meta_grid
+                    any_mg = next(OUTPUT_DIR.glob("meta_grid_*.png"), None)
+                    if any_mg:
+                        scene["img_path"] = str(any_mg)
+                    else:
+                        scene["img_path"] = str(OUTPUT_DIR / f"img_{i}.jpg")
+            completed = {i: True for i in range(n)}
         else:
             storyboard_used = generate_storyboard_grid_gpt_image2(script, topic) or generate_storyboard_images_gpt_image2(script, topic)
         if storyboard_used:
