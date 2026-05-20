@@ -11158,8 +11158,11 @@ def _build_voice_clone_hybrid_audio(script: list[dict], master_voice_path: str) 
                 )
                 silent_b_count += 1
             elif seg_has_clone_audio:
+                # Bug C fix (2026-05-20)：per-part loudnorm 让 narrated_b 响度匹配 a_roll
+                # 不归一化时 narrated_b 比 a_roll 弱 10+ dB（实测 -30 dB vs -17 dB），旁白几乎听不见
                 ffmpeg(
                     "-i", seg_path,
+                    "-af", "loudnorm=I=-16:LRA=11:TP=-1.5",
                     "-vn", "-ac", "1", "-ar", "44100",
                     "-c:a", "pcm_s16le",
                     part_wav,
@@ -12276,12 +12279,15 @@ def step9_render(raw_path: str, voice_path: str, bgm_path: str | None, ass_path:
                 final_path,
             )
         else:
+            # Bug A fix (2026-05-20)：voice 1.5→1.0 + BGM 0.6→0.85
+            # 之前 voice 经 loudnorm + ×1.5 接近 clipping，把 BGM 完全压在 voice 段听不到
+            # 调整为更平衡的混音比例，让 a_roll/narrated_b 段也保留 BGM 存在感
             ffmpeg(
                 "-i", raw_path,
                 "-itsoffset", offset, "-i", voice_path,
                 "-itsoffset", offset, "-i", bgm_path,
                 "-filter_complex",
-                "[1:a]apad=pad_dur=1.5,volume=1.5[va];[2:a]volume=0.6[ba];[va][ba]amix=inputs=2:duration=first[aout]",
+                "[1:a]apad=pad_dur=1.5,volume=1.0[va];[2:a]volume=0.85[ba];[va][ba]amix=inputs=2:duration=first[aout]",
                 "-map", "0:v",
                 "-map", "[aout]",
                 "-vf", vf_with_subtitles,
