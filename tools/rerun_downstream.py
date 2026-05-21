@@ -31,12 +31,13 @@ from pathlib import Path
 
 def main() -> int:
     if len(sys.argv) < 2:
-        print(f"Usage: {sys.argv[0]} <OUTPUT_DIR>")
+        print(f"Usage: {sys.argv[0]} <OUTPUT_DIR> [--regen-bgm]")
         return 1
     output_dir = Path(sys.argv[1]).resolve()
     if not output_dir.is_dir():
         print(f"OUTPUT_DIR 不存在: {output_dir}")
         return 1
+    regen_bgm = "--regen-bgm" in sys.argv
 
     state_path = output_dir / "pipeline_state.json"
     if not state_path.exists():

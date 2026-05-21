@@ -7446,6 +7446,40 @@ def _llm_bgm_description(topic: str, tone: str) -> str | None:
         return None
 
 
+def _bgm_contains_vocals(bgm_path: str, sample_len: float = 20.0) -> bool:
+    """检测 BGM 是否含 lyrics / vocal。
+    用 faster-whisper auto-detect 语言；如果识别到 ≥3 个英文/中文 token → 判定含 vocal。
+    WERYAI music generate 偶尔忽略 "no vocals" 出带 vocal 的 BGM。"""
+    try:
+        from faster_whisper import WhisperModel
+    except Exception:
+        log("faster_whisper 不可用，跳过 BGM vocal 检测")
+        return False
+    if not os.path.exists(bgm_path):
+        return False
+    try:
+        # 先取头部 sample_len 秒检测（节省时间）
+        sample_path = bgm_path + ".vocal_check.wav"
+        ffmpeg("-i", bgm_path, "-t", f"{sample_len}", "-ac", "1", "-ar", "16000",
+               "-c:a", "pcm_s16le", sample_path, timeout=30)
+        model = WhisperModel("base", compute_type="int8")
+        segs, _info = model.transcribe(sample_path, beam_size=1, vad_filter=True)
+        text = "".join(s.text for s in segs).strip()
+        try:
+            os.remove(sample_path)
+        except Exception:
+            pass
+        # 过滤明显错觉（whisper 在纯音乐里偶发 hallucinate 1-2 字）
+        tokens = [t for t in re.split(r"[\s,，。.!?！？]+", text) if t]
+        has_vocal = len([t for t in tokens if len(t) >= 2]) >= 3
+        if has_vocal:
+            log(f"BGM vocal 检测命中：「{text[:120]}」")
+        return has_vocal
+    except Exception as e:
+        log(f"BGM vocal 检测异常（保留原 BGM）：{e}")
+        return False
+
+
 def generate_bgm(topic: str, tone: str = "中性") -> str | None:
     bgm_path = str(OUTPUT_DIR / "bgm.mp3")
     MAX_BGM_RETRY = 3
@@ -7523,6 +7557,14 @@ def generate_bgm(topic: str, tone: str = "中性") -> str | None:
             except Exception as _e:
                 log(f"BGM 截 intro 失败（保留原 BGM）：{_e}")
             if os.path.exists(bgm_path) and os.path.getsize(bgm_path) > 10000:
+                # 2026-05-21 fix: WERYAI music 偶尔忽略 "no vocals" 出带英文 vocal 的 BGM
+                # ASR 检测 BGM 含 lyrics → 自动重试
+                if _bgm_contains_vocals(bgm_path):
+                    log(f"BGM 第 {attempt} 次含 vocal（违反 instrumental），重试...")
+                    if attempt < MAX_BGM_RETRY:
+                        continue
+                    else:
+                        tg(f"⚠️ BGM {MAX_BGM_RETRY} 次都含 vocal，仍用最后版本")
                 tg(f"🎵 BGM 生成完毕 ✓（第{attempt}次尝试）")
                 return bgm_path
             else:
@@ -12441,8 +12483,12 @@ def step8_subtitles(script: list[dict]) -> str:
         return lines
 
     def _wrap_card(text: str, max_width: float | None = None, max_lines: int = 2) -> list[str]:
-        """Wrap into one subtitle card: semantic tokens, max two display lines."""
-        max_width = max_width or (9.0 if IS_VERTICAL else 14.5)
+        """Wrap into one subtitle card: semantic tokens, max two display lines.
+
+        Fix 2026-05-21: 横屏 max_width 14.5 与 SUBTITLE_MAX_CHARS=16 冲突，
+        LLM 切到 16 字时 _wrap_card 强制换行。改为 ≥ SUBTITLE_MAX_CHARS+2 让 LLM 切的段能单行显示。
+        """
+        max_width = max_width or (9.0 if IS_VERTICAL else float(SUBTITLE_MAX_CHARS) + 2.0)
         text = _clean_display(text)
         if not text:
             return []
