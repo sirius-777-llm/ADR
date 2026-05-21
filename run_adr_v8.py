@@ -5611,13 +5611,30 @@ def _wait_approval(idx: int, timeout: int = 300) -> bool:
     return True
 
 
-def _render_still_segment(scene: dict, timeout: int = 30) -> None:
-    """Render one still image into its timed video segment."""
+def _render_still_segment(scene: dict, timeout: int = 30, ken_burns: bool = False) -> None:
+    """Render one still image into its timed video segment.
+    ken_burns=True: 加慢推 zoom (1.0→1.06) + 微 pan，避免完全冻帧（step7 防御层兜底用）。"""
     dur = scene["vid_duration"]
+    if ken_burns:
+        # Ken Burns: 1.2× 预 scale (够 zoom 1.06 余量) + zoompan 慢推 + 微 pan
+        # zoom 只到 1.06 不需 2× 预 scale，避免大尺寸 ffmpeg 计算超时
+        frames = max(24, int(float(dur) * 24))
+        sw = int(VIDEO_W * 1.2)
+        sh = int(VIDEO_H * 1.2)
+        vf = (
+            f"scale={sw}:{sh}:force_original_aspect_ratio=increase,"
+            f"crop={sw}:{sh},"
+            f"zoompan=z='min(1.0+0.0008*on,1.06)':"
+            f"x='iw/2-(iw/zoom/2)+sin(on/40)*8':y='ih/2-(ih/zoom/2)+cos(on/40)*6':"
+            f"d={frames}:s={VIDEO_W}x{VIDEO_H}:fps=24,"
+            f"setsar=1"
+        )
+    else:
+        vf = f"scale={VIDEO_W}:{VIDEO_H}:force_original_aspect_ratio=increase,crop={VIDEO_W}:{VIDEO_H},setsar=1"
     ffmpeg(
         "-loop", "1", "-framerate", "24", "-t", str(dur),
         "-i", scene["img_path"],
-        "-vf", f"scale={VIDEO_W}:{VIDEO_H}:force_original_aspect_ratio=increase,crop={VIDEO_W}:{VIDEO_H},setsar=1",
+        "-vf", vf,
         "-c:v", "libx264", "-crf", "23", "-preset", "ultrafast",
         "-pix_fmt", "yuv420p", "-an",
         scene["vid_path"],
@@ -13110,20 +13127,27 @@ def step7_concat(script: list[dict]) -> str:
                 still_src = cover_path  # 最后 fallback：cover
             if still_src:
                 try:
-                    log(f"step7 防御：seg_{i}.mp4 缺失 → 用 {os.path.basename(still_src)} 现场补 still seg")
+                    log(f"step7 防御：seg_{i}.mp4 缺失 → 用 {os.path.basename(still_src)} 现场补 Ken Burns still seg")
                     # 临时换 img_path 让 _render_still_segment 用合法图
                     orig_img = s.get("img_path")
                     s["img_path"] = still_src
                     try:
-                        _render_still_segment(s, timeout=30)
+                        # ken_burns=True 让冻帧动起来（slow zoom + 微 pan），避免画面死板
+                        _render_still_segment(s, timeout=60, ken_burns=True)
                     finally:
                         s["img_path"] = orig_img
                     if os.path.exists(vp) and os.path.getsize(vp) > 1000:
                         src_label = "邻 turn 图" if still_src in legit_imgs else ("cover" if still_src == cover_path else "原 img")
-                        tg(f"⚠️ turn {i+1} WERYDANCE 失败 → 用静态图补救（来源: {src_label}）")
+                        tg(f"⚠️ turn {i+1} WERYDANCE 失败 → Ken Burns 慢推静态图补救（来源: {src_label}）")
                         continue
                 except Exception as e:
                     log(f"step7 防御 turn {i+1} still seg 补救失败：{e}")
+                    # cleanup partial: ffmpeg -y 失败时可能写了半成品，导致后续过滤逻辑误判 "vid_path 存在"
+                    try:
+                        if vp and os.path.exists(vp):
+                            os.remove(vp)
+                    except Exception:
+                        pass
             log(f"step7 防御：turn {i+1} seg 不可恢复（无合法图源），从 script 移除")
             tg(f"⚠️ turn {i+1} seg 不可恢复，从拼接队列剔除")
     script[:] = [s for s in script if s.get("vid_path") and os.path.exists(s["vid_path"]) and os.path.getsize(s["vid_path"]) > 1000]
