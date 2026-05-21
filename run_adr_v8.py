@@ -2311,6 +2311,14 @@ action_b    武戏 / 激烈对抗 / 突破冲击 镜头
                   动作场面下游会触发更密集镜头切换 + 动态镜头运动 prompt
                   silent_b 通常 false (空镜呼吸位)
                   默认 false
+- meta_grid_costume  (a_roll/narrated_b 填，silent_b/action_b 写 "")
+                    该 turn speaker 应召唤人设符 grid 中的哪个服装 panel
+                    从 IP context 给出的 costume_variants 池中选
+                    没池时根据题材判断 (e.g. 历史→朝服/战袍 / 现代→西装/便服)
+- meta_grid_pose    (a_roll/narrated_b 填，silent_b/action_b 写 "")
+                    该 turn speaker 应召唤人设符 grid 中的哪个动作 panel
+                    从 IP context 给出的 poses 池中选
+                    根据 text 推断 (说话/沉思/书写/发令/...)
 
 【画面禁忌】（narrated_b / silent_b）
 ✗ 不能有「角色对镜头说话」
@@ -2420,6 +2428,8 @@ action_b    武戏 / 激烈对抗 / 突破冲击 镜头
             emotion = "neutral"
         broll_rule = str(item.get("broll_rule", "")).strip().lower()
         is_action_scene_flag = bool(item.get("is_action_scene", False))
+        llm_costume = str(item.get("meta_grid_costume", "")).strip()
+        llm_pose = str(item.get("meta_grid_pose", "")).strip()
         try:
             duration_hint = float(item.get("duration_hint", 0) or 0)
         except Exception:
@@ -2472,6 +2482,8 @@ action_b    武戏 / 激烈对抗 / 突破冲击 镜头
             "duration_hint": duration_hint,
             "is_action_scene": is_action_scene_flag or is_action,
             "needs_lip_sync": (not is_silent and not is_narrated and not is_action),
+            "meta_grid_costume": llm_costume,
+            "meta_grid_pose": llm_pose,
         })
     speakers = [t["speaker"] for t in turns if t.get("speaker")]
     shape = _adsd_dialogue_shape(speakers)
@@ -6577,7 +6589,11 @@ def _resolve_meta_grid_template(speaker: str, topic: str = "", ip: dict | None =
 
 def _infer_meta_grid_costume(scene: dict) -> str:
     """从 scene + speaker IP template 池中匹配 costume 标签。
+    LLM 智能召唤 (2026-05-21): 优先用 scene.meta_grid_costume (script-gen LLM 预填)。
     历史规则 (战袍/朝服/夜行) 现仅在 IP era=historical 时用，否则从 IP template.costume_variants 池选。"""
+    llm_tag = str(scene.get("meta_grid_costume", "") or "").strip()
+    if llm_tag:
+        return llm_tag
     text = (scene.get("text", "") or "") + " " + (scene.get("shot", "") or "")
     speaker = scene.get("speaker", "")
     ip = _match_speaker_ip(speaker) if speaker else None
@@ -6621,7 +6637,11 @@ def _infer_meta_grid_costume(scene: dict) -> str:
 
 
 def _infer_meta_grid_pose(scene: dict) -> str:
-    """从 scene + speaker IP template 池中匹配 pose 标签。"""
+    """从 scene + speaker IP template 池中匹配 pose 标签。
+    LLM 智能召唤 (2026-05-21): 优先用 scene.meta_grid_pose (script-gen LLM 预填)。"""
+    llm_tag = str(scene.get("meta_grid_pose", "") or "").strip()
+    if llm_tag:
+        return llm_tag
     text = (scene.get("text", "") or "") + " " + (scene.get("shot", "") or "")
     emotion = (scene.get("emotion", "") or "").lower()
     speaker = scene.get("speaker", "")
@@ -6800,6 +6820,16 @@ def _build_speaker_ip_context_for_script(topic: str, role_candidates: list[str])
                 person_lines.append(f"  与其他出场角色关系: {' / '.join(other_known)}")
         if ip.get("era"):
             person_lines.append(f"  时代: {ip['era']}")
+        # LLM 智能召唤标签：把 IP meta_grid_template_cache 里的 costume/pose 池提供给 LLM
+        cache = ip.get("meta_grid_template_cache") or {}
+        any_template = next(iter(cache.values()), None) if cache else None
+        if any_template:
+            costumes = any_template.get("costume_variants") or []
+            poses = any_template.get("poses") or []
+            if costumes:
+                person_lines.append(f"  可用 meta_grid_costume 池: {' / '.join(costumes)}")
+            if poses:
+                person_lines.append(f"  可用 meta_grid_pose 池: {' / '.join(poses)}")
         lines.extend(person_lines)
         # B · usage_history 注入：让 LLM 看到该 speaker 之前说过的避免重复
         history_block = _format_speaker_usage_history_for_prompt(sp, max_lines=6)
@@ -6926,6 +6956,175 @@ def _format_speaker_usage_history_for_prompt(speaker: str, max_lines: int = 8) -
         if text:
             lines.append(f"    · 「{text}」（{topic} 片中）")
     return "\n".join(lines)
+
+
+def _llm_infer_ip_skeleton(speaker: str, brief: str) -> dict | None:
+    """AUTO-IP (2026-05-21): LLM 生成 IP 骨架字段。失败返回 None。"""
+    prompt = f"""你是 ADR 项目的角色卡设计师。为以下角色生成完整 Speaker IP 数据。
+
+角色名: {speaker}
+简介/出处: {brief}
+
+输出严格 JSON，含字段:
+  aliases: 该角色的别称数组 (中英文都可，0-5 个)
+  visual_subject: 25-40 词英文描述外形（年龄+种族+体型+面部特征+服饰+时代背景）
+  era: 该角色所处时代/年代（中文短语）
+  personality: 4-6 条性格/特质短语（中文，每条 4-8 字）
+  catchphrases: 该角色 2-4 句典型/历史/标志性台词（中文原文，避免争议性政治内容）
+  costume_variants: 4 套该角色不同场合服装名（中文短语）
+  poses: 6 种该角色典型姿态/动作（中文短语，如「说话」「沉思」「书写」）
+  emotion_palette: 4 种该角色情绪基调（中文短语）
+  scenes: 4 个该角色典型场景（中文短语）
+  voice_gender: "male" 或 "female"
+  voice_tone_hint: 中文短语描述音色调性（如「磁性深沉纪录片」「斯文学者」「年轻活力」）
+  note: 1-2 句使用提示（召唤时优先什么基调）
+
+要求:
+1. 严格 JSON，不要 markdown，不要解释
+2. 历史人物用真实信息；虚构/小说人物按设定；现代职业/泛角色（如「客户经理」「记者」）按角色定位推断
+3. catchphrases 避开教科书超级著名诗句（会触发 audit）
+4. visual_subject 详细但避免明星名字
+
+只输出 JSON。"""
+    try:
+        raw = chat("GEMINI_25_FLASH", "你只输出严格 JSON。", prompt, max_tokens=1500, timeout=90)
+    except Exception as e:
+        log(f"AUTO-IP {speaker} LLM 调用失败: {e}")
+        return None
+    start = raw.find("{")
+    end = raw.rfind("}")
+    if start < 0 or end <= start:
+        log(f"AUTO-IP {speaker} LLM 输出非 JSON: {raw[:200]}")
+        return None
+    try:
+        return json.loads(raw[start:end + 1])
+    except Exception as e:
+        log(f"AUTO-IP {speaker} JSON 解析失败: {e}")
+        return None
+
+
+def _llm_pick_voice_asset_for_ip(voice_gender: str, voice_tone_hint: str) -> str:
+    """AUTO-IP: 从 voice_assets.json 池按 gender+tone hint 推荐 voice_id。"""
+    catalog_path = Path(__file__).resolve().parent / "voice_assets" / "voice_assets.json"
+    fallback = ADSD_DEFAULT_MALE_VOICE_ASSET if voice_gender == "male" else ADSD_GENDER_FALLBACK_VOICE_ASSET.get("female", ADSD_DEFAULT_MALE_VOICE_ASSET)
+    if not catalog_path.exists():
+        return fallback
+    try:
+        catalog = json.loads(catalog_path.read_text(encoding="utf-8"))
+    except Exception:
+        return fallback
+    assets = catalog.get("assets", [])
+    candidates = [
+        a for a in assets
+        if a.get("gender", "").lower() == voice_gender.lower()
+        and not a.get("high_risk_public_figure", False)
+        and "singing_not_speech" not in (a.get("quality_flags") or [])
+    ]
+    if not candidates:
+        return fallback
+    short_pool = [
+        {
+            "voice_id": a.get("voice_id"),
+            "name": a.get("display_name", ""),
+            "tone_tags": (a.get("tone_tags") or [])[:4],
+            "age": a.get("age_style", ""),
+            "person": str(a.get("identified_person", ""))[:40],
+        }
+        for a in candidates[:30]
+    ]
+    prompt = f"""从下面 voice_asset 池里挑最匹配的 1 个 voice_id。
+
+候选池（gender={voice_gender}）:
+{json.dumps(short_pool, ensure_ascii=False)}
+
+目标音色调性: {voice_tone_hint}
+
+只输出 1 个 voice_id 字符串，不要解释，不要 markdown。"""
+    try:
+        raw = chat("GEMINI_25_FLASH", "你只输出一个 voice_id 字符串。", prompt, max_tokens=80, timeout=30)
+        vid = raw.strip().strip('"').strip("'").strip()
+        valid = {a["voice_id"] for a in candidates}
+        if vid in valid:
+            return vid
+    except Exception as e:
+        log(f"AUTO-IP voice_asset 推荐失败: {e}")
+    return candidates[0].get("voice_id", fallback)
+
+
+def _auto_incubate_missing_ips(script: list[dict], topic: str) -> int:
+    """AUTO-IP (2026-05-21): 扫描脚本中无 IP card 的 speaker → 自动孵化。
+
+    env ADR_AUTO_INCUBATE_IP=0 关闭（默认开）。
+    qa_status=auto_generated_pending_review（标记待审）。
+    meta_grid PNG 不在此处生成（step6 会按需生成并写入 cache）。
+    Returns: 孵化数量。
+    """
+    if os.environ.get("ADR_AUTO_INCUBATE_IP", "1").strip().lower() in ("0", "false", "no", "off"):
+        return 0
+    if not script:
+        return 0
+    seen = set()
+    speakers_in_script: list[str] = []
+    for s in script:
+        sp = (s.get("speaker") or "").strip()
+        if not sp or sp in seen:
+            continue
+        seen.add(sp)
+        speakers_in_script.append(sp)
+    missing = [sp for sp in speakers_in_script if not _match_speaker_ip(sp)]
+    if not missing:
+        return 0
+    log(f"AUTO-IP: {len(missing)} 个 speaker 无 IP → 自动孵化：{missing}")
+    try:
+        tg(f"🪺 AUTO-IP：检测到 {len(missing)} 个新 speaker（{', '.join(missing)}），开始 LLM 孵化")
+    except Exception:
+        pass
+    incubated = 0
+    for speaker in missing:
+        try:
+            brief_hint = f"出现在 ADR 题材「{topic}」中的角色"
+            skeleton = _llm_infer_ip_skeleton(speaker, brief_hint)
+            if not skeleton:
+                log(f"AUTO-IP {speaker} 跳过（LLM skeleton 失败）")
+                continue
+            voice_gender = skeleton.get("voice_gender", "male")
+            voice_tone_hint = skeleton.get("voice_tone_hint", "")
+            voice_asset_id = _llm_pick_voice_asset_for_ip(voice_gender, voice_tone_hint)
+            ip = {
+                "speaker": speaker,
+                "aliases": skeleton.get("aliases", []),
+                "voice_asset_id": voice_asset_id,
+                "voice_gender": voice_gender,
+                "visual_subject": skeleton.get("visual_subject", ""),
+                "meta_grid": f"voice_assets/character_meta_grids/{speaker}.png",
+                "era": skeleton.get("era", ""),
+                "accent": "mandarin",
+                "personality": skeleton.get("personality", []),
+                "catchphrases": skeleton.get("catchphrases", []),
+                "costume_variants": skeleton.get("costume_variants", []),
+                "poses": skeleton.get("poses", []),
+                "emotion_palette": skeleton.get("emotion_palette", []),
+                "scenes": skeleton.get("scenes", []),
+                "note": skeleton.get("note", ""),
+                "created_at": f"auto_incubated_from_topic:{topic}",
+                "qa_status": "auto_generated_pending_review",
+                "usage_count": 0,
+                "usage_history": [],
+            }
+            _save_speaker_ip(speaker, ip)
+            incubated += 1
+            log(f"AUTO-IP {speaker}: era={ip['era']} voice={voice_asset_id}")
+            try:
+                tg(f"  ✓ {speaker} IP 孵化完成 · era={ip['era']} · voice={voice_asset_id} · qa=auto_generated_pending_review")
+            except Exception:
+                pass
+        except Exception as e:
+            log(f"AUTO-IP {speaker} 孵化异常：{e}")
+            try:
+                tg(f"  ⚠️ {speaker} 孵化失败（流程继续，用 fallback）：{e}")
+            except Exception:
+                pass
+    return incubated
 
 
 def _character_meta_grid_cache_dir() -> Path:
@@ -15471,6 +15670,14 @@ def main():
 
     try:
         t = time.time(); script, spk_id, spk_name = step1_script(topic);       timings["剧本+制片人准则+画面提示词+音色"] = time.time() - t
+        # AUTO-IP (2026-05-21): 检测脚本中无 IP card 的 speaker → 自动孵化
+        try:
+            t = time.time()
+            incubated = _auto_incubate_missing_ips(script, topic)
+            if incubated > 0:
+                timings["AUTO-IP 孵化"] = time.time() - t
+        except Exception as e:
+            log(f"AUTO-IP 异常（不影响流程）：{e}")
         # 异步 kickoff：caption LLM + 封面图（GPT Image 2 ~180s）跟 step6/66/7/8/9 并发跑
         _async_kickoff_cover_caption(topic, script)
         bgm_path = None
