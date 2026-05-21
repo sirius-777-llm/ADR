@@ -307,8 +307,12 @@ ADSD_GENDER_FALLBACK_VOICE_ASSET = {
 # _ACTION_KEYWORDS_ZH 已抽到 adr_data/action_keywords.py（顶部已 import）
 
 
-def _is_action_scene(text: str, shot: str = "") -> bool:
-    """检测是否动作场面（武侠/修真/打斗题材）"""
+def _is_action_scene(text: str, shot: str = "", scene: dict | None = None) -> bool:
+    """检测是否动作场面。
+    阶段 3 (2026-05-21): 优先用 scene["is_action_scene"] (LLM 标记)，
+    缺失时 fallback 关键字命中 ≥2 个规则。"""
+    if scene is not None and isinstance(scene, dict) and "is_action_scene" in scene:
+        return bool(scene.get("is_action_scene"))
     combined = str(text or "") + " " + str(shot or "")
     hits = sum(1 for kw in _ACTION_KEYWORDS_ZH if kw in combined)
     return hits >= 2  # 至少 2 个动作关键字
@@ -1987,6 +1991,13 @@ def _adsd_allows_media_role(topic: str) -> bool:
 
 
 def _adsd_role_candidates(topic: str) -> list[str]:
+    # 阶段 3 (2026-05-21): 优先 LLM topic_decomposition role_candidates
+    decomp = _llm_topic_decomposition(topic)
+    if decomp.get("role_candidates"):
+        roles = [str(r).strip() for r in decomp["role_candidates"] if str(r).strip()]
+        if len(roles) >= 3:
+            return roles[:6]
+    # Fallback 现有硬编码关键词分支
     if any(k in topic for k in ("同泰寺", "佛", "僧", "梁武帝", "萧衍", "寺")):
         return ["寺中僧人", "朝廷官员", "梁朝文士", "寺外百姓"]
     if any(k in topic for k in ("公车上书", "康有为", "梁启超", "科举", "上书")):
@@ -2278,6 +2289,11 @@ silent_b    氛围呼吸镜头 + 仅 BGM
                 narrated_b: silhouette | back_view | wide_shot | crowd | statue | historical_painting
                 silent_b:   empty_scene | object_close_up | environmental | distant_figure
                 a_roll: 写 ""
+- is_action_scene  true/false (该 turn 是否动作场面：战斗/打斗/激烈对抗/突破/冲撞/爆炸/绝杀进球/激烈论战 等)
+                  现代/历史/体育 跨题材通用判定，不限关键字
+                  动作场面下游会触发更密集镜头切换 + 动态镜头运动 prompt
+                  silent_b 通常 false (空镜呼吸位)
+                  默认 false
 
 【画面禁忌】（narrated_b / silent_b）
 ✗ 不能有「角色对镜头说话」
@@ -2385,6 +2401,7 @@ silent_b    氛围呼吸镜头 + 仅 BGM
         if emotion not in _SUPPORTED_EMOTIONS:
             emotion = "neutral"
         broll_rule = str(item.get("broll_rule", "")).strip().lower()
+        is_action_scene_flag = bool(item.get("is_action_scene", False))
         try:
             duration_hint = float(item.get("duration_hint", 0) or 0)
         except Exception:
@@ -2431,6 +2448,7 @@ silent_b    氛围呼吸镜头 + 仅 BGM
             "emotion": emotion,
             "broll_rule": broll_rule,
             "duration_hint": duration_hint,
+            "is_action_scene": is_action_scene_flag,
             "needs_lip_sync": (not is_silent and not is_narrated),
         })
     speakers = [t["speaker"] for t in turns if t.get("speaker")]
@@ -6042,9 +6060,16 @@ def _storyboard_grid_prompt(batch_script: list[dict], start: int, total: int, to
         lines.append(f"{local_i:02d}. Visual: {prompt[:visual_limit]}\n    Beat: {text[:beat_limit]}\n    Motion: {action}")
     count = len(batch_script)
     culture_guard = _topic_culture_guard(batch_script[0].get("topic_meta", {}) if batch_script else {})
+    # 阶段 3 (2026-05-21): 注入 LLM 推断的 director_style + era 让 storyboard 题材-aware
+    decomp = _llm_topic_decomposition(topic)
+    director_block = ""
+    if decomp.get("director_style"):
+        director_block = f"\nDirector style: {decomp['director_style']}."
+    if decomp.get("era"):
+        director_block += f"\nEra anchor: {decomp['era']} — strictly avoid mixing other-era costumes / props / lighting."
     return f"""Create one single {aspect} cinematic storyboard grid for a documentary sequence.
 Topic: {topic}
-{culture_guard}
+{culture_guard}{director_block}
 Grid: exact {cols} columns x {rows} rows, {count} panels filled in reading order left-to-right then top-to-bottom. Leave unused panels empty only if the grid has more cells than requested.
 
 Panel rules:
@@ -6262,6 +6287,107 @@ def _paraphrase_sensitive_dialogue(text: str) -> tuple[str, bool]:
         if sensitive in text:
             return text.replace(sensitive, paraphrase), True
     return text, False
+
+
+# ── topic-level LLM decomposition + cache (2026-05-21) ───────────────────────
+# 一次 LLM 推断 topic 的多个判断字段，topic-level cache 跨 run 复用
+# 供：BGM 风格 / role_candidates / director_style / cover_art_direction / is_action_topic
+
+def _topic_cache_dir() -> Path:
+    p = Path(__file__).resolve().parent / "voice_assets" / "topic_cache"
+    p.mkdir(parents=True, exist_ok=True)
+    return p
+
+
+def _topic_cache_path(topic: str) -> Path:
+    safe = re.sub(r"[^一-龥A-Za-z0-9_]", "", topic)[:60] or "topic"
+    return _topic_cache_dir() / f"{safe}.json"
+
+
+def _load_topic_decomposition_cache(topic: str) -> dict | None:
+    p = _topic_cache_path(topic)
+    if not p.exists():
+        return None
+    try:
+        return json.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+
+def _save_topic_decomposition_cache(topic: str, data: dict) -> None:
+    p = _topic_cache_path(topic)
+    p.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _llm_topic_decomposition(topic: str, use_cache: bool = True) -> dict:
+    """LLM 一次推断 topic 的多个判断字段，缓存跨 run 复用。
+
+    返回字段：
+      era: 时代 (historical_chinese / contemporary_corporate / modern_athlete / ...)
+      culture: 文化背景
+      bgm_style_label: BGM 调性标签
+      bgm_instruments: 推荐乐器列表（中文）
+      bgm_mood: BGM 情绪
+      role_candidates: 现场角色名（4-6 个，中文）
+      director_style: 导演风格短语（英文）
+      cover_art_direction: 封面美术方向（中文）
+      is_action_topic: 是否动作题材
+
+    失败返回 {} 让调用方走 fallback 硬规则。
+    """
+    if use_cache:
+        cached = _load_topic_decomposition_cache(topic)
+        if cached and isinstance(cached, dict) and cached.get("era"):
+            log(f"topic_decomposition: {topic} 从 cache 复用 era={cached.get('era')}")
+            return cached
+    if os.environ.get("ADR_TOPIC_DECOMPOSITION_LLM", "1").strip().lower() in ("0", "false", "no", "off"):
+        return {}
+    available_eras = list(ERA_TEMPLATES.keys())
+    prompt = f"""你是 ADR 纪录片视觉/听觉总监。为主题「{topic}」一次输出所有关键判断。
+
+预设 era: {' / '.join(available_eras)} (也可输出自定义)
+
+严格输出 JSON，含字段:
+{{
+  "era": "选择 era 或自定义 (如 modern_lawyer / qing_dynasty)",
+  "culture": "文化背景短语 (e.g. modern_chinese_business / late_han_china / nba_modern)",
+  "bgm_style_label": "BGM 调性 (e.g. modern_business_calm / epic_orchestral / nba_intensity)",
+  "bgm_instruments": ["3-4 个推荐乐器 中文短语"],
+  "bgm_mood": "BGM 情绪短语 (e.g. 稳健进取 / 史诗激昂 / 静谧沉思)",
+  "role_candidates": ["4-6 个现场角色名 中文短语，符合 topic 时代和性质"],
+  "director_style": "导演风格 英文短语 (e.g. corporate clean handheld documentary / epic dramatic backlight)",
+  "cover_art_direction": "封面美术方向 中文短语 (e.g. 极简金融感冷色调 / 史诗水墨卷轴)",
+  "is_action_topic": false,
+  "reason": "10 字内说明 era 判断依据"
+}}
+
+要求:
+1. 严格 JSON，不要 markdown 不要解释
+2. role_candidates 要符合 topic 时代（南京银行 → 客户经理；曹操 → 谋士；科比 → 球员）
+3. 现代企业题材 BGM 不要选 erhu/guzheng；历史题材不要选合成器
+4. is_action_topic 仅在题材本身是动作/打斗类才 true (武侠/体育对抗/战争)
+
+只输出 JSON。"""
+    try:
+        raw = chat("GEMINI_25_FLASH", "你只输出严格 JSON。", prompt, max_tokens=800, timeout=45)
+        start = raw.find("{")
+        end = raw.rfind("}")
+        if start < 0 or end <= start:
+            log(f"topic_decomposition LLM JSON 解析失败：{raw[:200]}")
+            return {}
+        result = json.loads(raw[start:end + 1])
+        if not result.get("era"):
+            log("topic_decomposition LLM 输出缺 era")
+            return {}
+        log(f"topic_decomposition LLM: {topic} → era={result['era']} bgm={result.get('bgm_style_label', '?')} ({result.get('reason', '')})")
+        try:
+            _save_topic_decomposition_cache(topic, result)
+        except Exception as e:
+            log(f"topic_decomposition cache 写入失败（不影响）：{e}")
+        return result
+    except Exception as e:
+        log(f"topic_decomposition LLM 异常（走 fallback）：{e}")
+        return {}
 
 
 # ── era-aware meta_grid 模板系统 (2026-05-21) ────────────────────────────────
@@ -7720,46 +7846,64 @@ def _bgm_contains_vocals(bgm_path: str, sample_len: float = 20.0) -> bool:
 def generate_bgm(topic: str, tone: str = "中性") -> str | None:
     bgm_path = str(OUTPUT_DIR / "bgm.mp3")
     MAX_BGM_RETRY = 3
-    SUFFIX = ", starting directly at peak energy with minimal intro, no vocals"
+    SUFFIX = ", instrumental only, absolutely no vocals, no lyrics, no singing, no human voice, starting directly at peak energy with minimal intro"
 
-    # 主路径：LLM 直接生成描述（覆盖任意长尾主题）
-    llm_desc = _llm_bgm_description(topic, tone)
-    if llm_desc:
-        bgm_desc = f"{llm_desc}{SUFFIX}"
-        log(f"BGM 描述: LLM ({len(llm_desc.split())} 词) → {llm_desc[:120]}...")
-    elif tone == "轻松":
-        bgm_desc = f"Cheerful upbeat children's background music for '{topic}', ukulele marimba glockenspiel whistle claps, warm playful hopeful mood, light and bouncy, family-friendly, starting directly at peak energy with minimal intro, no vocals"
-    elif tone == "怀旧":
-        bgm_desc = f"Nostalgic warm instrumental soundtrack for '{topic}', solo piano and harmonica and accordion and music box, slow waltz tempo, sentimental tender mood, like memories of 1980s China, starting directly at peak energy with minimal intro, no vocals"
-    elif tone == "庄重":
-        bgm_desc = f"Solemn reflective documentary soundtrack for '{topic}', slow strings and piano, restrained reverent atmosphere, starting directly at peak energy with minimal intro, no vocals"
-    else:  # 中性 → 按主题关键词细分
-        if is_1919_global_topic(topic):
-            bgm_desc = (
-                f"Restrained post World War I 1919 historical documentary score for '{topic}', "
-                "low strings, muted piano, distant military snare, newspaper-press rhythm, cold archival atmosphere, "
-                "grave but not triumphant, no guzheng, no erhu, no festive Chinese folk instruments, no heroic propaganda march, "
-                "starting directly with a tense pulse and minimal intro, no vocals"
-            )
-            log("BGM 细分: 1919战后民族觉醒")
-        elif any(k in topic for k in ("航天", "太空", "卫星", "火箭", "东方红", "神舟", "嫦娥", "北斗", "天宫", "宇宙", "星辰")):
-            bgm_desc = f"Heroic epic orchestral soundtrack for '{topic}', grand strings brass choir and timpani, triumphant uplifting mood, space exploration cinematic like Interstellar and Apollo, starting directly at peak energy with minimal intro, no vocals"
-            log("BGM 细分: 航天史诗")
-        elif any(k in topic for k in ("AI", "人工智能", "科技", "互联网", "算法", "机器人", "智能")):
-            bgm_desc = f"Modern cinematic electronic soundtrack for '{topic}', synth pad deep bass subtle percussion, futuristic thoughtful mood, tech documentary style, starting directly at peak energy with minimal intro, no vocals"
-            log("BGM 细分: 科技未来")
-        elif any(k in topic for k in ("读书", "书单", "书香", "文学", "文化", "诗词", "典籍", "阅读")):
-            bgm_desc = f"Gentle contemplative piano soundtrack for '{topic}', solo piano with soft violin strings, bookish quiet reflective mood, literary documentary style, starting directly at peak energy with minimal intro, no vocals"
-            log("BGM 细分: 文学书香")
-        elif any(k in topic for k in ("历史", "朝代", "古代", "千年", "诞辰", "周年", "纪念")):
-            bgm_desc = f"Warm cinematic historical soundtrack for '{topic}', piano strings and subtle Chinese elements, reflective dignified mood, history documentary style, starting directly at peak energy with minimal intro, no vocals"
-            log("BGM 细分: 历史纪录")
-        elif any(k in topic for k in ("美食", "旅行", "民俗", "节日", "风物")):
-            bgm_desc = f"Upbeat acoustic soundtrack for '{topic}', acoustic guitar soft percussion, cheerful warm mood, lifestyle documentary, starting directly at peak energy with minimal intro, no vocals"
-            log("BGM 细分: 生活风物")
-        else:
-            bgm_desc = f"Gentle contemplative Chinese documentary soundtrack for '{topic}', erhu guzheng pipa soft strings, calm thoughtful atmosphere, starting directly at peak energy with minimal intro, no vocals"
-            log("BGM 细分: 默认传统纪录")
+    # 阶段 2 (2026-05-21): 优先用 topic_decomposition LLM 推断的 bgm_style + instruments + mood
+    decomposition = _llm_topic_decomposition(topic)
+    if decomposition.get("bgm_style_label") and decomposition.get("bgm_instruments"):
+        style = decomposition["bgm_style_label"]
+        instruments = decomposition.get("bgm_instruments") or []
+        mood = decomposition.get("bgm_mood") or ""
+        era = decomposition.get("era", "")
+        bgm_desc = (
+            f"{style.replace('_', ' ')} soundtrack for '{topic}'. "
+            f"Era/style anchor: {era}. "
+            f"Featured instruments: {', '.join(instruments)}. "
+            f"Mood: {mood}. "
+            f"Cinematic documentary score, balanced dynamics"
+            f"{SUFFIX}"
+        )
+        log(f"BGM 描述 (topic_decomposition): {bgm_desc[:140]}...")
+        # 直接走生成路径，不再走旧关键词分支
+    else:
+        # 主路径：LLM 直接生成描述（覆盖任意长尾主题）
+        llm_desc = _llm_bgm_description(topic, tone)
+        if llm_desc:
+            bgm_desc = f"{llm_desc}{SUFFIX}"
+            log(f"BGM 描述: LLM ({len(llm_desc.split())} 词) → {llm_desc[:120]}...")
+        elif tone == "轻松":
+            bgm_desc = f"Cheerful upbeat children's background music for '{topic}', ukulele marimba glockenspiel whistle claps, warm playful hopeful mood, light and bouncy, family-friendly, starting directly at peak energy with minimal intro, no vocals"
+        elif tone == "怀旧":
+            bgm_desc = f"Nostalgic warm instrumental soundtrack for '{topic}', solo piano and harmonica and accordion and music box, slow waltz tempo, sentimental tender mood, like memories of 1980s China, starting directly at peak energy with minimal intro, no vocals"
+        elif tone == "庄重":
+            bgm_desc = f"Solemn reflective documentary soundtrack for '{topic}', slow strings and piano, restrained reverent atmosphere, starting directly at peak energy with minimal intro, no vocals"
+        else:  # 中性 → 按主题关键词细分
+            if is_1919_global_topic(topic):
+                bgm_desc = (
+                    f"Restrained post World War I 1919 historical documentary score for '{topic}', "
+                    "low strings, muted piano, distant military snare, newspaper-press rhythm, cold archival atmosphere, "
+                    "grave but not triumphant, no guzheng, no erhu, no festive Chinese folk instruments, no heroic propaganda march, "
+                    "starting directly with a tense pulse and minimal intro, no vocals"
+                )
+                log("BGM 细分: 1919战后民族觉醒")
+            elif any(k in topic for k in ("航天", "太空", "卫星", "火箭", "东方红", "神舟", "嫦娥", "北斗", "天宫", "宇宙", "星辰")):
+                bgm_desc = f"Heroic epic orchestral soundtrack for '{topic}', grand strings brass choir and timpani, triumphant uplifting mood, space exploration cinematic like Interstellar and Apollo, starting directly at peak energy with minimal intro, no vocals"
+                log("BGM 细分: 航天史诗")
+            elif any(k in topic for k in ("AI", "人工智能", "科技", "互联网", "算法", "机器人", "智能")):
+                bgm_desc = f"Modern cinematic electronic soundtrack for '{topic}', synth pad deep bass subtle percussion, futuristic thoughtful mood, tech documentary style, starting directly at peak energy with minimal intro, no vocals"
+                log("BGM 细分: 科技未来")
+            elif any(k in topic for k in ("读书", "书单", "书香", "文学", "文化", "诗词", "典籍", "阅读")):
+                bgm_desc = f"Gentle contemplative piano soundtrack for '{topic}', solo piano with soft violin strings, bookish quiet reflective mood, literary documentary style, starting directly at peak energy with minimal intro, no vocals"
+                log("BGM 细分: 文学书香")
+            elif any(k in topic for k in ("历史", "朝代", "古代", "千年", "诞辰", "周年", "纪念")):
+                bgm_desc = f"Warm cinematic historical soundtrack for '{topic}', piano strings and subtle Chinese elements, reflective dignified mood, history documentary style, starting directly at peak energy with minimal intro, no vocals"
+                log("BGM 细分: 历史纪录")
+            elif any(k in topic for k in ("美食", "旅行", "民俗", "节日", "风物")):
+                bgm_desc = f"Upbeat acoustic soundtrack for '{topic}', acoustic guitar soft percussion, cheerful warm mood, lifestyle documentary, starting directly at peak energy with minimal intro, no vocals"
+                log("BGM 细分: 生活风物")
+            else:
+                bgm_desc = f"Gentle contemplative Chinese documentary soundtrack for '{topic}', erhu guzheng pipa soft strings, calm thoughtful atmosphere, starting directly at peak energy with minimal intro, no vocals"
+                log("BGM 细分: 默认传统纪录")
     for attempt in range(1, MAX_BGM_RETRY + 1):
         try:
             log(f"BGM 生成尝试 {attempt}/{MAX_BGM_RETRY}（tone={tone}）")

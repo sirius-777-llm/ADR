@@ -45,6 +45,18 @@ Last updated: 2026-05-21
 | H · IP 质量评分 | 2h | ★ | planned | LLM 评估视觉/音色/性格契合，写 IP 跟踪 |
 | I · IP 版本管理 | 30min | ★ | planned | schema_version + 迁移机制 |
 
+### LLM 化 + 武戏强化 (2026-05-21 议定，5.5-6.5h 总)
+
+| 项目 | 工程量 | ROI | 状态 | 备注 |
+|------|--------|-----|------|------|
+| **阶段 1 · _llm_topic_decomposition + cache** | 1h | ★★★ | planned | 一次 LLM 出多字段 (era/bgm_style/role/director/cover/is_action) topic-level cache |
+| **阶段 2 · BGM LLM 化** | 1h | ★★★ | planned | generate_bgm 用 LLM bgm_style + instruments，替换硬编码 8 关键词分支 |
+| **阶段 3 · role/director/action 标记接入** | 1h | ★★ | planned | _adsd_role_candidates / _storyboard_grid_prompt / script-gen LLM 加 is_action_scene |
+| **阶段 4a · 武戏 spike 验证** | 30min | ★★★ | planned | 武戏 prompt + 4-panel multi-ref + 10s duration 测 WERYDANCE 天花板 |
+| **阶段 4b · 武戏 action_b PR** | 2.5h | ★★★ | blocked-by-4a | 新 turn_type "action_b" + multi-ref + 长 duration + dynamic kinetic prompt |
+| **阶段 5 · 非 ADSD Storyboard Flow action 强化** | 30min | ★ | planned | ADS_STORYBOARD_FLOW 加 is_action_scene 触发，dynamic 强化 |
+| ✗ image-to-video 升 almighty | - | - | rejected | 保留作 fallback (endpoint 冗余容灾) |
+
 ### 减时间优化
 
 | 项目 | 工程量 | ROI | 状态 | 备注 |

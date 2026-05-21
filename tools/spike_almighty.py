@@ -486,6 +486,44 @@ def spike_5():
         run_spec(spec, OUT_DIR / f"{spec['name']}.mp4")
 
 
+def spike_action():
+    """阶段 4a: 武戏天花板验证。
+    A: 单 panel + 普通 prompt (baseline)
+    B: 4-panel multi-ref + dynamic kinetic prompt + 10s
+    对比武戏密度差异。"""
+    voice = pick_voice_asset_ref()
+    panels = sorted(Path("/tmp").glob("adr_v8_*/img_*.jpg"), reverse=True)[:4]
+    if len(panels) < 4:
+        print("缺至少 4 张 panel，spike_action 跳过")
+        return
+    panel_single = str(panels[0])
+    panels_4 = [str(p) for p in panels[:4]]
+
+    prompt_baseline = (
+        "Cinematic documentary action shot. A warrior in armor swings sword in mid-combat. "
+        "Generate dynamic motion, dust, particle effects."
+    )
+    prompt_kinetic = (
+        "EXTREME ACTION SCENE — high-intensity combat sequence. "
+        "Multiple rapid camera cuts between angles. "
+        "Kinetic camera with whip pans, snap zooms, push-ins. "
+        "Dust clouds, motion blur, impact frames, slow-motion flash. "
+        "Sparks fly, fabric snaps, weapons clash, particles burst. "
+        "Multi-angle quick cuts as if edited from 4 different cameras simultaneously. "
+        "Avoid slow contemplative pacing — every second packed with movement and visual energy. "
+        "Cinematic dramatic backlight, gritty film grain, high contrast."
+    )
+
+    specs = [
+        {"name": "action_A_baseline_5s", "desc": "单 panel + 标准武戏 prompt 5s",
+         "images": [panel_single], "audio": voice, "prompt": prompt_baseline, "duration": 5},
+        {"name": "action_B_kinetic_10s", "desc": "4-panel multi-ref + kinetic prompt 10s",
+         "images": panels_4, "audio": voice, "prompt": prompt_kinetic, "duration": 10},
+    ]
+    for spec in specs:
+        run_spec(spec, OUT_DIR / f"{spec['name']}.mp4")
+
+
 def spike_4():
     """a_roll 整 grid 当 ref vs 切片对比：能否取代当前主路径切 panel？"""
     voice = pick_voice_asset_ref()
@@ -540,6 +578,9 @@ def main():
     if "5b" in args or "all" in args:
         print("\n#### SPIKE 5b · 中文标签人设融合 grid ####")
         spike_5b()
+    if "action" in args or "all" in args:
+        print("\n#### SPIKE action · 武戏天花板验证 (4a) ####")
+        spike_action()
     print(f"\n=== all spikes done. outputs in {OUT_DIR}/ ===")
 
 
