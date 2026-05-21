@@ -425,20 +425,21 @@ def _infer_needs_lip_sync(speaker: str, text: str = "", emotion: str = "") -> bo
     return True
 
 
-# ── 三类 turn 区分 (silent_b PR) ──────────────────────────────────────────────
+# ── 四类 turn 区分 (silent_b PR + action_b 4b PR) ─────────────────────────────
 # a_roll       说话人特写 + 对白 + 克隆音色 (needs_lip_sync=True)
 # narrated_b   空镜/远景/剪影 + 旁白 + 克隆音色 (needs_lip_sync=False, has dialogue)
 # silent_b     空镜/呼吸位 + 无 dialogue + 仅 BGM (needs_lip_sync=False, no dialogue)
+# action_b     武戏/激烈对抗 + 多镜切换 + 4-panel multi-ref (高视觉密度)
 SILENT_B_SPEAKERS = {"(silent)", "silent", "(无)", "无对白", "空镜"}
 
 
 def _infer_turn_type(speaker: str, text: str = "", emotion: str = "", turn_type_hint: str = "") -> str:
     """推断 turn 类型。优先级：explicit hint > rules。
 
-    返回 "a_roll" | "narrated_b" | "silent_b"
+    返回 "a_roll" | "narrated_b" | "silent_b" | "action_b"
     """
     explicit = (turn_type_hint or "").strip().lower()
-    if explicit in ("a_roll", "narrated_b", "silent_b"):
+    if explicit in ("a_roll", "narrated_b", "silent_b", "action_b"):
         return explicit
     sp = str(speaker or "").strip()
     txt = str(text or "").strip()
@@ -456,7 +457,7 @@ def _resolve_turn_type(scene: dict) -> str:
     if not isinstance(scene, dict):
         return "a_roll"
     explicit = (scene.get("turn_type") or "").strip().lower()
-    if explicit in ("a_roll", "narrated_b", "silent_b"):
+    if explicit in ("a_roll", "narrated_b", "silent_b", "action_b"):
         return explicit
     speaker = scene.get("speaker", "") or ""
     text = scene.get("text") or scene.get("dialogue") or ""
@@ -476,6 +477,10 @@ def _is_narrated_b(scene: dict) -> bool:
 
 def _is_a_roll(scene: dict) -> bool:
     return _resolve_turn_type(scene) == "a_roll"
+
+
+def _is_action_b(scene: dict) -> bool:
+    return _resolve_turn_type(scene) == "action_b"
 
 
 def _voice_asset_id_for_speaker(speaker: str, gender: str | None = None) -> str:
@@ -2258,6 +2263,14 @@ silent_b    氛围呼吸镜头 + 仅 BGM
             speaker = "(silent)"
             时长 3-6 秒（短）
 
+action_b    武戏 / 激烈对抗 / 突破冲击 镜头
+            画面：多镜切换 + 动态镜头 + 冲击力特效
+            用于：武打 / 体育对抗 / 战争 / 激烈论战 / 突破时刻
+            text 可空 (纯动作) 或短句 (角色喊话)
+            speaker 主体角色名 或 "(action)"
+            时长 8-12 秒（动作密度需要时间展开）
+            ★ 仅在题材确实含动作/对抗场面时用，不要滥用
+
 【硬约束】
 1. turn 1 必须是 narrated_b（开场 setup）
 2. turn {num_turns} 必须是 narrated_b（结尾收口）
@@ -2271,8 +2284,8 @@ silent_b    氛围呼吸镜头 + 仅 BGM
 {role_hint}
 
 【输出字段】每项必须包含：
-- turn_type    "a_roll" | "narrated_b" | "silent_b"
-- speaker      a_roll: 角色名；narrated_b: "旁白"；silent_b: "(silent)"
+- turn_type    "a_roll" | "narrated_b" | "silent_b" | "action_b"
+- speaker      a_roll: 角色名；narrated_b: "旁白"；silent_b: "(silent)"；action_b: 主体角色名或 "(action)"
 - voice_gender "male" | "female"；silent_b 写 "male"（不会用到，但保持字段）
 - visual_subject 12-30 词英文角色外形描述（同 speaker 跨 turn 一致；silent_b 写场景外形）
 - text         a_roll/narrated_b 中文对白 18-36 字；silent_b 写 ""
@@ -2376,11 +2389,12 @@ silent_b    氛围呼吸镜头 + 仅 BGM
     speaker_visual_map: dict[str, str] = {}
     for i, item in enumerate(arr):
         turn_type_raw = str(item.get("turn_type", "")).strip().lower()
-        if turn_type_raw not in ("a_roll", "narrated_b", "silent_b"):
+        if turn_type_raw not in ("a_roll", "narrated_b", "silent_b", "action_b"):
             # 旧 LLM 未给 turn_type：按 speaker/text 推断
             turn_type_raw = _infer_turn_type(str(item.get("speaker", "")), str(item.get("text", "")))
         is_silent = (turn_type_raw == "silent_b")
         is_narrated = (turn_type_raw == "narrated_b")
+        is_action = (turn_type_raw == "action_b")
 
         speaker = str(item.get("speaker", "")).strip()
         if is_silent:
@@ -2428,9 +2442,13 @@ silent_b    氛围呼吸镜头 + 仅 BGM
             if visual_subject:
                 speaker_visual_map[speaker] = visual_subject
 
-        # silent_b 允许 text 为空；a_roll/narrated_b 必须有 text
+        # silent_b/action_b 允许 text 为空；a_roll/narrated_b 必须有 text
         if is_silent:
             text = ""
+        elif is_action:
+            # action_b 可有可无 text，无 text 时也 OK
+            if text and len(text) > 80:
+                text = text[:80]
         else:
             if not text or len(text) > 80:
                 raise RuntimeError(f"ADSD 第 {i+1} 句台词异常：{text}")
@@ -2448,8 +2466,8 @@ silent_b    氛围呼吸镜头 + 仅 BGM
             "emotion": emotion,
             "broll_rule": broll_rule,
             "duration_hint": duration_hint,
-            "is_action_scene": is_action_scene_flag,
-            "needs_lip_sync": (not is_silent and not is_narrated),
+            "is_action_scene": is_action_scene_flag or is_action,
+            "needs_lip_sync": (not is_silent and not is_narrated and not is_action),
         })
     speakers = [t["speaker"] for t in turns if t.get("speaker")]
     shape = _adsd_dialogue_shape(speakers)
@@ -5591,6 +5609,12 @@ def _motion_action_block(scene: dict, limit: int = 700) -> str:
         parts.append(f"Motion energy target: {energy}")
     if sfx:
         parts.append(f"SFX: {sfx}")
+    # 阶段 5 (2026-05-21): is_action_scene → 注入 dynamic kinetic 强化 (4a spike 验证)
+    if _is_action_scene(scene.get("text", ""), scene.get("shot", ""), scene):
+        parts.append(
+            "ACTION MODE: multi-angle quick cuts, kinetic camera (whip pans / snap zooms), "
+            "dust + particles + motion blur, impact frames, high contrast backlight"
+        )
     return _short_board_text(". ".join(parts), limit)
 
 
@@ -6665,6 +6689,27 @@ def _adsd_meta_grid_call_prompt(scene: dict) -> str:
 # ── Speaker IP Card (2026-05-21) ──────────────────────────────────────────
 # Speaker IP = 一个角色的完整档案：voice_asset + 人设符 + 性格 + 标志服装/姿势 + 标志台词
 # 跨片复用 + LLM 生成更贴合角色 + 召唤 prompt 更精准
+ADR_IP_SCHEMA_VERSION = "1.1"  # 加 schema_version 字段 + 迁移机制
+
+
+def _migrate_speaker_ip(ip: dict) -> dict:
+    """前向兼容：把老 IP 迁移到当前 schema_version。
+    1.0 → 1.1: 加 schema_version 字段；补缺失的 relationships / meta_grid_template_cache / usage_history 默认空
+    未来扩展时在这里加 if version == "1.x":...
+    """
+    ver = str(ip.get("schema_version", "1.0"))
+    if ver == ADR_IP_SCHEMA_VERSION:
+        return ip
+    # 1.0 → 1.1
+    if ver in ("1.0", ""):
+        ip.setdefault("relationships", {})
+        ip.setdefault("meta_grid_template_cache", {})
+        ip.setdefault("usage_history", [])
+        ip["schema_version"] = "1.1"
+    # 未来：if ver == "1.1": ... → "1.2"
+    return ip
+
+
 def _speaker_ips_dir() -> Path:
     """speaker IP 卡目录。每个 speaker 一个 json 文件。"""
     p = Path(__file__).resolve().parent / "voice_assets" / "speaker_ips"
@@ -6673,14 +6718,14 @@ def _speaker_ips_dir() -> Path:
 
 
 def _list_speaker_ips() -> dict[str, dict]:
-    """扫描 IP 库，返回 {规范化名: ip_dict}。"""
+    """扫描 IP 库，返回 {规范化名: ip_dict}。加载时自动迁移老 schema。"""
     out: dict[str, dict] = {}
     for f in _speaker_ips_dir().glob("*.json"):
         try:
             data = json.loads(f.read_text(encoding="utf-8"))
             name = str(data.get("speaker", f.stem)).strip()
             if name:
-                out[name] = data
+                out[name] = _migrate_speaker_ip(data)
         except Exception as e:
             log(f"speaker_ip {f.name} 解析失败：{e}")
     return out
@@ -6753,9 +6798,10 @@ def _build_speaker_ip_context_for_script(topic: str, role_candidates: list[str])
 
 
 def _save_speaker_ip(speaker: str, ip_dict: dict) -> Path:
-    """写入 / 更新 speaker IP json。"""
+    """写入 / 更新 speaker IP json。自动写 schema_version。"""
     safe = re.sub(r"[^一-龥A-Za-z0-9]", "", speaker)[:30] or "speaker"
     p = _speaker_ips_dir() / f"{safe}.json"
+    ip_dict["schema_version"] = ADR_IP_SCHEMA_VERSION
     p.write_text(json.dumps(ip_dict, ensure_ascii=False, indent=2), encoding="utf-8")
     return p
 
@@ -10941,6 +10987,43 @@ def _adsd_broll_motion_prompt(scene: dict, safe_retry: bool = False) -> str:
     )[:2000]
 
 
+def _adsd_action_b_motion_prompt(scene: dict, safe_retry: bool = False) -> str:
+    """action_b 武戏 prompt (4b PR, Spike action 验证):
+    强镜头切换 + 动态镜头运动 + 冲击力特效 (dust/sparks/motion blur)
+    适用：武侠打斗 / 体育对抗 / 现代动作 / 激烈论战 / 突破冲刺
+    """
+    shot = scene.get("shot", "")
+    text = scene.get("text", "")
+    speaker = scene.get("speaker", "")
+    emotion = scene.get("emotion", "")
+    ip = _match_speaker_ip(speaker) if speaker else None
+    era_hint = ""
+    if ip and ip.get("era"):
+        era_hint = f"Era anchor: {ip['era']}. "
+    _no_text_ban = (
+        "ABSOLUTELY NO TEXT IN FRAME: no subtitles, no captions, no on-screen typography. "
+    )
+    base = (
+        f"{_no_text_ban}"
+        "EXTREME ACTION SCENE — high-intensity sequence with packed visual density. "
+        "Multiple rapid camera cuts between angles (multi-angle quick cuts as if edited from 4 cameras). "
+        "Kinetic camera with whip pans, snap zooms, push-ins, slight handheld shake. "
+        "Dust clouds, motion blur, impact frames, slow-motion flash on key beats. "
+        "Sparks fly, fabric snaps, particles burst, environmental debris in air. "
+        "Avoid slow contemplative pacing — every second packed with movement and visual energy. "
+        "Cinematic dramatic backlight, gritty film grain, high contrast, kinetic energy. "
+        f"{era_hint}"
+    )
+    if safe_retry:
+        return (base + f"Scene: {shot or text[:80]}. No logos, no watermark.")[:2000]
+    return (base +
+        f"Scene action: {shot or text[:120]}. "
+        f"Emotion: {emotion or 'intense'}. "
+        "Multiple subjects in dynamic interplay; use all 4 reference images for visual continuity + multi-angle composition. "
+        "No close-up mouth (no lip-sync); no speaker labels, no watermark."
+    )[:2000]
+
+
 def _adsd_silent_b_motion_prompt(scene: dict, safe_retry: bool = False) -> str:
     """silent_b 专属 prompt：氛围呼吸位，无人说话，画面呼吸。
 
@@ -11544,10 +11627,14 @@ def _lip_sync_poll_download_and_process(idx: int, task_id: str, scene: dict, tar
 
 
 def _lip_sync_one_scene(idx: int, scene: dict, target_dur: float, aspect_ratio: str) -> tuple[int, bool, dict]:
-    # 三类 turn 分发：a_roll lip-sync / narrated_b 旁白克隆 (有 audio 但无嘴特写) / silent_b 纯 motion
+    # 四类 turn 分发：a_roll lip-sync / narrated_b 旁白克隆 / silent_b 纯 motion / action_b 武戏多镜
     needs_lip = bool(scene.get("needs_lip_sync", True))
     is_narrated = _is_narrated_b(scene)
     is_silent = _is_silent_b(scene)
+    is_action = _is_action_b(scene)
+    if is_action:
+        # action_b 不要嘴部 lip-sync，走 motion 路径但加 4-panel multi-ref
+        needs_lip = False
     turn_audio = scene.get("dialogue_audio_mp3") or scene.get("dialogue_audio")
     # silent_b 不需要 audio；a_roll / narrated_b 需要 TTS 音频做 audio_ref fallback
     if (needs_lip or is_narrated) and (not turn_audio or not os.path.exists(turn_audio)):
@@ -11618,6 +11705,17 @@ def _lip_sync_one_scene(idx: int, scene: dict, target_dur: float, aspect_ratio: 
             ref_images.append(sheet_url)
         ref_images.extend(alt_panel_urls)
         ref_images.append(image_url)
+        # 4b PR · action_b: 上传 4-panel multi-ref 给 action_b 路径用
+        action_b_ref_urls: list[str] = []
+        if is_action:
+            for _ap in (scene.get("_action_b_4panels") or [])[:4]:
+                if _ap and os.path.exists(_ap):
+                    try:
+                        action_b_ref_urls.append(_upload_to_weryai(_ap))
+                    except Exception as e:
+                        log(f"[lip-sync {idx}] action_b panel upload skipped: {e}")
+            if not action_b_ref_urls:
+                action_b_ref_urls = [image_url]  # fallback 单 panel
         # 人设符 PR (Phase 2)：meta_grid 当 召唤 variant 专用 ref（单张大图）
         # spike 5/5b 验证：单 meta_grid + 召唤 prompt 比 sheet+panel+alt 效果更稳
         meta_grid_url: str | None = None
@@ -11638,10 +11736,24 @@ def _lip_sync_one_scene(idx: int, scene: dict, target_dur: float, aspect_ratio: 
         _tts_dur = float(scene.get("dur") or target_dur)
         _text = str(scene.get("text") or "")
         _char_min = math.ceil(len(_text) / 6.0) if _text else 0
-        api_dur = int(round(min(15, max(5, _char_min, _tts_dur))))
+        # duration 优化 (2026-05-21): 下限 5s → 3s + tts_dur+0.3 buffer (短 dialogue 处理时长降 30-40%)
+        # action_b 会 max(api_dur, 10) 自己加长，不受此影响
+        _min_dur = float(os.environ.get("ADR_LIP_SYNC_MIN_DURATION", "3"))
+        _char_min_safe = _char_min if _text else 0
+        api_dur = int(round(min(15, max(_min_dur, _char_min_safe, _tts_dur + 0.3))))
         fast_fallback_enabled = os.environ.get("ADR_WERYDANCE_FAST_FALLBACK", "1").strip().lower() not in ("0", "false", "no", "off")
         if not needs_lip:
-            if is_silent:
+            if is_action:
+                # action_b: 武戏专属 kinetic prompt，无 audio (motion-only)
+                # 加长 duration 到 10s (Spike action 验证)
+                api_dur = max(api_dur, 10)
+                variants = [
+                    ("action_b_kinetic", "WERYDANCE_2_0", _adsd_action_b_motion_prompt(scene, safe_retry=False), "false"),
+                    ("action_b_kinetic_safe", "WERYDANCE_2_0", _adsd_action_b_motion_prompt(scene, safe_retry=True), "false"),
+                ]
+                if fast_fallback_enabled:
+                    variants.append(("action_b_kinetic_fast", "WERYDANCE_2_0_FAST", _adsd_action_b_motion_prompt(scene, safe_retry=True), "false"))
+            elif is_silent:
                 # silent_b：纯 motion，无 audio，呼吸位 prompt
                 variants = [
                     ("silent_b_motion", "WERYDANCE_2_0", _adsd_silent_b_motion_prompt(scene, safe_retry=False), "false"),
@@ -11691,7 +11803,13 @@ def _lip_sync_one_scene(idx: int, scene: dict, target_dur: float, aspect_ratio: 
             task_id = None
             scene["_almighty_audio_dub_attempt"] = generate_audio == "true"
             # meta_grid_call variant 用单张人设符 grid；其他 variants 用原 sheet+panel+alt 拼装
-            current_ref_images = [meta_grid_url] if (variant_name == "meta_grid_call" and meta_grid_url) else ref_images
+            # action_b 用 4-panel multi-ref (Spike action 验证)
+            if variant_name.startswith("action_b_kinetic"):
+                current_ref_images = action_b_ref_urls or ref_images
+            elif variant_name == "meta_grid_call" and meta_grid_url:
+                current_ref_images = [meta_grid_url]
+            else:
+                current_ref_images = ref_images
             for submit_attempt in range(3):
                 try:
                     _wait_motion_submit_slot(f"lip-sync {idx+1}")
@@ -11885,11 +12003,28 @@ def step66_adsd_lip_sync(script: list[dict]):
         _p = _s.get("img_path")
         _alts = [pp for pp in _speaker_to_panel_paths.get(_sp, []) if pp and pp != _p]
         _s["_alt_speaker_panels"] = _alts[:2]
+        # 4b PR: action_b 准备 4-panel multi-ref (邻近 idx-2,-1,0,+1 panel)
+        if _resolve_turn_type(_s) == "action_b":
+            _action_panels: list[str] = []
+            for _off in (-2, -1, 0, 1):
+                _t = _i + _off
+                if 0 <= _t < len(script):
+                    _pp = script[_t].get("img_path", "")
+                    if _pp and os.path.exists(_pp) and _pp not in _action_panels:
+                        _action_panels.append(_pp)
+            # 不足 4 张则从 alt panel 补
+            for _ap in _alts:
+                if len(_action_panels) >= 4:
+                    break
+                if _ap and _ap not in _action_panels:
+                    _action_panels.append(_ap)
+            _s["_action_b_4panels"] = _action_panels[:4]
         _alt_attach_log.append({
             "turn": _i + 1,
             "speaker": _sp,
             "alt_panel_count": len(_s["_alt_speaker_panels"]),
             "alt_panel_paths": _s["_alt_speaker_panels"],
+            "action_b_4panels": _s.get("_action_b_4panels", []),
         })
     try:
         (OUTPUT_DIR / "adsd_lipsync_multiref_attach_qa.json").write_text(

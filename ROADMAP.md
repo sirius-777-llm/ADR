@@ -24,6 +24,14 @@ Last updated: 2026-05-21
 | 2026-05-21 | resume tool --regen-bgm flag | 单独重生成 BGM，其他物料复用，针对 BGM 含 vocal 等场景秒修 |
 | 2026-05-21 | Era LLM template (主路径) | _llm_infer_meta_grid_template + _resolve_meta_grid_template，LLM 推断 era + 4 类标签集，写入 IP cache 跨片复用，修「南京银行出古装」bug |
 | 2026-05-21 | ERA_TEMPLATES 预设 + 兜底链 | 7 个 era 预设 (historical/contemporary_corporate/modern_athlete/modern_scholar/future_tech/...) + costume/pose 智能匹配 |
+| 2026-05-21 | LLM 阶段 1 topic_decomposition | _llm_topic_decomposition + topic_cache，一次 LLM 出 era/bgm_style/role/director/cover/is_action_topic 多字段 |
+| 2026-05-21 | LLM 阶段 2 BGM 接入 | generate_bgm 用 LLM 推断 bgm_style + instruments + mood，替换 8 硬关键词分支 |
+| 2026-05-21 | LLM 阶段 3 role/director/action 标记 | _adsd_role_candidates / _storyboard_grid_prompt / script-gen 输出 is_action_scene 字段 |
+| 2026-05-21 | Spike action 武戏天花板验证 | 4-panel multi-ref + kinetic prompt + 10s 武戏密度明显比 baseline 强（大哥确认）|
+| 2026-05-21 | action_b turn_type PR (4b) | 第四类 turn (武戏)：4-panel multi-ref + duration 10s + kinetic prompt + LLM 自动标 |
+| 2026-05-21 | 非 ADSD action 强化 (阶段 5) | _motion_action_block 检测 is_action_scene → 注入 kinetic prompt |
+| 2026-05-21 | duration 计算优化 | api_dur 下限 5s → 3s + tts_dur+0.3 buffer，短 dialogue 处理时长降 30-40% |
+| 2026-05-21 | IP 版本管理 (I) | ADR_IP_SCHEMA_VERSION="1.1" + _migrate_speaker_ip 加载时自动迁移，9 个 IP 已 v1.1 |
 | 2026-05-20 | TG deliver 假阴性 fix | status=200 后验证 body {"ok":true,"result":{}} |
 | 2026-05-20 | tools/rerun_downstream.py | 跳过 step1-66 跑下游，10x 调试加速 |
 
@@ -43,18 +51,13 @@ Last updated: 2026-05-21
 | F · IP 调用统计 + 推荐 | 1h | ★★ | planned | 跟踪频次，推荐相关 IP |
 | G · IP 管理 CLI 工具 | 2h | ★ | planned | tools/ip_manager.py 列出/编辑/创建 IP |
 | H · IP 质量评分 | 2h | ★ | planned | LLM 评估视觉/音色/性格契合，写 IP 跟踪 |
-| I · IP 版本管理 | 30min | ★ | planned | schema_version + 迁移机制 |
+| ~~I · IP 版本管理~~ | ~~30min~~ | ~~★~~ | ✅ shipped 2026-05-21 | ADR_IP_SCHEMA_VERSION + _migrate_speaker_ip |
 
 ### LLM 化 + 武戏强化 (2026-05-21 议定，5.5-6.5h 总)
 
 | 项目 | 工程量 | ROI | 状态 | 备注 |
 |------|--------|-----|------|------|
-| **阶段 1 · _llm_topic_decomposition + cache** | 1h | ★★★ | planned | 一次 LLM 出多字段 (era/bgm_style/role/director/cover/is_action) topic-level cache |
-| **阶段 2 · BGM LLM 化** | 1h | ★★★ | planned | generate_bgm 用 LLM bgm_style + instruments，替换硬编码 8 关键词分支 |
-| **阶段 3 · role/director/action 标记接入** | 1h | ★★ | planned | _adsd_role_candidates / _storyboard_grid_prompt / script-gen LLM 加 is_action_scene |
-| **阶段 4a · 武戏 spike 验证** | 30min | ★★★ | planned | 武戏 prompt + 4-panel multi-ref + 10s duration 测 WERYDANCE 天花板 |
-| **阶段 4b · 武戏 action_b PR** | 2.5h | ★★★ | blocked-by-4a | 新 turn_type "action_b" + multi-ref + 长 duration + dynamic kinetic prompt |
-| **阶段 5 · 非 ADSD Storyboard Flow action 强化** | 30min | ★ | planned | ADS_STORYBOARD_FLOW 加 is_action_scene 触发，dynamic 强化 |
+| ~~阶段 1-5 (LLM 化 + 武戏)~~ | ~~5.5h~~ | ~~★★★~~ | ✅ shipped 2026-05-21 | 全部 6 阶段已 ship |
 | ✗ image-to-video 升 almighty | - | - | rejected | 保留作 fallback (endpoint 冗余容灾) |
 
 ### 减时间优化
@@ -64,7 +67,7 @@ Last updated: 2026-05-21
 | **PR-A · merged_a 合并跑** | 4-5h | ★★★ | planned | 同 speaker 连续 turn 合并 almighty，API 调用 12→6-8 (Spike 2 已验证) |
 | meta_grid 缓存预热 | 30min | ★★ | planned | 跑 driver 给常用 speaker 预生成 meta_grid 入缓存 |
 | 0.5s submit interval 重测 | 5min | ★★ | planned | 用户之前实测过不行，现在 ref 减少可能能用 |
-| duration 计算优化 | 30min | ★★ | planned | 当前 a_roll duration 偏长，缩到 max(3, tts_dur+0.3) |
+| ~~duration 计算优化~~ | ~~30min~~ | ~~★★~~ | ✅ shipped 2026-05-21 | api_dur 下限 5s→3s + tts_dur+0.3 |
 | voice_asset upload 缓存 | 1h | ★ | planned | 按 sha256 缓存 weryai upload URL |
 | WERYDANCE_2_0_FAST 主路径 | 30min+测 | ★ | planned | A/B 验证 FAST 质量是否够，省 30-40% step66 时间 |
 
