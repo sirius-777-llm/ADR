@@ -6778,17 +6778,29 @@ def _adsd_meta_grid_call_prompt(scene: dict) -> str:
         if era:
             ip_flavor += f"时代背景：{era}。"
     return (
+        # B2 fix (2026-05-21): 明确禁止复刻 4×3 grid 布局，强调生成 single fullframe single shot
+        "CRITICAL — REFERENCE IS A CASTING CARD ONLY, NOT A SCENE REFERENCE. "
+        "The uploaded image is a 4×3 character casting card with 12 small panels. "
+        "DO NOT replicate the grid layout. DO NOT show split-screen, multi-panel, contact sheet, or collage. "
+        "DO NOT copy the layout, frame divisions, or text labels from the reference. "
+        "Generate ONE single fullframe cinematic shot (not 12 small frames). "
+        "Use the reference ONLY to identify the character's face, costume, and visual style — "
+        "then create a NEW single shot showing this character in the scene described below. "
+        # B3 fix (2026-05-21): 强化中文标签 NO COPY 措辞
         "ABSOLUTELY NO TEXT IN FRAME: do not burn in subtitles, do not render Chinese/English captions, "
-        "no chyron / lower-thirds / speech bubbles / on-screen typography. The text labels on the meta_grid reference "
-        "are AI metadata ONLY — never re-draw them in the output frame. PURELY cinematic image. "
-        f"纪录片场景。使用上传的人设符参考图作为视觉指引——"
-        f"重点关注标记为「{speaker}｜{costume}｜{pose}」的 panel，提取其中的服装、表情、动作。"
+        "no chyron / lower-thirds / speech bubbles / on-screen typography. "
+        "The Chinese text labels on the reference card (e.g. '令狐冲｜战袍｜说话') are metadata for AI guidance ONLY — "
+        "DO NOT copy, render, paint, or transcribe ANY of these Chinese characters into the output frame. "
+        "The output must be PURELY cinematic with zero text overlay. "
+        f"纪录片单一镜头（不是 grid，不是分屏）。参考图仅用于识别角色外形——"
+        f"从参考图中提取标记为「{speaker}｜{costume}｜{pose}」的 panel 的角色造型，"
+        f"渲染为一个完整的电影单镜头，背景符合下方台词描述的场景。"
         f"{ip_flavor}"
         f"生成普通话语音，演讲者准确说出：「{dialogue}」。"
         f"上传的音频仅作为音色、语速、年龄感参考。"
         f"嘴部可见，面部稳定，嘴型自然同步，符合真人节奏。"
-        f"画面绝对不要出现任何文字、字幕、标签、签条。"
-    )[:1700]
+        f"画面绝对不要出现任何文字、字幕、标签、签条、grid 框架、分屏。"
+    )[:2000]
 
 
 # ── Speaker IP Card (2026-05-21) ──────────────────────────────────────────
@@ -9392,12 +9404,16 @@ def _werydance_negative_prompt(scene: dict) -> str:
         return "watermark, logo, extra text, misspelled text, garbled characters, duplicate captions"
     # 强化：WERYDANCE 模型偶尔会自作主张在画面下方烧中文字幕，跟我们的 ASS 字幕双重叠
     # 用多重否定关键词压制 (single negative prompt 力度不够，扩到所有 text-related artifact)
+    # B2 fix (2026-05-21): 加 grid/split/panel/contact_sheet ban，防 meta_grid 4×3 grid 被 WERYDANCE 直接复刻
     return (
         "no subtitles, no captions, no on-screen text, no burned-in text, no Chinese subtitles, "
         "no English subtitles, no text overlay, no caption bar, no chyron, no lower-third graphic, "
         "no speech bubbles, no thought bubbles, no signage text, no UI labels, no character name tags, "
         "no watermark, no logo, no studio mark, no copyright mark, "
-        "no random Chinese characters anywhere in the frame, no garbled glyphs, no floating text"
+        "no random Chinese characters anywhere in the frame, no garbled glyphs, no floating text, "
+        "no grid layout, no 4x3 grid, no contact sheet, no split screen, no multi-panel, no collage, "
+        "no panel divisions, no frame borders, no thumbnail grid, no character sheet layout, "
+        "no storyboard frame numbers, no casting card overlay"
     )
 
 
@@ -13986,11 +14002,14 @@ def step9_render(raw_path: str, voice_path: str, bgm_path: str | None, ass_path:
                 final_path,
             )
         elif use_embedded_dialogue_audio:
+            # B1 fix (2026-05-21): amix 默认 normalize=1 让两路各 ×0.5，人声从 -16 LUFS 被压到 -22
+            # 加 normalize=0 + weights 显式权重让 voice 主导
+            # 2nd pass: voice 1.4→1.8 (大哥反馈应更响)
             ffmpeg(
                 "-i", raw_path,
                 "-i", bgm_path,
                 "-filter_complex",
-                "[0:a]apad=pad_dur=1.5,volume=1.2[va];[1:a]volume=0.45[ba];[va][ba]amix=inputs=2:duration=first[aout]",
+                "[0:a]apad=pad_dur=1.5,volume=1.8[va];[1:a]volume=0.35[ba];[va][ba]amix=inputs=2:duration=first:normalize=0:weights=1.0 0.35[aout]",
                 "-map", "0:v",
                 "-map", "[aout]",
                 "-vf", vf_with_subtitles,
@@ -14002,14 +14021,16 @@ def step9_render(raw_path: str, voice_path: str, bgm_path: str | None, ass_path:
                 final_path,
             )
         else:
-            # Bug A fix (2026-05-20)：voice 1.5→1.0 + BGM 0.6→0.85（让 a_roll 段也保留 BGM 存在感）
+            # B1 fix (2026-05-21): amix normalize 默认压人声 → 加 normalize=0 + weights 显式权重
+            # voice 1.0→2.0 + BGM 0.85→0.4，hybrid voice loudnorm 已-16 LUFS，BGM 后台音量级
+            # 2nd pass: voice 1.6→2.0 (大哥反馈应更响)
             # Bug D fix (2026-05-20)：BGM aloop 无限循环，避免 BGM < voice 时片尾静音
             ffmpeg(
                 "-i", raw_path,
                 "-itsoffset", offset, "-i", voice_path,
                 "-itsoffset", offset, "-i", bgm_path,
                 "-filter_complex",
-                "[1:a]apad=pad_dur=1.5,volume=1.0[va];[2:a]aloop=loop=-1:size=2147483647,volume=0.85[ba];[va][ba]amix=inputs=2:duration=first[aout]",
+                "[1:a]apad=pad_dur=1.5,volume=2.0[va];[2:a]aloop=loop=-1:size=2147483647,volume=0.4[ba];[va][ba]amix=inputs=2:duration=first:normalize=0:weights=1.0 0.4[aout]",
                 "-map", "0:v",
                 "-map", "[aout]",
                 "-vf", vf_with_subtitles,

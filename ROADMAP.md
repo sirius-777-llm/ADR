@@ -90,6 +90,17 @@ Last updated: 2026-05-21
 | 题材泛化验证 | 30min/题材 | ★ | planned | 跑科比/鲁迅/苏东坡/钱学森等验证 IP+人设符稳定性 |
 | resume 工具 e2e test | 1h | ★ | planned | tools/rerun_downstream.py 加自动测试套件 |
 
+### 🐛 2026-05-21 笑傲江湖重跑发现的 bug
+
+| Bug | 严重度 | 工程量 | 状态 | 现象 + 修复方向 |
+|-----|--------|--------|------|----------------|
+| **B1 旁白/对白音量太低** | ★★★ P0 | 1h | planned | BGM 正常但 hybrid voice (克隆+TTS) 在 step9 mux 后人声偏弱听感不清。看 _build_voice_clone_hybrid_audio loudnorm 目标 + step9 mux 比例 (voice:bgm)，把 voice 提到 -14 LUFS 或 BGM 降到 0.4 |
+| **B2 meta_grid panel 漏进成片** | ★★★ P0 | 1.5h | planned | 00:12 出现现代风格 12 宫格画面，是 meta_grid 4×3 grid 被 WERYDANCE 当 panel 当素材输出。可能 (action) IP 的 meta_grid 是旧 cache 现代风格 + 被 action_b 4-panel multi-ref 直接召唤回视频。修：era 校验 meta_grid 缓存 + 召唤 prompt 强调"参考人物造型不要复制 grid 框架" |
+| **B3 内嵌字幕又出现** | ★★★ P0 | 30min | planned | 00:16 起视频内嵌字幕，NO TEXT IN FRAME ban 没生效。看 caption_info 流程 + WERYDANCE prompt 末尾是否真带英文 ban + a_roll 路径 prompt 函数检查 |
+| **B4 武戏无 SFX 配音** | ★★ P1 | 2h | planned | action_b 是 motion-only 无 audio，缺打斗音效（拳风/兵器格挡/落地声）。方案：action_b 走 generate_audio=true 让 WERYDANCE 自配 SFX，或本地 SFX 库 + step9 时间轴叠加 |
+| **B5 LLM 把场景描述当 speaker** | ★★ P1 | 1h | planned | script-gen 把 speaker 字段填「令狐冲与仪琳的对话场景」（5 turn 都中招）。修：prompt 强制 speaker 字段必须是单个角色名 + script-gen 后 sweep 校验 |
+| **B6 短喊招漏关键词** | ★ P2 | 15min | planned | 「再来！换我主攻！」未升级 action_b（"主攻"/"再来" 不在 shout_keywords）。扩词：再来/换我/还击/反攻/上来/接着 |
+
 ---
 
 ## ✗ Deprecated (撤回方向)
@@ -116,10 +127,10 @@ Last updated: 2026-05-21
 - ★★ 中等 ROI 或工程量 3-5h
 - ★ 长期价值或工具型
 
-**当前 top 3 (2026-05-21 更新):**
-1. PR-A · merged_a 合并跑 (4-5h) — 最大省时间，Spike 2 已验证
-2. meta_grid 缓存预热 (30min) — 零工，常用 speaker 预生
-3. D · 角色弧线版本 (3h) — 同 speaker 多年龄/阶段
+**当前 top 3 (2026-05-21 笑傲江湖重跑 bug 修复优先):**
+1. **B1+B2+B3 三 P0 bug 包修** (3h) — 音量/meta_grid 泄露/内嵌字幕，直接影响成片质量
+2. B4 武戏 SFX (2h) — 武戏无打斗音效，影响 action_b 实际观感
+3. B5 LLM speaker 误填 (1h) — 修了能省 AUTO-IP 误孵化 + voice_asset 错配
 
 零工 / 已可立刻用：
 - 跨题材召唤 (用 IP 即可)
