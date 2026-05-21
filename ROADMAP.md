@@ -37,6 +37,8 @@ Last updated: 2026-05-21
 | 2026-05-21 | action_b 题材触发优化 | script-gen prompt 鼓励武侠/对抗题材主动出 ≥1-2 个 action_b（之前易筋经 0 个 action_b 因 LLM 保守）|
 | 2026-05-21 | LLM 智能召唤标签 | script-gen LLM 同时推 meta_grid_costume/pose 字段 + scene 注入 IP costume/pose 池，_infer_* 优先读 LLM 标签，规则兜底 |
 | 2026-05-21 | AUTO-IP · ADR 主流程自动孵化 | step1 后扫描脚本无 IP speaker → LLM 孵化（含 voice_asset 智能匹配 + 全字段填充 + qa_status=auto_generated_pending_review）·env ADR_AUTO_INCUBATE_IP 控制 · 实测苏东坡 ✓ |
+| 2026-05-21 | duration=3 bug fix (P0) | duration 优化下限 3 越过 WERYDANCE 硬限 4，整 run 39min 挂掉；回收下限 → 4 + 双保险 max(4) · 实测笑傲江湖 turn 5/9 status 1002 root cause |
+| 2026-05-21 | step7 防御层 | 缺失 seg 时用 img_path 现场补 still seg + 不可恢复时从 script 移除 turn，避免 ffprobe 整 run 挂掉 |
 | 2026-05-20 | TG deliver 假阴性 fix | status=200 后验证 body {"ok":true,"result":{}} |
 | 2026-05-20 | tools/rerun_downstream.py | 跳过 step1-66 跑下游，10x 调试加速 |
 
@@ -82,6 +84,7 @@ Last updated: 2026-05-21
 | 项目 | 工程量 | ROI | 状态 | 备注 |
 |------|--------|-----|------|------|
 | ~~LLM 智能召唤标签~~ | ~~1.5h~~ | ~~★★~~ | ✅ shipped 2026-05-21 | script-gen LLM 同时推 meta_grid_costume/pose 字段 |
+| action_b LLM 标注 bug | 1h | ★★ | planned | LLM 把武戏 dialog（如「看招！破箭式！」「躲不了，就破了他！」）标 narrated_b 而非 action_b，导致武戏走静态 b-roll 路径。修 _infer_turn_type + 强化 script-gen prompt |
 | 题材泛化验证 | 30min/题材 | ★ | planned | 跑科比/鲁迅/苏东坡/钱学森等验证 IP+人设符稳定性 |
 | resume 工具 e2e test | 1h | ★ | planned | tools/rerun_downstream.py 加自动测试套件 |
 

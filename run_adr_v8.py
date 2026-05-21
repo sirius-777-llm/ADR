@@ -437,6 +437,7 @@ def _infer_turn_type(speaker: str, text: str = "", emotion: str = "", turn_type_
     """推断 turn 类型。优先级：explicit hint > rules。
 
     返回 "a_roll" | "narrated_b" | "silent_b" | "action_b"
+    P0 fix 2026-05-21: 武戏命中改回 action_b（之前历史遗留错返 narrated_b）+ 新增短喊招检测
     """
     explicit = (turn_type_hint or "").strip().lower()
     if explicit in ("a_roll", "narrated_b", "silent_b", "action_b"):
@@ -447,9 +448,24 @@ def _infer_turn_type(speaker: str, text: str = "", emotion: str = "", turn_type_
         return "silent_b"
     if "旁白" in sp or sp.lower() in ("narrator", "voiceover", "vo", "解说"):
         return "narrated_b"
+    # P0 (2026-05-21): 武戏短喊招（看招/接招/破/出招/感叹号短句含武术词）→ action_b
+    if _is_action_shout(txt):
+        return "action_b"
     if _is_action_scene(txt):
-        return "narrated_b"
+        return "action_b"  # ← 修正: 原 narrated_b 是 action_b PR 漏改的历史遗留
     return "a_roll"
+
+
+def _is_action_shout(text: str) -> bool:
+    """检测武戏短喊招：短句（≤15 字）+ 感叹号 + 含武术关键词。
+    例: 「看招！破箭式！」「接招！」「破！」「躲不了，就破了他！」"""
+    t = str(text or "").strip()
+    if not t or len(t) > 20:
+        return False
+    if "！" not in t and "!" not in t:
+        return False
+    shout_keywords = ("看招", "接招", "出招", "破招", "破!", "破！", "招式", "受死", "纳命", "决一", "杀", "斩", "劈", "砍", "刺", "出剑", "亮剑")
+    return any(kw in t for kw in shout_keywords)
 
 
 def _resolve_turn_type(scene: dict) -> str:
@@ -2230,6 +2246,32 @@ def _generate_adsd_dialogue_turns(topic: str, num_turns: int, tone: str, style_g
     # silent_b 占比目标：20%-35%
     min_silent = max(1, int(num_turns * 0.20))
     max_silent = max(min_silent + 1, int(num_turns * 0.35))
+    # P1 (2026-05-21) action_b 密度硬指标：LLM topic_decomposition 推断的武戏含量
+    _decomp_for_action = _llm_topic_decomposition(topic) or {}
+    _density = (_decomp_for_action.get("action_density_hint") or "low").strip().lower()
+    _rec_count = int(_decomp_for_action.get("recommended_action_b_count") or 0)
+    if _density == "high":
+        min_action, max_action = max(2, _rec_count - 1), max(3, _rec_count + 1)
+        action_block = (
+            f"★ 武戏密度硬指标 (题材 action_density=high):\n"
+            f"  必须 {min_action}-{max_action} 个 action_b（建议 {_rec_count} 个）\n"
+            f"  推荐节奏: a_roll → action_b → silent_b → action_b → a_roll → action_b（武戏连续 2 个组成节拍）\n"
+            f"  武打描写禁止用 narrated_b 旁白带过，必须用 action_b 演出"
+        )
+    elif _density == "medium":
+        min_action, max_action = max(1, _rec_count - 1), max(2, _rec_count + 1)
+        action_block = (
+            f"★ 武戏密度硬指标 (题材 action_density=medium):\n"
+            f"  必须 {min_action}-{max_action} 个 action_b（建议 {_rec_count} 个）\n"
+            f"  在关键冲突点用 action_b 制造冲击力"
+        )
+    else:
+        min_action, max_action = 0, max(1, _rec_count)
+        action_block = (
+            f"★ 武戏密度硬指标 (题材 action_density=low):\n"
+            f"  最多 {max_action} 个 action_b（建议 {_rec_count} 个）\n"
+            f"  纯叙述题材可全无 action_b，不强求"
+        )
 
     def _build_prompt(retry_hint: str = "") -> str:
         retry_block = f"\n【重试提醒】上一次输出违反约束：{retry_hint}\n请严格按以下规则重新生成。\n" if retry_hint else ""
@@ -2266,23 +2308,39 @@ silent_b    氛围呼吸镜头 + 仅 BGM
 action_b    武戏 / 激烈对抗 / 突破冲击 镜头
             画面：多镜切换 + 动态镜头 + 冲击力特效
             用于：武打 / 体育对抗 / 战争 / 激烈论战 / 突破时刻
-            text 可空 (纯动作) 或短句 (角色喊话)
+            text 可空 (纯动作) 或短句 (角色喊话/招式名)
             speaker 主体角色名 或 "(action)"
             时长 8-12 秒（动作密度需要时间展开）
-            ★ 题材判断:
-              · 武侠 / 武功 / 武学 / 内功 / 出招 / 修炼 → 建议 ≥1-2 个 action_b 演绎修炼或对决
-              · 体育对抗 / 战争 / 警匪 / 追逐 → 建议 1-2 个 action_b 体现冲击
-              · 纯叙述/讲解题材（书评 / 节气 / 文化品鉴）→ 可以全无 action_b
-              · 不要滥用，但武打/对抗题材至少要有 1 个 action_b 让观众感受冲击力
+
+            ★ 标注正例（必须按这个标）:
+              · 「看招！破箭式！」(令狐冲) → turn_type=action_b ← 短喊招就是 action_b 不是 narrated_b
+              · 「躲不了，就破了他！」(令狐冲) → turn_type=action_b
+              · 「接招！」「亮剑！」「受死！」「再来！」→ 全部 action_b
+              · 「这一球必进！」(科比) → action_b
+              · 「冲！」「开火！」「卧倒！」→ action_b
+              · 任何 ≤15 字 + 感叹号 + 武术/对抗词 的 dialog → action_b（不要标 a_roll/narrated_b）
+
+            ★ 题材密度硬指标（按 topic 武戏含量给）:
+              · 武侠/格斗/竞技对抗 (笑傲江湖 / NBA 对决 / 拳击) → ≥3 action_b，且必须连续 2 个组成节奏
+                  pattern: A-roll(对白) → action_b(出招) → silent_b(余韵) → action_b(反击)
+              · 战争/警匪/动作冒险 → 2-3 action_b
+              · 商业/职场冲突 / 激烈论战 → 1-2 action_b（用于"拍桌"等冲击点）
+              · 历史叙事 / 文化品鉴 / 书评 → 0-1 action_b
+              · 纯讲解/科普 / 节气 → 0 action_b
+              ★ 武戏题材出现「武功招式名 / 兵器对碰 / 招式拆解」描述时，必须配 action_b 不可走 narrated_b
+
+{action_block}
 
 【硬约束】
 1. turn 1 必须是 narrated_b（开场 setup）
 2. turn {num_turns} 必须是 narrated_b（结尾收口）
 3. narrated_b 全片 ≤ {max_narrated} 个（含开场+结尾）
 4. silent_b 数量 ∈ [{min_silent}, {max_silent}]
-5. 任意两个 narrated_b 间距 ≥ 3 turn
-6. 中段（turn 2~{num_turns-1}）以 a_roll 为主，穿插 silent_b
-7. narrated_b 仅在「真转场」用：时间大跳 / 地点大跳 / 视角切换
+5. action_b 数量 ∈ [{min_action}, {max_action}]（按上面 action_density 硬指标）
+6. 任意两个 narrated_b 间距 ≥ 3 turn
+7. 中段（turn 2~{num_turns-1}）以 a_roll 为主，穿插 silent_b 和 action_b
+8. narrated_b 仅在「真转场」用：时间大跳 / 地点大跳 / 视角切换
+9. 武戏题材的 action_b 必须连续 2 个组成节拍（一招 + 反招），不可单点散布
 
 【可用现场角色方向】（用于 a_roll，按题材微调，必须是题材内部的人）
 {role_hint}
@@ -6398,6 +6456,8 @@ def _llm_topic_decomposition(topic: str, use_cache: bool = True) -> dict:
   "director_style": "导演风格 英文短语 (e.g. corporate clean handheld documentary / epic dramatic backlight)",
   "cover_art_direction": "封面美术方向 中文短语 (e.g. 极简金融感冷色调 / 史诗水墨卷轴)",
   "is_action_topic": false,
+  "action_density_hint": "low",
+  "recommended_action_b_count": 0,
   "reason": "10 字内说明 era 判断依据"
 }}
 
@@ -6406,6 +6466,11 @@ def _llm_topic_decomposition(topic: str, use_cache: bool = True) -> dict:
 2. role_candidates 要符合 topic 时代（南京银行 → 客户经理；曹操 → 谋士；科比 → 球员）
 3. 现代企业题材 BGM 不要选 erhu/guzheng；历史题材不要选合成器
 4. is_action_topic 仅在题材本身是动作/打斗类才 true (武侠/体育对抗/战争)
+5. action_density_hint 必填 (3 档判断武戏含量):
+     · "high"   武侠/格斗/竞技对抗 (笑傲江湖 / NBA 决战 / 拳击 / 战神) → recommended_action_b_count=3-4
+     · "medium" 战争/警匪/动作冒险/激烈商业冲突 → recommended_action_b_count=1-2
+     · "low"    历史叙事/文化品鉴/书评/科普/节气 → recommended_action_b_count=0-1
+   recommended_action_b_count 是「该题材在 8-12 turn 片子里应有的 action_b 数量」硬指标
 
 只输出 JSON。"""
     try:
@@ -12003,11 +12068,12 @@ def _lip_sync_one_scene(idx: int, scene: dict, target_dur: float, aspect_ratio: 
         _tts_dur = float(scene.get("dur") or target_dur)
         _text = str(scene.get("text") or "")
         _char_min = math.ceil(len(_text) / 6.0) if _text else 0
-        # duration 优化 (2026-05-21): 下限 5s → 3s + tts_dur+0.3 buffer (短 dialogue 处理时长降 30-40%)
+        # duration 优化 (2026-05-21): 下限 5s → 4s + tts_dur+0.3 buffer (短 dialogue 处理时长降 ~25%)
         # action_b 会 max(api_dur, 10) 自己加长，不受此影响
-        _min_dur = float(os.environ.get("ADR_LIP_SYNC_MIN_DURATION", "3"))
+        # WERYDANCE 硬限 duration ∈ [4, 15]，下限不能 < 4（实测 duration=3 status 1002 整 run 挂掉）
+        _min_dur = float(os.environ.get("ADR_LIP_SYNC_MIN_DURATION", "4"))
         _char_min_safe = _char_min if _text else 0
-        api_dur = int(round(min(15, max(_min_dur, _char_min_safe, _tts_dur + 0.3))))
+        api_dur = int(round(min(15, max(4, _min_dur, _char_min_safe, _tts_dur + 0.3))))
         fast_fallback_enabled = os.environ.get("ADR_WERYDANCE_FAST_FALLBACK", "1").strip().lower() not in ("0", "false", "no", "off")
         if not needs_lip:
             if is_action:
@@ -12893,6 +12959,25 @@ def step7_concat(script: list[dict]) -> str:
             tg("⚠️ STORYBOARD_TRAILER_MAIN 开启但 storyboard_trailer.mp4 不存在/过小，回退到逐镜拼接")
             log("step7 STORYBOARD_TRAILER_MAIN fallback: trailer missing, using per-scene concat")
     concat_txt = OUTPUT_DIR / "concat.txt"
+    # 2026-05-21 防御：step66 全部 variants 失败的 turn 没有 seg_N.mp4 文件，
+    # 直接 ffprobe 会让 step7 抛异常整 run 挂掉（已 39 min 投入）。
+    # 缺失 seg → 用 img_path 现场补一个 still seg（保留叙事连续性），实在不行才丢弃。
+    for i, s in enumerate(script):
+        vp = s.get("vid_path") or ""
+        if not vp or not os.path.exists(vp) or os.path.getsize(vp) < 1000:
+            img = s.get("img_path") or ""
+            if img and os.path.exists(img):
+                try:
+                    log(f"step7 防御：seg_{i}.mp4 缺失 → 用 img_path 现场补 still seg")
+                    _render_still_segment(s, timeout=30)
+                    if os.path.exists(vp) and os.path.getsize(vp) > 1000:
+                        tg(f"⚠️ turn {i+1} WERYDANCE 失败 → 用静态图补救（仍计入最终成片）")
+                        continue
+                except Exception as e:
+                    log(f"step7 防御 turn {i+1} still seg 补救失败：{e}")
+            log(f"step7 防御：turn {i+1} seg 不可恢复（连 img 也没），从 script 移除")
+            tg(f"⚠️ turn {i+1} seg 不可恢复（WERYDANCE 失败 + img 缺失），从拼接队列剔除")
+    script[:] = [s for s in script if s.get("vid_path") and os.path.exists(s["vid_path"]) and os.path.getsize(s["vid_path"]) > 1000]
     segment_paths = [str(s["vid_path"]) for s in script]
     audio_flags = [_has_audio_stream(p) for p in segment_paths]
     prefer_embedded_partial_audio = (
