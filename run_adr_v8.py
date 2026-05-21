@@ -6264,31 +6264,249 @@ def _paraphrase_sensitive_dialogue(text: str) -> tuple[str, bool]:
     return text, False
 
 
+# ── era-aware meta_grid 模板系统 (2026-05-21) ────────────────────────────────
+# 历史题材 + 现代题材 + 未来题材 通用：LLM 推断 era + 标签集
+# 兜底：IP era + 预设 era 模板 + 默认「日常」
+
+# A · 预设 era 模板（LLM 失败兜底）
+ERA_TEMPLATES: dict[str, dict] = {
+    "historical_chinese": {
+        "costume_variants": ["战袍", "朝服", "私服", "夜行"],
+        "poses": ["说话", "发令", "沉思", "书写", "持剑", "拱手"],
+        "scenes": ["战场", "宫殿", "夜营", "书房"],
+        "emotion_palette": ["严肃", "暴怒", "文人", "深沉"],
+    },
+    "contemporary_corporate": {
+        "costume_variants": ["商务西装", "职业衬衫", "工服马甲", "休闲西装"],
+        "poses": ["说话", "握手", "演示", "电话", "签字", "点头"],
+        "scenes": ["写字楼大堂", "会议室", "柜台", "电梯间"],
+        "emotion_palette": ["专业", "微笑", "凝重", "热情"],
+    },
+    "modern_casual": {
+        "costume_variants": ["便服", "休闲装", "运动装", "外套"],
+        "poses": ["说话", "走路", "坐下", "举杯", "微笑", "凝视"],
+        "scenes": ["街头", "咖啡馆", "公园", "家中"],
+        "emotion_palette": ["放松", "认真", "感慨", "温暖"],
+    },
+    "modern_athlete": {
+        "costume_variants": ["球衣", "训练服", "西装", "便装"],
+        "poses": ["训练", "投篮", "怒吼", "采访", "庆祝"],
+        "scenes": ["球场", "训练馆", "媒体厅", "更衣室"],
+        "emotion_palette": ["专注", "得意", "怒火", "汗水"],
+    },
+    "modern_scholar": {
+        "costume_variants": ["西装", "便服", "讲学服", "围巾"],
+        "poses": ["书写", "讲台演讲", "凝视", "把玩眼镜", "握笔思考"],
+        "scenes": ["书房", "讲台", "校园", "灯下"],
+        "emotion_palette": ["冷峻", "悲愤", "幽默", "深思"],
+    },
+    "future_tech": {
+        "costume_variants": ["科技外套", "工作服", "实验服", "便服"],
+        "poses": ["操作设备", "演讲", "握手", "凝视屏幕", "讨论"],
+        "scenes": ["发布会", "实验室", "工厂", "办公室"],
+        "emotion_palette": ["专注", "兴奋", "凝重", "野心"],
+    },
+    "documentary_narrator": {
+        "costume_variants": [],
+        "poses": [],
+        "scenes": ["silhouette", "wide_shot", "statue", "historical_painting"],
+        "emotion_palette": ["solemn", "neutral", "contemplative"],
+    },
+    "default": {
+        "costume_variants": ["日常", "外套", "便服", "工作装"],
+        "poses": ["说话", "凝视", "走路", "微笑", "沉思"],
+        "scenes": ["室内", "户外", "工作场所", "夜景"],
+        "emotion_palette": ["平和", "认真", "微笑", "凝重"],
+    },
+}
+
+
+def _llm_infer_meta_grid_template(speaker: str, topic: str, ip: dict | None = None) -> dict | None:
+    """LLM 推断 speaker + topic 的 era + 4 类标签集。
+    返回 dict 含 era / costume_variants / poses / scenes / emotion_palette。
+    失败返回 None，调用方走 fallback chain。
+    """
+    cache_key = f"{speaker}|{topic}|{(ip or {}).get('era', '')}"
+    # 检查 IP 是否已存 template（避免重复 LLM）
+    if ip and ip.get("meta_grid_template_cache", {}).get(cache_key):
+        return ip["meta_grid_template_cache"][cache_key]
+    ip_hint = ""
+    if ip:
+        if ip.get("era"):
+            ip_hint += f"已知该角色时代: {ip['era']}。"
+        if ip.get("personality"):
+            ip_hint += f"性格: {' / '.join(ip['personality'][:3])}。"
+    available_eras = list(ERA_TEMPLATES.keys())
+    prompt = f"""你是 ADR 视觉总监。为「{speaker}」（出现在主题「{topic}」的纪录片）推荐 meta_grid 标签集。
+
+{ip_hint}
+预设 era 类型: {' / '.join(available_eras)}
+
+输出严格 JSON:
+{{
+  "era": "选择上面一个 era 或自定义新 era 名（如 modern_lawyer / qing_dynasty）",
+  "costume_variants": [3-4 个该 speaker 在该题材中合理的服装中文短语],
+  "poses": [4-6 个该 speaker 典型动作/姿态中文短语],
+  "scenes": [3-4 个该题材典型场景中文短语],
+  "emotion_palette": [3-4 个情绪基调中文短语],
+  "reason": "10 字内说明 era 判断依据"
+}}
+
+要求:
+1. 严格 JSON，不要 markdown
+2. 标签必须与 speaker + 题材匹配（南京银行 = 现代商务，曹操 = 历史古装）
+3. 中文短语，每个 2-6 字
+4. 历史题材用 historical_chinese 类标签，现代企业用 contemporary_corporate，等
+
+只输出 JSON。"""
+    try:
+        raw = chat("GEMINI_25_FLASH", "你只输出严格 JSON。", prompt, max_tokens=600, timeout=30)
+        start = raw.find("{")
+        end = raw.rfind("}")
+        if start < 0 or end <= start:
+            log(f"meta_grid template LLM JSON 解析失败：{raw[:200]}")
+            return None
+        result = json.loads(raw[start:end + 1])
+        # 校验必填字段
+        if not all(k in result for k in ("era", "costume_variants", "poses", "scenes")):
+            log(f"meta_grid template LLM 输出缺字段：{result}")
+            return None
+        log(f"meta_grid template LLM 推断 {speaker}@{topic}: era={result['era']} ({result.get('reason', '')})")
+        return result
+    except Exception as e:
+        log(f"meta_grid template LLM 异常（走 fallback）：{e}")
+        return None
+
+
+def _resolve_meta_grid_template(speaker: str, topic: str = "", ip: dict | None = None) -> dict:
+    """Fallback chain 解析 meta_grid template:
+      1. LLM 推断（主路径）
+      2. IP 已存的 template_cache 复用
+      3. IP era → 预设 ERA_TEMPLATES 模板
+      4. 默认 default 模板
+    """
+    if ip is None:
+        ip = _match_speaker_ip(speaker)
+    # 优先 IP 中已 cache 的（同 topic 跨 run 复用）
+    cache = (ip or {}).get("meta_grid_template_cache") if ip else None
+    if cache:
+        for key, tpl in cache.items():
+            if key.startswith(f"{speaker}|{topic}|"):
+                log(f"meta_grid template: {speaker}@{topic} 从 IP cache 复用")
+                return tpl
+    # LLM 主路径
+    if os.environ.get("ADR_META_GRID_LLM_TEMPLATE", "1").strip().lower() not in ("0", "false", "no", "off"):
+        llm_template = _llm_infer_meta_grid_template(speaker, topic, ip)
+        if llm_template:
+            # 写入 IP 缓存
+            if ip:
+                cache_key = f"{speaker}|{topic}|{ip.get('era', '')}"
+                cache = ip.get("meta_grid_template_cache") or {}
+                cache[cache_key] = llm_template
+                ip["meta_grid_template_cache"] = cache
+                try:
+                    _save_speaker_ip(ip.get("speaker", speaker), ip)
+                except Exception as e:
+                    log(f"IP template cache 写入失败（不影响）：{e}")
+            return llm_template
+    # IP era → 预设 era 模板
+    if ip and ip.get("era"):
+        ip_era = ip["era"]
+        for era_key, tpl in ERA_TEMPLATES.items():
+            if era_key in ip_era or ip_era in era_key:
+                log(f"meta_grid template: {speaker} fallback to ERA_TEMPLATES[{era_key}]")
+                return tpl
+    # 默认
+    log(f"meta_grid template: {speaker} fallback to default")
+    return ERA_TEMPLATES["default"]
+
+
 def _infer_meta_grid_costume(scene: dict) -> str:
-    """从 scene 推断应召唤的服装标签。"""
+    """从 scene + speaker IP template 池中匹配 costume 标签。
+    历史规则 (战袍/朝服/夜行) 现仅在 IP era=historical 时用，否则从 IP template.costume_variants 池选。"""
     text = (scene.get("text", "") or "") + " " + (scene.get("shot", "") or "")
-    if any(k in text for k in ("战", "兵", "马", "甲", "刀剑", "战场", "出征", "厮杀")):
-        return "战袍"
-    if any(k in text for k in ("夜", "深夜", "暗中", "潜行", "刺")):
-        return "夜行"
-    if any(k in text for k in ("私下", "书房", "私服", "独处", "灯下", "夜读")):
-        return "私服"
-    return "朝服"  # 默认 - 中性场景
+    speaker = scene.get("speaker", "")
+    ip = _match_speaker_ip(speaker) if speaker else None
+    # 从 IP cache 拿 template
+    template = None
+    if ip:
+        cache = ip.get("meta_grid_template_cache") or {}
+        if cache:
+            template = next(iter(cache.values()))  # 取任意一个 cache
+        if not template:
+            # 用 IP era 选预设
+            ip_era = ip.get("era", "")
+            for era_key, tpl in ERA_TEMPLATES.items():
+                if era_key in ip_era or ip_era in era_key:
+                    template = tpl
+                    break
+    if not template:
+        template = ERA_TEMPLATES["default"]
+    costumes = template.get("costume_variants") or ERA_TEMPLATES["default"]["costume_variants"]
+    if not costumes:
+        return "日常"
+    # 关键词命中：text 里出现某 costume name 子串 → 直接命中
+    for c in costumes:
+        if c and c in text:
+            return c
+    # 历史风格 fallback 规则
+    if any(c in costumes for c in ("战袍", "朝服", "私服", "夜行")):
+        if any(k in text for k in ("战", "兵", "马", "甲", "刀剑", "战场", "出征", "厮杀")):
+            if "战袍" in costumes:
+                return "战袍"
+        if any(k in text for k in ("夜", "深夜", "暗中", "潜行", "刺")):
+            if "夜行" in costumes:
+                return "夜行"
+        if any(k in text for k in ("私下", "书房", "私服", "独处", "灯下", "夜读")):
+            if "私服" in costumes:
+                return "私服"
+        if "朝服" in costumes:
+            return "朝服"
+    # 现代/泛用 fallback：返回池里第一个
+    return costumes[0]
 
 
 def _infer_meta_grid_pose(scene: dict) -> str:
-    """从 scene 推断应召唤的动作/表情标签。"""
+    """从 scene + speaker IP template 池中匹配 pose 标签。"""
     text = (scene.get("text", "") or "") + " " + (scene.get("shot", "") or "")
     emotion = (scene.get("emotion", "") or "").lower()
-    if any(k in text for k in ("写", "笔", "竹简", "纸")):
-        return "书写"
-    if any(k in text for k in ("令", "命", "传令", "下令", "全军")):
-        return "发令"
-    if emotion == "tense" or any(k in text for k in ("怒", "恨", "愤", "斥")):
-        return "惊愤"
-    if emotion == "solemn" or any(k in text for k in ("思", "想", "念", "回忆", "沉思", "默")):
-        return "沉思"
-    return "说话"  # 默认 a_roll
+    speaker = scene.get("speaker", "")
+    ip = _match_speaker_ip(speaker) if speaker else None
+    template = None
+    if ip:
+        cache = ip.get("meta_grid_template_cache") or {}
+        if cache:
+            template = next(iter(cache.values()))
+        if not template:
+            ip_era = ip.get("era", "")
+            for era_key, tpl in ERA_TEMPLATES.items():
+                if era_key in ip_era or ip_era in era_key:
+                    template = tpl
+                    break
+    if not template:
+        template = ERA_TEMPLATES["default"]
+    poses = template.get("poses") or ERA_TEMPLATES["default"]["poses"]
+    if not poses:
+        return "说话"
+    # 关键词直接命中
+    for p in poses:
+        if p and p in text:
+            return p
+    # emotion 推断
+    if emotion in ("tense",) or any(k in text for k in ("怒", "恨", "愤", "斥")):
+        for cand in ("惊愤", "怒火", "凝视"):
+            if cand in poses:
+                return cand
+    if emotion in ("solemn", "contemplative") or any(k in text for k in ("思", "想", "念", "回忆", "沉思")):
+        for cand in ("沉思", "凝视", "握笔思考"):
+            if cand in poses:
+                return cand
+    if any(k in text for k in ("写", "笔", "竹简", "纸", "签字")):
+        for cand in ("书写", "签字", "握笔思考"):
+            if cand in poses:
+                return cand
+    # 默认池里第一个（通常是「说话」）
+    return poses[0]
 
 
 def _adsd_meta_grid_call_prompt(scene: dict) -> str:
@@ -6496,7 +6714,7 @@ def _character_meta_grid_path(speaker: str) -> Path:
     return OUTPUT_DIR / f"meta_grid_{safe}.png"
 
 
-def generate_character_meta_grid_gpt_image2(speaker: str, visual_subject: str, voice_gender: str = "male") -> str | None:
+def generate_character_meta_grid_gpt_image2(speaker: str, visual_subject: str, voice_gender: str = "male", topic: str = "") -> str | None:
     """人设符 PR：生成单个 speaker 的 4×3 中文标签 grid。
 
     返回 grid 文件路径；失败返回 None。
@@ -6537,25 +6755,44 @@ def generate_character_meta_grid_gpt_image2(speaker: str, visual_subject: str, v
         except Exception as e:
             log(f"meta_grid 缓存复用失败（重新生成）：{e}")
     subject = visual_subject or "an adult Chinese historical figure"
+    # P2: era-aware template，LLM/fallback 决定标签集
+    template = _resolve_meta_grid_template(speaker, topic, ip)
+    costumes = template.get("costume_variants") or ERA_TEMPLATES["default"]["costume_variants"]
+    poses = template.get("poses") or ERA_TEMPLATES["default"]["poses"]
+    scenes = template.get("scenes") or ERA_TEMPLATES["default"]["scenes"]
+    # 凑齐 4 个 costume / 6 个 pose / 4 个 scene（不够则循环填）
+    costumes = (costumes * 4)[:4]
+    poses = (poses * 6)[:6]
+    scenes = (scenes * 4)[:4]
+    era_label = template.get("era", "general")
+    # 行 1: 4 个 costume × 「说话」/对应动作
+    # 行 2: 角色不同动作 (4 个 pose 4-7 + costume)
+    # 行 3: 4 场景
+    cell_lines = [
+        f"第 1 行：",
+        f"cell 1「{speaker}｜{costumes[0]}｜{poses[0]}」（中景，{costumes[0]}，{poses[0]}）；",
+        f"cell 2「{speaker}｜{costumes[1]}｜{poses[0]}」（{costumes[1]}，{poses[0]}）；",
+        f"cell 3「{speaker}｜{costumes[2]}｜{poses[1]}」（{costumes[2]}，{poses[1]}）；",
+        f"cell 4「{speaker}｜{costumes[3]}｜{poses[2]}」（{costumes[3]}，{poses[2]}）。",
+        f"第 2 行：",
+        f"cell 5「{speaker}｜{costumes[0]}｜{poses[3]}」（{costumes[0]}，{poses[3]}）；",
+        f"cell 6「{speaker}｜{costumes[1]}｜{poses[4]}」（{costumes[1]}，{poses[4]}）；",
+        f"cell 7「{speaker}｜{costumes[2]}｜{poses[5]}」（{costumes[2]}，{poses[5]}）；",
+        f"cell 8「{speaker}｜{costumes[3]}｜{poses[2]}」（特写表情）。",
+        f"第 3 行：",
+        f"cell 9「场景｜{scenes[0]}」（远景，无人脸特写）；",
+        f"cell 10「场景｜{scenes[1]}」；",
+        f"cell 11「场景｜{scenes[2]}」；",
+        f"cell 12「场景｜{scenes[3]}」。",
+    ]
     grid_prompt = (
         f"生成 4 列 × 3 行 人设符参考图，12 个独立 cell，细金色边框。\n"
-        f"角色主体：{subject}（{speaker} 原型，性别 {voice_gender}）。\n"
+        f"角色主体：{subject}（{speaker} 原型，性别 {voice_gender}，era={era_label}）。\n"
         f"每个 cell 左上角必须有清晰可读的中文文字标签（黑色衬线字体，白色描边，"
         f"字号约 cell 高度 5%，不变形、不糊、不错字）——这是功能性元数据。\n"
-        f"布局：\n"
-        f"第 1 行：cell 1「{speaker}｜战袍｜说话」（中景战甲，开口讲话，嘴部清晰可见）；"
-        f"cell 2「{speaker}｜战袍｜发令」（举臂下令）；"
-        f"cell 3「{speaker}｜朝服｜说话」（朝服，宫殿柱旁）；"
-        f"cell 4「{speaker}｜朝服｜沉思」（朝服，低头思考）。\n"
-        f"第 2 行：cell 5「{speaker}｜私服｜沉思」（私服丝绸便装，油灯光照）；"
-        f"cell 6「{speaker}｜私服｜书写」（竹简书写）；"
-        f"cell 7「{speaker}｜战袍｜骑马」（马上，尘土飞扬）；"
-        f"cell 8「{speaker}｜表情｜惊愤」（特写，怒目）。\n"
-        f"第 3 行：cell 9「场景｜战场」（远景，旗帜，无人脸特写）；"
-        f"cell 10「场景｜宫殿」（室内，柱子，昏暗）；"
-        f"cell 11「场景｜夜营」（营火，帐篷）；"
-        f"cell 12「道具｜竹简」（桌上竹简特写）。\n"
+        f"布局：\n{' '.join(cell_lines)}\n"
         f"同标签组内服装连续；同角色身份贯穿；每个 cell 是纪录片电影质感。"
+        f"严格按照 era={era_label} 风格渲染（不要混搭其他时代/题材的服装、道具、场景）。"
     )
     payload = {
         "model": "GPT_IMAGE_2",
@@ -6596,7 +6833,7 @@ def generate_character_meta_grid_gpt_image2(speaker: str, visual_subject: str, v
     return None
 
 
-def _generate_all_character_meta_grids(script: list[dict], executor) -> dict[str, str]:
+def _generate_all_character_meta_grids(script: list[dict], executor, topic: str = "") -> dict[str, str]:
     """ADR step6 阶段：为脚本中每个 unique a_roll/narrated_b speaker 并发生成人设符 grid。
     silent_b 不需要人设符（无主体）。
     返回 {speaker: grid_path}（含已存在的）。
@@ -6619,7 +6856,7 @@ def _generate_all_character_meta_grids(script: list[dict], executor) -> dict[str
     futures = {
         executor.submit(
             generate_character_meta_grid_gpt_image2,
-            speaker, meta["visual_subject"], meta["voice_gender"],
+            speaker, meta["visual_subject"], meta["voice_gender"], topic,
         ): speaker
         for speaker, meta in seen.items()
     }
@@ -7632,7 +7869,7 @@ def step6_parallel(script: list[dict], topic: str, pregenerated_bgm_path: str | 
         # 人设符 PR (Phase 4)：每个 a_roll/narrated_b unique speaker 并发生成 meta_grid
         if meta_grid_active:
             try:
-                _generate_all_character_meta_grids(script, ex)
+                _generate_all_character_meta_grids(script, ex, topic)
             except Exception as e:
                 log(f"人设符 meta_grid 并发生成失败（fallback 切片路径）：{e}")
         if not skip_production_sb:

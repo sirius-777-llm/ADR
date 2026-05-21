@@ -91,7 +91,18 @@ def main() -> int:
     print(f"turn count: {len(script)}")
     print(f"voice_path: {voice_path}")
     print(f"bgm_path: {bgm_path}")
+    print(f"regen_bgm: {regen_bgm}")
     print()
+
+    if regen_bgm:
+        print("[--regen-bgm] 强制重新生成 BGM (含 vocal 检测 retry)...")
+        tone = "中性"
+        new_bgm = adr.generate_bgm(topic, tone)
+        if new_bgm:
+            bgm_path = new_bgm
+            print(f"  新 BGM: {bgm_path}")
+        else:
+            print(f"  BGM 重生成失败，沿用原 bgm_path: {bgm_path}")
 
     # 跑下游
     print("[1/6] audio_dub retiming...")
