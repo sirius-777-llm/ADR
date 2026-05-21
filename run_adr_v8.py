@@ -13126,28 +13126,43 @@ def step7_concat(script: list[dict]) -> str:
             elif cover_path:
                 still_src = cover_path  # 最后 fallback：cover
             if still_src:
+                orig_img = s.get("img_path")
+                s["img_path"] = still_src
+                src_label = "邻 turn 图" if still_src in legit_imgs else ("cover" if still_src == cover_path else "原 img")
+                # 三层降级：Ken Burns 大 timeout → Ken Burns 失败回退静态 → 静态也失败 才丢弃
+                ken_burns_success = False
                 try:
                     log(f"step7 防御：seg_{i}.mp4 缺失 → 用 {os.path.basename(still_src)} 现场补 Ken Burns still seg")
-                    # 临时换 img_path 让 _render_still_segment 用合法图
-                    orig_img = s.get("img_path")
-                    s["img_path"] = still_src
-                    try:
-                        # ken_burns=True 让冻帧动起来（slow zoom + 微 pan），避免画面死板
-                        _render_still_segment(s, timeout=60, ken_burns=True)
-                    finally:
-                        s["img_path"] = orig_img
+                    # ken_burns timeout 180s 给长 dur turn (10s+ 296 帧) 足够余量
+                    _render_still_segment(s, timeout=180, ken_burns=True)
                     if os.path.exists(vp) and os.path.getsize(vp) > 1000:
-                        src_label = "邻 turn 图" if still_src in legit_imgs else ("cover" if still_src == cover_path else "原 img")
+                        ken_burns_success = True
                         tg(f"⚠️ turn {i+1} WERYDANCE 失败 → Ken Burns 慢推静态图补救（来源: {src_label}）")
-                        continue
                 except Exception as e:
-                    log(f"step7 防御 turn {i+1} still seg 补救失败：{e}")
-                    # cleanup partial: ffmpeg -y 失败时可能写了半成品，导致后续过滤逻辑误判 "vid_path 存在"
+                    log(f"step7 防御 turn {i+1} Ken Burns 失败 (降级静态): {e}")
                     try:
                         if vp and os.path.exists(vp):
                             os.remove(vp)
                     except Exception:
                         pass
+                # Ken Burns 失败 → 回退到无 motion 静态图
+                if not ken_burns_success:
+                    try:
+                        _render_still_segment(s, timeout=60, ken_burns=False)
+                        if os.path.exists(vp) and os.path.getsize(vp) > 1000:
+                            tg(f"⚠️ turn {i+1} Ken Burns 失败 → 降级静态图补救（来源: {src_label}）")
+                            s["img_path"] = orig_img
+                            continue
+                    except Exception as e2:
+                        log(f"step7 防御 turn {i+1} 静态图补救也失败：{e2}")
+                        try:
+                            if vp and os.path.exists(vp):
+                                os.remove(vp)
+                        except Exception:
+                            pass
+                s["img_path"] = orig_img
+                if ken_burns_success:
+                    continue
             log(f"step7 防御：turn {i+1} seg 不可恢复（无合法图源），从 script 移除")
             tg(f"⚠️ turn {i+1} seg 不可恢复，从拼接队列剔除")
     script[:] = [s for s in script if s.get("vid_path") and os.path.exists(s["vid_path"]) and os.path.getsize(s["vid_path"]) > 1000]
