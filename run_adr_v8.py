@@ -451,20 +451,33 @@ def _infer_turn_type(speaker: str, text: str = "", emotion: str = "", turn_type_
     # P0 (2026-05-21): 武戏短喊招（看招/接招/破/出招/感叹号短句含武术词）→ action_b
     if _is_action_shout(txt):
         return "action_b"
-    if _is_action_scene(txt):
-        return "action_b"  # ← 修正: 原 narrated_b 是 action_b PR 漏改的历史遗留
+    # _is_action_scene 兜底：仅对极短句（≤12 字）+ 感叹号生效
+    # 长 dialog 即便含武术词通常是讨论/教学，应保留 a_roll（让 LLM 自己显式标 action_b）
+    if len(txt) <= 12 and ("！" in txt or "!" in txt) and _is_action_scene(txt):
+        return "action_b"
     return "a_roll"
 
 
 def _is_action_shout(text: str) -> bool:
-    """检测武戏短喊招：短句（≤15 字）+ 感叹号 + 含武术关键词。
-    例: 「看招！破箭式！」「接招！」「破！」「躲不了，就破了他！」"""
+    """检测武戏短喊招：短句（≤20 字）+ 感叹号 + 含动作/武术关键词。
+    例: 「看招！破箭式！」「接招！」「破！」「躲不了，就破了他！」「冲！」「这一球必进！」"""
     t = str(text or "").strip()
     if not t or len(t) > 20:
         return False
     if "！" not in t and "!" not in t:
         return False
-    shout_keywords = ("看招", "接招", "出招", "破招", "破!", "破！", "招式", "受死", "纳命", "决一", "杀", "斩", "劈", "砍", "刺", "出剑", "亮剑")
+    shout_keywords = (
+        # 武侠喊招
+        "看招", "接招", "出招", "破招", "招式", "受死", "纳命", "决一",
+        "杀", "斩", "劈", "砍", "刺", "出剑", "亮剑", "破了他", "破他",
+        "纵身", "腾空", "凌空", "夺命",
+        # 体育对抗喊声
+        "必进", "扣篮", "灌篮", "盖帽", "绝杀", "突破",
+        # 战争/警匪喊令
+        "冲", "上", "撤", "开火", "突击", "卧倒", "进攻", "歼灭",
+        # 通用打斗
+        "打", "干", "揍", "动手",
+    )
     return any(kw in t for kw in shout_keywords)
 
 
@@ -7130,9 +7143,17 @@ def _auto_incubate_missing_ips(script: list[dict], topic: str) -> int:
         return 0
     seen = set()
     speakers_in_script: list[str] = []
+    # 排除占位符 speaker：silent_b / action_b 不需要 IP（不是真角色）
+    placeholder_set = {"(silent)", "(action)", "silent", "action", "silent_b", "action_b", "(none)", "none"}
     for s in script:
         sp = (s.get("speaker") or "").strip()
         if not sp or sp in seen:
+            continue
+        if sp.lower() in placeholder_set or sp in SILENT_B_SPEAKERS:
+            continue
+        # 防御：场景描述被误当 speaker（含「场景」「对话」「画面」等词 + >8 字 → 跳过）
+        if len(sp) > 8 and any(kw in sp for kw in ("场景", "对话", "画面", "镜头", "段落", "片段")):
+            log(f"AUTO-IP 跳过疑似场景描述 speaker: 「{sp}」")
             continue
         seen.add(sp)
         speakers_in_script.append(sp)
