@@ -477,6 +477,9 @@ def _is_action_shout(text: str) -> bool:
         "冲", "上", "撤", "开火", "突击", "卧倒", "进攻", "歼灭",
         # 通用打斗
         "打", "干", "揍", "动手",
+        # B6 (2026-05-21) 攻势/反击/换场喊声扩词
+        "再来", "换我", "还击", "反攻", "上来", "接着", "拦住", "挡住",
+        "夺回", "破阵", "进招", "出手", "下杀手", "封住", "拼了", "决胜",
     )
     return any(kw in t for kw in shout_keywords)
 
@@ -2354,13 +2357,24 @@ action_b    武戏 / 激烈对抗 / 突破冲击 镜头
 7. 中段（turn 2~{num_turns-1}）以 a_roll 为主，穿插 silent_b 和 action_b
 8. narrated_b 仅在「真转场」用：时间大跳 / 地点大跳 / 视角切换
 9. 武戏题材的 action_b 必须连续 2 个组成节拍（一招 + 反招），不可单点散布
+10. ★ speaker 字段铁律 (2026-05-21 B5):
+    a_roll 的 speaker 必须是**单个角色名**（2-4 字最佳），如「令狐冲」「风清扬」「科比」「鲁迅」
+    严禁填场景描述、动作描述、对话标签，如:
+      ❌ 「令狐冲与仪琳的对话场景」  ← 这是场景，不是角色
+      ❌ 「酒肆里的争执」              ← 这是事件
+      ❌ 「师徒对话」                  ← 这是关系
+      ❌ 「年轻人 / 路人甲」            ← 角色应该有名字
+    narrated_b 永远写 "旁白"
+    silent_b 永远写 "(silent)"
+    action_b 写主体角色名 或 "(action)"（纯动作无主体时）
 
 【可用现场角色方向】（用于 a_roll，按题材微调，必须是题材内部的人）
 {role_hint}
 
 【输出字段】每项必须包含：
 - turn_type    "a_roll" | "narrated_b" | "silent_b" | "action_b"
-- speaker      a_roll: 角色名；narrated_b: "旁白"；silent_b: "(silent)"；action_b: 主体角色名或 "(action)"
+- speaker      a_roll: 单一角色名 2-4 字（严禁场景描述/动作描述/关系标签）
+               narrated_b: "旁白"；silent_b: "(silent)"；action_b: 角色名或 "(action)"
 - voice_gender "male" | "female"；silent_b 写 "male"（不会用到，但保持字段）
 - visual_subject 12-30 词英文角色外形描述（同 speaker 跨 turn 一致；silent_b 写场景外形）
 - text         a_roll/narrated_b 中文对白 18-36 字；silent_b 写 ""
@@ -2562,7 +2576,63 @@ action_b    武戏 / 激烈对抗 / 突破冲击 镜头
     for turn in turns:
         turn["dialogue_shape"] = shape
         turn["speaker_count"] = speaker_count
+    # B5 (2026-05-21): speaker sweep 校验 — 修 LLM 把场景描述当 speaker 的 bug
+    _sweep_speaker_field(turns, role_candidates)
     return _adsd_immersion_qa_rewrite_turns(topic, turns, role_candidates)
+
+
+def _sweep_speaker_field(turns: list[dict], role_candidates: list[str]) -> None:
+    """B5 fix: 检测 a_roll turn 的 speaker 字段是否被 LLM 误填成场景描述/对话标签。
+    修复策略：
+      1. 含场景词（场景/对话/画面/镜头/段落/片段）→ 尝试从 speaker 字符串中提取已知角色名
+      2. 长度 > 8 字 → 同 1
+      3. 都没匹配 → fallback 第一个 role_candidate
+    本地修复不调 LLM，保持快速 + 零成本。"""
+    bad_keywords = (
+        "场景", "对话", "画面", "镜头", "段落", "片段", "情景", "氛围",
+        "争执", "冲突", "打斗", "相会", "对峙", "交锋", "讨论", "讲解",
+        "现场", "时刻", "瞬间", "时分", "时候",
+    )
+    # 已知角色池：role_candidates + IP 库所有 speaker 名
+    known_roles = list(role_candidates) if role_candidates else []
+    try:
+        for ip in _list_speaker_ips().values():
+            sp = ip.get("speaker")
+            if sp and sp not in known_roles:
+                known_roles.append(sp)
+            for alias in (ip.get("aliases") or []):
+                if alias and alias not in known_roles:
+                    known_roles.append(alias)
+    except Exception:
+        pass
+    fallback = role_candidates[0] if role_candidates else "讲述人"
+    fixed = 0
+    for t in turns:
+        if _resolve_turn_type(t) != "a_roll":
+            continue
+        sp = str(t.get("speaker") or "").strip()
+        if not sp:
+            t["speaker"] = fallback
+            fixed += 1
+            continue
+        is_bad = any(kw in sp for kw in bad_keywords) or len(sp) > 8
+        if not is_bad:
+            continue
+        # 从 bad speaker 字符串中找已知角色名 (子串匹配)
+        extracted = None
+        for role in known_roles:
+            if role and len(role) >= 2 and role in sp:
+                extracted = role
+                break
+        new_speaker = extracted or fallback
+        log(f"B5 speaker sweep: turn {t.get('dialogue_turn')} 「{sp}」→「{new_speaker}」")
+        t["speaker"] = new_speaker
+        fixed += 1
+    if fixed > 0:
+        try:
+            tg(f"⚠️ B5 speaker 校验：修正 {fixed} 个 turn 的 speaker 字段（LLM 误填场景描述）")
+        except Exception:
+            pass
 
 
 def _adsd_immersion_qa_rewrite_turns(topic: str, turns: list[dict], role_candidates: list[str]) -> list[dict]:

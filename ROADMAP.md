@@ -98,8 +98,8 @@ Last updated: 2026-05-21
 | **B2 meta_grid panel 漏进成片** | ★★★ P0 | 1.5h | planned | 00:12 出现现代风格 12 宫格画面，是 meta_grid 4×3 grid 被 WERYDANCE 当 panel 当素材输出。可能 (action) IP 的 meta_grid 是旧 cache 现代风格 + 被 action_b 4-panel multi-ref 直接召唤回视频。修：era 校验 meta_grid 缓存 + 召唤 prompt 强调"参考人物造型不要复制 grid 框架" |
 | **B3 内嵌字幕又出现** | ★★★ P0 | 30min | planned | 00:16 起视频内嵌字幕，NO TEXT IN FRAME ban 没生效。看 caption_info 流程 + WERYDANCE prompt 末尾是否真带英文 ban + a_roll 路径 prompt 函数检查 |
 | **B4 武戏无 SFX 配音** | ★★ P1 | 2h | planned | action_b 是 motion-only 无 audio，缺打斗音效（拳风/兵器格挡/落地声）。方案：action_b 走 generate_audio=true 让 WERYDANCE 自配 SFX，或本地 SFX 库 + step9 时间轴叠加 |
-| **B5 LLM 把场景描述当 speaker** | ★★ P1 | 1h | planned | script-gen 把 speaker 字段填「令狐冲与仪琳的对话场景」（5 turn 都中招）。修：prompt 强制 speaker 字段必须是单个角色名 + script-gen 后 sweep 校验 |
-| **B6 短喊招漏关键词** | ★ P2 | 15min | planned | 「再来！换我主攻！」未升级 action_b（"主攻"/"再来" 不在 shout_keywords）。扩词：再来/换我/还击/反攻/上来/接着 |
+| ~~**B5 LLM 把场景描述当 speaker**~~ | ~~★★ P1~~ | ~~1h~~ | ✅ shipped 2026-05-21 | prompt 加 speaker 铁律 + _sweep_speaker_field 后处理 (bad_keywords 检测 + 从 bad speaker 提取已知角色 + role_candidates fallback) · 7/7 case 通过 |
+| ~~**B6 短喊招漏关键词**~~ | ~~★ P2~~ | ~~15min~~ | ✅ shipped 2026-05-21 | _is_action_shout 加 再来/换我/还击/反攻/拦住/挡住/拼了/决胜 等 16 个攻势/反击/换场词 · 6/6 case 通过 |
 
 ---
 
