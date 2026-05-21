@@ -32,6 +32,9 @@ Last updated: 2026-05-21
 | 2026-05-21 | 非 ADSD action 强化 (阶段 5) | _motion_action_block 检测 is_action_scene → 注入 kinetic prompt |
 | 2026-05-21 | duration 计算优化 | api_dur 下限 5s → 3s + tts_dur+0.3 buffer，短 dialogue 处理时长降 30-40% |
 | 2026-05-21 | IP 版本管理 (I) | ADR_IP_SCHEMA_VERSION="1.1" + _migrate_speaker_ip 加载时自动迁移，9 个 IP 已 v1.1 |
+| 2026-05-21 | IP 调用统计 + 推荐 (F) | schema v1.2 加 usage_count + 跑后自动 increment + _recommend_related_ips + tools/show_ip_stats.py CLI |
+| 2026-05-21 | NO TEXT IN FRAME 补强 | _adsd_almighty_audio_dub_prompt + _adsd_meta_grid_call_prompt 加英文 ABSOLUTELY NO TEXT IN FRAME ban，修易筋经 00:48 内嵌字幕 |
+| 2026-05-21 | action_b 题材触发优化 | script-gen prompt 鼓励武侠/对抗题材主动出 ≥1-2 个 action_b（之前易筋经 0 个 action_b 因 LLM 保守）|
 | 2026-05-20 | TG deliver 假阴性 fix | status=200 后验证 body {"ok":true,"result":{}} |
 | 2026-05-20 | tools/rerun_downstream.py | 跳过 step1-66 跑下游，10x 调试加速 |
 
@@ -46,9 +49,10 @@ Last updated: 2026-05-21
 | ~~A · AI 自动孵化 IP~~ | ~~2h~~ | ~~★★★~~ | ✅ shipped 2026-05-21 | tools/create_speaker_ip.py |
 | ~~B · 自学习 usage_history~~ | ~~1.5h~~ | ~~★★★~~ | ✅ shipped 2026-05-21 | _record_speaker_usage_history + prompt 注入 |
 | ~~C · 角色关系网络~~ | ~~1h~~ | ~~★★★~~ | ✅ shipped 2026-05-21 | IP relationships + _build_speaker_ip_context_for_script |
+| **AUTO-IP · ADR 主流程自动孵化 IP** | 1h | ★★ | planned | step6 检测新 speaker 无 IP → 自动调 create_speaker_ip 孵化 (qa_status=auto_generated_pending_review)，env ADR_AUTO_INCUBATE_IP 控制 |
 | D · 角色弧线版本 | 3h | ★★ | planned | 曹操_青年/中年/晚年 多版本，LLM 看时代自动选 |
 | E · 多人物互动 IP | 4h | ★★ | planned | 双人卡 (曹操+刘备) 同框 IP，含对峙/煮酒姿势 |
-| F · IP 调用统计 + 推荐 | 1h | ★★ | planned | 跟踪频次，推荐相关 IP |
+| ~~F · IP 调用统计 + 推荐~~ | ~~1h~~ | ~~★★~~ | ✅ shipped 2026-05-21 | usage_count + _recommend_related_ips + show_ip_stats.py |
 | G · IP 管理 CLI 工具 | 2h | ★ | planned | tools/ip_manager.py 列出/编辑/创建 IP |
 | H · IP 质量评分 | 2h | ★ | planned | LLM 评估视觉/音色/性格契合，写 IP 跟踪 |
 | ~~I · IP 版本管理~~ | ~~30min~~ | ~~★~~ | ✅ shipped 2026-05-21 | ADR_IP_SCHEMA_VERSION + _migrate_speaker_ip |

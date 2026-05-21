@@ -2269,7 +2269,11 @@ action_b    武戏 / 激烈对抗 / 突破冲击 镜头
             text 可空 (纯动作) 或短句 (角色喊话)
             speaker 主体角色名 或 "(action)"
             时长 8-12 秒（动作密度需要时间展开）
-            ★ 仅在题材确实含动作/对抗场面时用，不要滥用
+            ★ 题材判断:
+              · 武侠 / 武功 / 武学 / 内功 / 出招 / 修炼 → 建议 ≥1-2 个 action_b 演绎修炼或对决
+              · 体育对抗 / 战争 / 警匪 / 追逐 → 建议 1-2 个 action_b 体现冲击
+              · 纯叙述/讲解题材（书评 / 节气 / 文化品鉴）→ 可以全无 action_b
+              · 不要滥用，但武打/对抗题材至少要有 1 个 action_b 让观众感受冲击力
 
 【硬约束】
 1. turn 1 必须是 narrated_b（开场 setup）
@@ -6676,26 +6680,29 @@ def _adsd_meta_grid_call_prompt(scene: dict) -> str:
         if era:
             ip_flavor += f"时代背景：{era}。"
     return (
+        "ABSOLUTELY NO TEXT IN FRAME: do not burn in subtitles, do not render Chinese/English captions, "
+        "no chyron / lower-thirds / speech bubbles / on-screen typography. The text labels on the meta_grid reference "
+        "are AI metadata ONLY — never re-draw them in the output frame. PURELY cinematic image. "
         f"纪录片场景。使用上传的人设符参考图作为视觉指引——"
         f"重点关注标记为「{speaker}｜{costume}｜{pose}」的 panel，提取其中的服装、表情、动作。"
         f"{ip_flavor}"
         f"生成普通话语音，演讲者准确说出：「{dialogue}」。"
         f"上传的音频仅作为音色、语速、年龄感参考。"
         f"嘴部可见，面部稳定，嘴型自然同步，符合真人节奏。"
-        f"不要在画面上渲染任何文字、字幕、标签——人设符上的标签只是给 AI 看的元数据。"
-    )[:1500]
+        f"画面绝对不要出现任何文字、字幕、标签、签条。"
+    )[:1700]
 
 
 # ── Speaker IP Card (2026-05-21) ──────────────────────────────────────────
 # Speaker IP = 一个角色的完整档案：voice_asset + 人设符 + 性格 + 标志服装/姿势 + 标志台词
 # 跨片复用 + LLM 生成更贴合角色 + 召唤 prompt 更精准
-ADR_IP_SCHEMA_VERSION = "1.1"  # 加 schema_version 字段 + 迁移机制
+ADR_IP_SCHEMA_VERSION = "1.2"  # 1.2: 加 usage_count 字段 (F · IP 调用统计 + 推荐)
 
 
 def _migrate_speaker_ip(ip: dict) -> dict:
     """前向兼容：把老 IP 迁移到当前 schema_version。
-    1.0 → 1.1: 加 schema_version 字段；补缺失的 relationships / meta_grid_template_cache / usage_history 默认空
-    未来扩展时在这里加 if version == "1.x":...
+    1.0 → 1.1: 加 schema_version + relationships/meta_grid_template_cache/usage_history 默认空
+    1.1 → 1.2: 加 usage_count 字段 (默认从 usage_history 长度推断或 0)
     """
     ver = str(ip.get("schema_version", "1.0"))
     if ver == ADR_IP_SCHEMA_VERSION:
@@ -6706,7 +6713,14 @@ def _migrate_speaker_ip(ip: dict) -> dict:
         ip.setdefault("meta_grid_template_cache", {})
         ip.setdefault("usage_history", [])
         ip["schema_version"] = "1.1"
-    # 未来：if ver == "1.1": ... → "1.2"
+        ver = "1.1"
+    # 1.1 → 1.2
+    if ver == "1.1":
+        # 从 usage_history 的 unique run_id 数推断历史 usage_count
+        history = ip.get("usage_history") or []
+        unique_runs = len({h.get("run_id", "") for h in history if h.get("run_id")})
+        ip.setdefault("usage_count", unique_runs)
+        ip["schema_version"] = "1.2"
     return ip
 
 
@@ -6797,6 +6811,49 @@ def _build_speaker_ip_context_for_script(topic: str, role_candidates: list[str])
     return "\n".join(lines)
 
 
+def _ip_usage_stats() -> list[dict]:
+    """F: 返回全库 IP usage 统计，按 usage_count 降序排。"""
+    ips = _list_speaker_ips()
+    stats = []
+    for name, ip in ips.items():
+        history = ip.get("usage_history") or []
+        recent_topics = list(dict.fromkeys(h.get("topic", "") for h in history if h.get("topic")))[-5:]
+        stats.append({
+            "speaker": name,
+            "usage_count": int(ip.get("usage_count", 0)),
+            "era": ip.get("era", ""),
+            "history_turn_count": len(history),
+            "recent_topics": recent_topics,
+        })
+    stats.sort(key=lambda x: x["usage_count"], reverse=True)
+    return stats
+
+
+def _recommend_related_ips(speaker: str, limit: int = 5) -> list[dict]:
+    """F: 基于 IP.relationships + usage_count 推荐相关 IP。
+    返回 [{speaker, relation_label, usage_count, era}, ...] 按 usage_count 降序。"""
+    ip = _match_speaker_ip(speaker)
+    if not ip:
+        return []
+    rels = ip.get("relationships") or {}
+    if not rels:
+        return []
+    ips_db = _list_speaker_ips()
+    out: list[dict] = []
+    for other_name, label in rels.items():
+        other_ip = ips_db.get(other_name) or _match_speaker_ip(other_name)
+        if not other_ip:
+            continue
+        out.append({
+            "speaker": other_ip.get("speaker", other_name),
+            "relation_label": label,
+            "usage_count": int(other_ip.get("usage_count", 0)),
+            "era": other_ip.get("era", ""),
+        })
+    out.sort(key=lambda x: x["usage_count"], reverse=True)
+    return out[:limit]
+
+
 def _save_speaker_ip(speaker: str, ip_dict: dict) -> Path:
     """写入 / 更新 speaker IP json。自动写 schema_version。"""
     safe = re.sub(r"[^一-龥A-Za-z0-9]", "", speaker)[:30] or "speaker"
@@ -6841,11 +6898,16 @@ def _record_speaker_usage_history(script: list[dict], topic: str, run_id: str) -
         if len(history) > max_history:
             history = history[-max_history:]
         ip["usage_history"] = history
+        # F: usage_count 自动 increment (按 run_id 去重，多 turn 同 run 只算一次)
+        prev_runs = {h.get("run_id", "") for h in history[:-len(records)] if h.get("run_id")}
+        new_runs = {r.get("run_id", "") for r in records if r.get("run_id")}
+        delta = len(new_runs - prev_runs)
+        ip["usage_count"] = int(ip.get("usage_count", 0)) + delta
         try:
             _save_speaker_ip(ip.get("speaker", speaker), ip)
-            log(f"Speaker IP usage_history: {speaker} +{len(records)} 条 (总 {len(history)})")
+            log(f"Speaker IP usage: {speaker} +{len(records)} 条 turn (run 计 {ip['usage_count']}, history 总 {len(history)})")
         except Exception as e:
-            log(f"Speaker IP usage_history 写入失败 {speaker}：{e}")
+            log(f"Speaker IP usage 写入失败 {speaker}：{e}")
 
 
 def _format_speaker_usage_history_for_prompt(speaker: str, max_lines: int = 8) -> str:
@@ -11113,8 +11175,13 @@ def _adsd_almighty_audio_dub_prompt(scene: dict, safe_retry: bool = False) -> st
         " First-person onsite observer POV, camera close enough to see face and mouth."
         if ADSD_ONSITE_POV_MODE else ""
     )
+    _no_text_ban = (
+        "ABSOLUTELY NO TEXT IN FRAME: do not burn in subtitles, do not render Chinese/English captions, "
+        "no chyron / lower-thirds / speech bubbles / on-screen typography. PURELY cinematic image. "
+    )
     if safe_retry:
         return (
+            f"{_no_text_ban}"
             "Create a realistic Chinese spoken documentary scene. "
             "Use uploaded image references only for speaker identity, costume, era, lighting, and composition. "
             "Use uploaded audio only as voice timbre and speaking-style reference, then generate new synchronized speech. "
@@ -11122,9 +11189,10 @@ def _adsd_almighty_audio_dub_prompt(scene: dict, safe_retry: bool = False) -> st
             f"The {role} speaks exactly this Chinese line: 「{dialogue}」. "
             f"Natural lip sync, stable face, subtle head motion.{pov} "
             f"{_werydance_caption_instruction(scene)} No speaker labels, logos, or watermarks."
-        )[:1000]
+        )[:1200]
     shot = scene.get("shot", "")
     return (
+        f"{_no_text_ban}"
         "Create a historically grounded Chinese spoken documentary scene with generated audio. "
         "Use the uploaded audio as a voice/timbre reference only: preserve the same gender, tone color, age impression, "
         "pace, emotional delivery, and speaking style. Do not use it as background music. "
@@ -11135,7 +11203,7 @@ def _adsd_almighty_audio_dub_prompt(scene: dict, safe_retry: bool = False) -> st
         f"The {role} speaks exactly this Chinese dialogue and nothing else: 「{dialogue}」. "
         f"Scene action: {shot}. Visible mouth, stable face, natural jaw motion, realistic human timing.{pov} "
         f"{_werydance_caption_instruction(scene)} No speaker labels, logos, or watermarks."
-    )[:1000]
+    )[:1200]
 
 
 def _postprocess_lip_sync_segment(src_video: str, scene: dict, target_dur: float) -> bool:
