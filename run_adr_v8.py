@@ -13068,22 +13068,43 @@ def step7_concat(script: list[dict]) -> str:
     concat_txt = OUTPUT_DIR / "concat.txt"
     # 2026-05-21 防御：step66 全部 variants 失败的 turn 没有 seg_N.mp4 文件，
     # 直接 ffprobe 会让 step7 抛异常整 run 挂掉（已 39 min 投入）。
-    # 缺失 seg → 用 img_path 现场补一个 still seg（保留叙事连续性），实在不行才丢弃。
+    # 缺失 seg → 用合法 still 图源补一个 still seg（保留叙事连续性），实在不行才丢弃。
+    # B2 fix (2026-05-21): img_path 若是 meta_grid 4×3 grid，不能直接当 still，否则观众看到 12 宫格画面
+    # 优先级：其他 turn 的合法 img (非 meta_grid) > cover.jpg > 报错丢弃
+    cover_path = str(OUTPUT_DIR / "cover.jpg") if (OUTPUT_DIR / "cover.jpg").exists() else ""
+    legit_imgs = [s.get("img_path", "") for s in script
+                  if s.get("img_path") and os.path.exists(s["img_path"])
+                  and "meta_grid_" not in os.path.basename(s["img_path"])]
     for i, s in enumerate(script):
         vp = s.get("vid_path") or ""
         if not vp or not os.path.exists(vp) or os.path.getsize(vp) < 1000:
             img = s.get("img_path") or ""
-            if img and os.path.exists(img):
+            is_meta_grid_img = img and "meta_grid_" in os.path.basename(img)
+            still_src = ""
+            if img and os.path.exists(img) and not is_meta_grid_img:
+                still_src = img  # 合法单图（非 grid）
+            elif legit_imgs:
+                still_src = legit_imgs[0]  # 借用其他 turn 的合法图
+            elif cover_path:
+                still_src = cover_path  # 最后 fallback：cover
+            if still_src:
                 try:
-                    log(f"step7 防御：seg_{i}.mp4 缺失 → 用 img_path 现场补 still seg")
-                    _render_still_segment(s, timeout=30)
+                    log(f"step7 防御：seg_{i}.mp4 缺失 → 用 {os.path.basename(still_src)} 现场补 still seg")
+                    # 临时换 img_path 让 _render_still_segment 用合法图
+                    orig_img = s.get("img_path")
+                    s["img_path"] = still_src
+                    try:
+                        _render_still_segment(s, timeout=30)
+                    finally:
+                        s["img_path"] = orig_img
                     if os.path.exists(vp) and os.path.getsize(vp) > 1000:
-                        tg(f"⚠️ turn {i+1} WERYDANCE 失败 → 用静态图补救（仍计入最终成片）")
+                        src_label = "邻 turn 图" if still_src in legit_imgs else ("cover" if still_src == cover_path else "原 img")
+                        tg(f"⚠️ turn {i+1} WERYDANCE 失败 → 用静态图补救（来源: {src_label}）")
                         continue
                 except Exception as e:
                     log(f"step7 防御 turn {i+1} still seg 补救失败：{e}")
-            log(f"step7 防御：turn {i+1} seg 不可恢复（连 img 也没），从 script 移除")
-            tg(f"⚠️ turn {i+1} seg 不可恢复（WERYDANCE 失败 + img 缺失），从拼接队列剔除")
+            log(f"step7 防御：turn {i+1} seg 不可恢复（无合法图源），从 script 移除")
+            tg(f"⚠️ turn {i+1} seg 不可恢复，从拼接队列剔除")
     script[:] = [s for s in script if s.get("vid_path") and os.path.exists(s["vid_path"]) and os.path.getsize(s["vid_path"]) > 1000]
     segment_paths = [str(s["vid_path"]) for s in script]
     audio_flags = [_has_audio_stream(p) for p in segment_paths]
