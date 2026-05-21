@@ -11436,6 +11436,14 @@ def _adsd_action_b_motion_prompt(scene: dict, safe_retry: bool = False) -> str:
     _no_text_ban = (
         "ABSOLUTELY NO TEXT IN FRAME: no subtitles, no captions, no on-screen typography. "
     )
+    # B4 (2026-05-21): 武戏 SFX 引导 — generate_audio=true 让 WERYDANCE 自配打斗音效
+    _sfx_directive = (
+        "AUDIO TRACK: generate combat sound effects ONLY — sword clashes, blade ringing, "
+        "weapon impacts, punches and kicks landing, body thuds, fabric whoosh, footstep stomps, "
+        "fast breathing exhales, debris falls, dust clouds, environmental impact. "
+        "NO dialogue, NO speech, NO music score, NO narration, NO singing. "
+        "Pure cinematic combat SFX layered against the action beats, dry and impactful, no reverb wash. "
+    )
     base = (
         f"{_no_text_ban}"
         "EXTREME ACTION SCENE — high-intensity sequence with packed visual density. "
@@ -11445,6 +11453,7 @@ def _adsd_action_b_motion_prompt(scene: dict, safe_retry: bool = False) -> str:
         "Sparks fly, fabric snaps, particles burst, environmental debris in air. "
         "Avoid slow contemplative pacing — every second packed with movement and visual energy. "
         "Cinematic dramatic backlight, gritty film grain, high contrast, kinetic energy. "
+        f"{_sfx_directive}"
         f"{era_hint}"
     )
     if safe_retry:
@@ -11682,7 +11691,12 @@ def _postprocess_audio_dub_segment(src_video: str, scene: dict, target_dur: floa
     → 检测 leading silence >0.5s 时同步 trim audio + video，让语音锚在 seg 开头
     """
     vid_path = scene["vid_path"]
-    leading_silence = _detect_audio_leading_silence(src_video, threshold_db=-30, min_silence=0.5)
+    # B4 (2026-05-21): action_b SFX 模式跳过 leading silence trim
+    # 武戏 SFX 开场可能有 setup 镜头静音 0.5-1s，不应误 trim
+    if _is_action_b(scene):
+        leading_silence = 0.0
+    else:
+        leading_silence = _detect_audio_leading_silence(src_video, threshold_db=-30, min_silence=0.5)
     if leading_silence > 0.5:
         log(f"[audio-dub postprocess] {scene.get('speaker', '?')} leading silence {leading_silence:.2f}s → 同步 trim audio+video")
         trimmed = str(OUTPUT_DIR / f"audio_dub_trimmed_{scene.get('dialogue_turn', 0):02d}.mp4")
@@ -12184,15 +12198,17 @@ def _lip_sync_one_scene(idx: int, scene: dict, target_dur: float, aspect_ratio: 
         fast_fallback_enabled = os.environ.get("ADR_WERYDANCE_FAST_FALLBACK", "1").strip().lower() not in ("0", "false", "no", "off")
         if not needs_lip:
             if is_action:
-                # action_b: 武戏专属 kinetic prompt，无 audio (motion-only)
+                # action_b: 武戏专属 kinetic prompt
                 # 加长 duration 到 10s (Spike action 验证)
+                # B4 (2026-05-21): generate_audio=true 让 WERYDANCE 自配打斗 SFX
+                # prompt 内已加 SFX_DIRECTIVE 引导生成 combat SFX (no dialogue/music)
                 api_dur = max(api_dur, 10)
                 variants = [
-                    ("action_b_kinetic", "WERYDANCE_2_0", _adsd_action_b_motion_prompt(scene, safe_retry=False), "false"),
-                    ("action_b_kinetic_safe", "WERYDANCE_2_0", _adsd_action_b_motion_prompt(scene, safe_retry=True), "false"),
+                    ("action_b_kinetic", "WERYDANCE_2_0", _adsd_action_b_motion_prompt(scene, safe_retry=False), "true"),
+                    ("action_b_kinetic_safe", "WERYDANCE_2_0", _adsd_action_b_motion_prompt(scene, safe_retry=True), "true"),
                 ]
                 if fast_fallback_enabled:
-                    variants.append(("action_b_kinetic_fast", "WERYDANCE_2_0_FAST", _adsd_action_b_motion_prompt(scene, safe_retry=True), "false"))
+                    variants.append(("action_b_kinetic_fast", "WERYDANCE_2_0_FAST", _adsd_action_b_motion_prompt(scene, safe_retry=True), "true"))
             elif is_silent:
                 # silent_b：纯 motion，无 audio，呼吸位 prompt
                 variants = [
@@ -12807,17 +12823,20 @@ def _build_voice_clone_hybrid_audio(script: list[dict], master_voice_path: str) 
     master_voice_dur = ffprobe_duration(master_voice_path)
     silent_b_count = 0
     narrated_clone_count = 0
+    action_sfx_count = 0
     for i, scene in enumerate(script):
         needs_lip = bool(scene.get("needs_lip_sync", True))
         is_narrated = _is_narrated_b(scene)
+        is_action = _is_action_b(scene)
         seg_path = scene.get("vid_path") or ""
         vid_dur = float(scene.get("vid_duration", 0.0) or 0.0)
         if vid_dur <= 0:
             continue
         part_wav = str(work_dir / f"part_{i:02d}.wav")
-        # a_roll 和 narrated_b（已跑 audio_dub）都用 seg 内嵌克隆音色
+        # B4 (2026-05-21): action_b SFX 也走 seg 内嵌音色路径，避免被 master_voice TTS 覆盖
+        # a_roll / narrated_b 是克隆 dialog 音色；action_b 是 WERYDANCE 自配打斗 SFX
         seg_has_clone_audio = (
-            (needs_lip or is_narrated)
+            (needs_lip or is_narrated or is_action)
             and seg_path and os.path.exists(seg_path) and _has_audio_stream(seg_path)
         )
         try:
@@ -12842,7 +12861,9 @@ def _build_voice_clone_hybrid_audio(script: list[dict], master_voice_path: str) 
                     part_wav,
                     timeout=60,
                 )
-                if needs_lip:
+                if is_action:
+                    action_sfx_count += 1
+                elif needs_lip:
                     a_roll_count += 1
                 else:
                     narrated_clone_count += 1
@@ -12915,8 +12936,8 @@ def _build_voice_clone_hybrid_audio(script: list[dict], master_voice_path: str) 
         return None
     if not os.path.exists(out_mp3) or os.path.getsize(out_mp3) < 1000:
         return None
-    fallback_count = len(parts) - a_roll_count - silent_b_count - narrated_clone_count
-    log(f"hybrid voice-clone master audio built ({a_roll_count} A-roll cloned, {narrated_clone_count} narrated_b cloned, {silent_b_count} silent_b 静音, {fallback_count} fallback)：{out_mp3}")
+    fallback_count = len(parts) - a_roll_count - silent_b_count - narrated_clone_count - action_sfx_count
+    log(f"hybrid voice-clone master audio built ({a_roll_count} A-roll cloned, {narrated_clone_count} narrated_b cloned, {action_sfx_count} action_b SFX, {silent_b_count} silent_b 静音, {fallback_count} fallback)：{out_mp3}")
     return out_mp3
 
 
