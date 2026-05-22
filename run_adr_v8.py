@@ -12213,6 +12213,10 @@ def _lip_sync_one_scene(idx: int, scene: dict, target_dur: float, aspect_ratio: 
         _char_min_safe = _char_min if _text else 0
         api_dur = int(round(min(15, max(4, _min_dur, _char_min_safe, _tts_dur + 0.3))))
         fast_fallback_enabled = os.environ.get("ADR_WERYDANCE_FAST_FALLBACK", "1").strip().lower() not in ("0", "false", "no", "off")
+        # 2026-05-22 FAST retry 增强：每个 variant family 末尾加 2 次 FAST 重跑
+        # 科比 retry 验证：同 prompt 第二次跑成功率 +30%（WERYDANCE 端有间歇性 task_failed）
+        # FAST 跑 3 次 (1 原有 + 2 retry) 大幅降低全 fail 概率
+        FAST_RETRY_COUNT = int(os.environ.get("ADR_WERYDANCE_FAST_RETRY_COUNT", "2"))
         if not needs_lip:
             if is_action:
                 # action_b: 武戏专属 kinetic prompt
@@ -12220,39 +12224,52 @@ def _lip_sync_one_scene(idx: int, scene: dict, target_dur: float, aspect_ratio: 
                 # B4 (2026-05-21): generate_audio=true 让 WERYDANCE 自配打斗 SFX
                 # prompt 内已加 SFX_DIRECTIVE 引导生成 combat SFX (no dialogue/music)
                 api_dur = max(api_dur, 10)
+                _act_prompt_safe = _adsd_action_b_motion_prompt(scene, safe_retry=True)
                 variants = [
                     ("action_b_kinetic", "WERYDANCE_2_0", _adsd_action_b_motion_prompt(scene, safe_retry=False), "true"),
-                    ("action_b_kinetic_safe", "WERYDANCE_2_0", _adsd_action_b_motion_prompt(scene, safe_retry=True), "true"),
+                    ("action_b_kinetic_safe", "WERYDANCE_2_0", _act_prompt_safe, "true"),
                 ]
                 if fast_fallback_enabled:
-                    variants.append(("action_b_kinetic_fast", "WERYDANCE_2_0_FAST", _adsd_action_b_motion_prompt(scene, safe_retry=True), "true"))
+                    variants.append(("action_b_kinetic_fast", "WERYDANCE_2_0_FAST", _act_prompt_safe, "true"))
+                    for _r in range(FAST_RETRY_COUNT):
+                        variants.append((f"action_b_fast_retry_{_r+1}", "WERYDANCE_2_0_FAST", _act_prompt_safe, "true"))
             elif is_silent:
                 # silent_b：纯 motion，无 audio，呼吸位 prompt
+                _sil_prompt_safe = _adsd_silent_b_motion_prompt(scene, safe_retry=True)
                 variants = [
                     ("silent_b_motion", "WERYDANCE_2_0", _adsd_silent_b_motion_prompt(scene, safe_retry=False), "false"),
-                    ("silent_b_motion_safe", "WERYDANCE_2_0", _adsd_silent_b_motion_prompt(scene, safe_retry=True), "false"),
+                    ("silent_b_motion_safe", "WERYDANCE_2_0", _sil_prompt_safe, "false"),
                 ]
                 if fast_fallback_enabled:
-                    variants.append(("silent_b_motion_fast", "WERYDANCE_2_0_FAST", _adsd_silent_b_motion_prompt(scene, safe_retry=True), "false"))
+                    variants.append(("silent_b_motion_fast", "WERYDANCE_2_0_FAST", _sil_prompt_safe, "false"))
+                    for _r in range(FAST_RETRY_COUNT):
+                        variants.append((f"silent_b_fast_retry_{_r+1}", "WERYDANCE_2_0_FAST", _sil_prompt_safe, "false"))
             elif is_narrated and ADSD_ALMIGHTY_AUDIO_DUB_EXPERIMENT and audio_url:
                 # narrated_b：走 audio_dub 拿克隆旁白音色 + 含 dialogue text 的专属 prompt
                 # (之前用 broll prompt 没 dialogue text 导致 WERYDANCE 脑补杂音)
+                _nar_prompt_safe = _adsd_narrated_b_audio_dub_prompt(scene, safe_retry=True)
                 variants = [
                     ("narrated_b_audio_dub", "WERYDANCE_2_0", _adsd_narrated_b_audio_dub_prompt(scene, safe_retry=False), "true"),
-                    ("narrated_b_audio_dub_safe", "WERYDANCE_2_0", _adsd_narrated_b_audio_dub_prompt(scene, safe_retry=True), "true"),
+                    ("narrated_b_audio_dub_safe", "WERYDANCE_2_0", _nar_prompt_safe, "true"),
                     ("narrated_b_motion_fallback", "WERYDANCE_2_0", _adsd_broll_motion_prompt(scene, safe_retry=True), "false"),
                 ]
                 if fast_fallback_enabled:
-                    variants.insert(2, ("narrated_b_audio_dub_fast", "WERYDANCE_2_0_FAST", _adsd_narrated_b_audio_dub_prompt(scene, safe_retry=True), "true"))
+                    variants.insert(2, ("narrated_b_audio_dub_fast", "WERYDANCE_2_0_FAST", _nar_prompt_safe, "true"))
+                    for _r in range(FAST_RETRY_COUNT):
+                        variants.append((f"narrated_b_fast_retry_{_r+1}", "WERYDANCE_2_0_FAST", _nar_prompt_safe, "true"))
             else:
                 # 兜底（旧 narrated_b 行为）：纯 motion 无 audio
+                _broll_prompt_safe = _adsd_broll_motion_prompt(scene, safe_retry=True)
                 variants = [
                     ("broll_motion", "WERYDANCE_2_0", _adsd_broll_motion_prompt(scene, safe_retry=False), "false"),
-                    ("broll_motion_safe", "WERYDANCE_2_0", _adsd_broll_motion_prompt(scene, safe_retry=True), "false"),
+                    ("broll_motion_safe", "WERYDANCE_2_0", _broll_prompt_safe, "false"),
                 ]
                 if fast_fallback_enabled:
-                    variants.append(("broll_motion_fast", "WERYDANCE_2_0_FAST", _adsd_broll_motion_prompt(scene, safe_retry=True), "false"))
+                    variants.append(("broll_motion_fast", "WERYDANCE_2_0_FAST", _broll_prompt_safe, "false"))
+                    for _r in range(FAST_RETRY_COUNT):
+                        variants.append((f"broll_fast_retry_{_r+1}", "WERYDANCE_2_0_FAST", _broll_prompt_safe, "false"))
         elif ADSD_ALMIGHTY_AUDIO_DUB_EXPERIMENT:
+            _audio_dub_prompt_safe = _adsd_almighty_audio_dub_prompt(scene, safe_retry=True)
             variants = [
                 ("audio_dub_primary", "WERYDANCE_2_0", _adsd_almighty_audio_dub_prompt(scene, safe_retry=False), "true"),
                 ("silent_lips_fallback", "WERYDANCE_2_0", _adsd_lip_sync_prompt(scene, safe_retry=True), "false"),
@@ -12262,14 +12279,20 @@ def _lip_sync_one_scene(idx: int, scene: dict, target_dur: float, aspect_ratio: 
                 variants.insert(0, ("meta_grid_call", "WERYDANCE_2_0", _adsd_meta_grid_call_prompt(scene), "true"))
                 log(f"[lip-sync {idx}] 启用人设符召唤路径：speaker={scene.get('speaker', '?')}")
             if fast_fallback_enabled:
-                variants.insert(2 if meta_grid_url else 1, ("audio_dub_safe", "WERYDANCE_2_0_FAST", _adsd_almighty_audio_dub_prompt(scene, safe_retry=True), "true"))
+                variants.insert(2 if meta_grid_url else 1, ("audio_dub_safe", "WERYDANCE_2_0_FAST", _audio_dub_prompt_safe, "true"))
+                # FAST retry 兜底（追加末尾 2 次 FAST 重跑）
+                for _r in range(FAST_RETRY_COUNT):
+                    variants.append((f"audio_dub_fast_retry_{_r+1}", "WERYDANCE_2_0_FAST", _audio_dub_prompt_safe, "true"))
         else:
+            _ls_prompt_safe = _adsd_lip_sync_prompt(scene, safe_retry=True)
             variants = [
                 ("primary", "WERYDANCE_2_0", _adsd_lip_sync_prompt(scene, safe_retry=False), "false"),
-                ("safe_prompt", "WERYDANCE_2_0", _adsd_lip_sync_prompt(scene, safe_retry=True), "false"),
+                ("safe_prompt", "WERYDANCE_2_0", _ls_prompt_safe, "false"),
             ]
             if fast_fallback_enabled:
-                variants.append(("fast_safe_prompt", "WERYDANCE_2_0_FAST", _adsd_lip_sync_prompt(scene, safe_retry=True), "false"))
+                variants.append(("fast_safe_prompt", "WERYDANCE_2_0_FAST", _ls_prompt_safe, "false"))
+                for _r in range(FAST_RETRY_COUNT):
+                    variants.append((f"lip_sync_fast_retry_{_r+1}", "WERYDANCE_2_0_FAST", _ls_prompt_safe, "false"))
         attempts: list[dict] = []
         for variant_name, model, prompt, generate_audio in variants:
             r = None
