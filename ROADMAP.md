@@ -97,6 +97,7 @@ Last updated: 2026-05-21
 | ~~**B1 音量太低**~~ | ~~★★★ P0~~ | ~~1h~~ | ✅ shipped 2026-05-21 | step9 amix 默认归一化压人声 → normalize=0 + weights 显式权重 + voice 1.0→2.0 + BGM 0.85→0.4，两阶调音通过 |
 | ~~**B2 meta_grid 12 宫格漏进**~~ | ~~★★★ P0~~ | ~~1.5h~~ | ✅ shipped 2026-05-21 | step7 防御层缺失 seg 时用 meta_grid 当 still 导致 4×3 grid 漏入画面 → 检测 meta_grid_ 文件名 + 优先用邻 turn 合法图/cover.jpg 兜底 + prompt 强化禁止复刻 grid + negative_prompt 加 grid/split/panel ban |
 | ~~**B3 内嵌字幕**~~ | ~~★★★ P0~~ | ~~30min~~ | ✅ shipped 2026-05-21 | meta_grid_call prompt 强化禁止复刻参考图中文标签 + negative_prompt 强化 text ban，重跑笑傲江湖未复现 |
+| **B7 名人题材 Image audit fail** | ★★★ P0 | ? | **blocked** | 2026-05-22 诊断：科比/NBA 题材 GPT_IMAGE_2 画真人+商标 → WeryAI 平台 Image asset audit 拦截全部 task。DOUBAO spike 验证：跨端点 fallback 无效（同 audit 服务）。**唯一路径：避免 GPT_IMAGE_2 画名人脸+商标**（重写 step6 prompt 抽象化 / 直接放弃现代名人题材）|
 | **B4 武戏无 SFX 配音** | ★★ P1 | 2h | planned | action_b 是 motion-only 无 audio，缺打斗音效（拳风/兵器格挡/落地声）。方案：action_b 走 generate_audio=true 让 WERYDANCE 自配 SFX，或本地 SFX 库 + step9 时间轴叠加 |
 | ~~**B5 LLM 把场景描述当 speaker**~~ | ~~★★ P1~~ | ~~1h~~ | ✅ shipped 2026-05-21 | prompt 加 speaker 铁律 + _sweep_speaker_field 后处理 (bad_keywords 检测 + 从 bad speaker 提取已知角色 + role_candidates fallback) · 7/7 case 通过 |
 | ~~**B6 短喊招漏关键词**~~ | ~~★ P2~~ | ~~15min~~ | ✅ shipped 2026-05-21 | _is_action_shout 加 再来/换我/还击/反攻/拦住/挡住/拼了/决胜 等 16 个攻势/反击/换场词 · 6/6 case 通过 |
