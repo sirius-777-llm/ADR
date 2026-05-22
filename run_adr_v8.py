@@ -12085,7 +12085,11 @@ def _lip_sync_poll_download_and_process(idx: int, task_id: str, scene: dict, tar
                 _remove_lip_sync_task(idx)
                 return ok, info
             if st == "failed":
-                info.update({"pass": False, "reason": "task_failed", "response": data})
+                # 2026-05-22 抽 msg 入 reason 方便诊断（之前看不到具体审核拦截原因）
+                fail_msg = str(data.get("msg") or data.get("desc") or "").strip()
+                fail_reason = f"task_failed: {fail_msg}" if fail_msg else "task_failed"
+                info.update({"pass": False, "reason": fail_reason, "response": data})
+                log(f"[lip-sync {idx}] task_failed msg: {fail_msg or '(empty)'}")
                 _remove_lip_sync_task(idx)
                 return False, info
         except Exception as e:
@@ -12370,7 +12374,8 @@ def _lip_sync_one_scene(idx: int, scene: dict, target_dur: float, aspect_ratio: 
                 if ok:
                     info["candidate"] = "almighty_reference_then_video_lips_change"
             audit_blocked_now = _is_audit_blocked(info)
-            attempts.append({k: v for k, v in info.items() if k not in ("image_url", "audio_url", "response")})
+            # 2026-05-22 保留 response 字段供 task_failed 诊断（之前过滤掉无法定位审核拦截原因）
+            attempts.append({k: v for k, v in info.items() if k not in ("image_url", "audio_url")})
             if ok:
                 info["attempts"] = attempts
                 return idx, ok, info
