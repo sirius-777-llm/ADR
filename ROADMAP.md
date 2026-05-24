@@ -41,6 +41,12 @@ Last updated: 2026-05-21
 | 2026-05-21 | step7 防御层 | 缺失 seg 时用 img_path 现场补 still seg + 不可恢复时从 script 移除 turn，避免 ffprobe 整 run 挂掉 |
 | 2026-05-21 | P0 action_b 标注 bug fix | _infer_turn_type line 451 武戏命中错返 narrated_b → 改 action_b + _is_action_shout 短喊招检测（武侠/体育/战争 全覆盖）+ 兜底收紧 ≤12 字防误标长教学 dialog · 13/13 case 通过 |
 | 2026-05-21 | P1 武戏密度 LLM 化 | topic_decomposition 加 action_density_hint (low/medium/high) + recommended_action_b_count + script-gen prompt 按密度给 min/max action_b 硬指标 + 武戏 ≥3 必须连续 2 个组成节拍 · 笑傲江湖实测 high/4 |
+| 2026-05-21 | AUTO-IP 占位符过滤 hotfix | _auto_incubate_missing_ips 跳过 (silent)/(action)/silent_b/action_b/none + 场景描述类 speaker（>8 字 含场景/对话/画面等词），防误孵化垃圾 IP |
+| 2026-05-22 | WERYDANCE FAST retry 兜底 | 每个 variant family 末尾追加 2 次 WERYDANCE_2_0_FAST 重跑 · env ADR_WERYDANCE_FAST_RETRY_COUNT 控制 · 单 turn FAST 尝试 1→3 次 · 验证: 科比 attempts 数 3-4 → 5-6 |
+| 2026-05-22 | almighty task_failed 诊断信号 | 从 data.msg 抽 reason 入 attempt 记录 + 不再 filter response · 现在 task_failed 看到具体「Content moderation / Image asset audit / Copyright restrictions」原因 |
+| 2026-05-23 | step7 Ken Burns + 3 层降级 | 缺 seg 时 Ken Burns slow-zoom 兜底（1.2× scale 防 ffmpeg 超时）+ Ken Burns 失败降级静态图 + 静态也失败才丢弃 turn · ffmpeg 失败后 cleanup partial · 笑傲江湖 + 科比都验证 |
+| 2026-05-23 | B4 武戏 SFX | action_b variants generate_audio="true" + _adsd_action_b_motion_prompt 加 SFX_DIRECTIVE (combat SFX only, no dialogue/music) + 跳过 leading silence trim + _build_voice_clone_hybrid_audio 保留 action_b 内嵌音色 · 西游记 turn 4 (孙悟空) 1 action_b SFX 进 hybrid ✓ |
+| 2026-05-24 | meta_grid 重构（无文字版）| 参考 strength04_x editorial 风格：panel 内 100% 纯图无文字 + 召唤改 panel index + 位置描述 (top-left/middle-right/...) 取代「曹操｜战袍｜说话」中文标签 · 彻底解决 WERYDANCE 复刻 ref 文字进画面的根本 bug · 38 个 cached 旧 PNG 待删让自然 regenerate |
 | 2026-05-20 | TG deliver 假阴性 fix | status=200 后验证 body {"ok":true,"result":{}} |
 | 2026-05-20 | tools/rerun_downstream.py | 跳过 step1-66 跑下游，10x 调试加速 |
 
@@ -98,7 +104,7 @@ Last updated: 2026-05-21
 | ~~**B2 meta_grid 12 宫格漏进**~~ | ~~★★★ P0~~ | ~~1.5h~~ | ✅ shipped 2026-05-21 | step7 防御层缺失 seg 时用 meta_grid 当 still 导致 4×3 grid 漏入画面 → 检测 meta_grid_ 文件名 + 优先用邻 turn 合法图/cover.jpg 兜底 + prompt 强化禁止复刻 grid + negative_prompt 加 grid/split/panel ban |
 | ~~**B3 内嵌字幕**~~ | ~~★★★ P0~~ | ~~30min~~ | ✅ shipped 2026-05-21 | meta_grid_call prompt 强化禁止复刻参考图中文标签 + negative_prompt 强化 text ban，重跑笑傲江湖未复现 |
 | **B7 名人题材 Image audit fail** | ★★★ P0 | ? | **blocked** | 2026-05-22 诊断：科比/NBA 题材 GPT_IMAGE_2 画真人+商标 → WeryAI 平台 Image asset audit 拦截全部 task。DOUBAO spike 验证：跨端点 fallback 无效（同 audit 服务）。**唯一路径：避免 GPT_IMAGE_2 画名人脸+商标**（重写 step6 prompt 抽象化 / 直接放弃现代名人题材）|
-| **B4 武戏无 SFX 配音** | ★★ P1 | 2h | planned | action_b 是 motion-only 无 audio，缺打斗音效（拳风/兵器格挡/落地声）。方案：action_b 走 generate_audio=true 让 WERYDANCE 自配 SFX，或本地 SFX 库 + step9 时间轴叠加 |
+| ~~**B4 武戏无 SFX 配音**~~ | ~~★★ P1~~ | ~~2h~~ | ✅ shipped 2026-05-23 | action_b generate_audio=true + SFX_DIRECTIVE prompt · 西游记 turn 4 验证通过 |
 | ~~**B5 LLM 把场景描述当 speaker**~~ | ~~★★ P1~~ | ~~1h~~ | ✅ shipped 2026-05-21 | prompt 加 speaker 铁律 + _sweep_speaker_field 后处理 (bad_keywords 检测 + 从 bad speaker 提取已知角色 + role_candidates fallback) · 7/7 case 通过 |
 | ~~**B6 短喊招漏关键词**~~ | ~~★ P2~~ | ~~15min~~ | ✅ shipped 2026-05-21 | _is_action_shout 加 再来/换我/还击/反攻/拦住/挡住/拼了/决胜 等 16 个攻势/反击/换场词 · 6/6 case 通过 |
 
@@ -128,18 +134,19 @@ Last updated: 2026-05-21
 - ★★ 中等 ROI 或工程量 3-5h
 - ★ 长期价值或工具型
 
-**当前 top 3 (2026-05-21 P0/P1 已收尾):**
-1. **B4 武戏 SFX** (2h) — action_b 无打斗音效，影响实际观感
+**当前 top 3 (2026-05-24 更新):**
+1. **meta_grid 重构无文字版验证** (1h) — 跑测试题材验证 panel 内无文字 + 召唤效果
 2. **PR-A · merged_a 合并跑** (4-5h) — 大杀器，省 8-12min/run
-3. **AUTO-IP 待审 IP review** — 令狐冲/苏东坡/风清扬 抽查质量
+3. **B7 名人题材脱敏方案** (2h) — GPT_IMAGE_2 prompt 强力脱敏避免画名人脸+商标
 
-今日 ship 清单 (10+ 件):
-  · AUTO-IP 主流程孵化 + hotfix 占位符过滤
-  · LLM 智能召唤标签
-  · P0 三连 (B1 音量 / B2 12 宫格 / B3 字幕)
-  · P1 两个 (B5 speaker 校验 / B6 喊招扩词)
-  · duration=3 bug fix + step7 防御层 + cover.jpg 兜底
-  · action_b 标注 bug + 武戏密度 LLM 化
+**当前 in_progress:**
+- #54 改造 meta_grid 移除图内文字 (代码 ship，待跑题材验证)
+
+**5/21-5/24 累计 ship 21 件:**
+  · IP 系统 7 件 (A 孵化 / AUTO-IP / B 自学习 / C 关系 / F 统计 / I 版本 / 占位符过滤)
+  · LLM 化 6 件 (topic_decomposition / BGM / role / 武戏密度 / 智能召唤标签 / action_b 标注)
+  · Bug 修复 8 件 (duration=3 / step7 防御 / B1-B6 / Ken Burns)
+  · B4 武戏 SFX / FAST retry / task_failed 诊断 / meta_grid 重构 4 件
 
 零工 / 已可立刻用：
 - 跨题材召唤 (用 IP 即可)
