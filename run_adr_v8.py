@@ -6849,45 +6849,85 @@ def _infer_meta_grid_pose(scene: dict) -> str:
 
 
 def _adsd_meta_grid_call_prompt(scene: dict) -> str:
-    """人设符召唤式 prompt：让 almighty 用 meta_grid 中标签对应 panel 渲染。
-    Speaker IP 集成：若 IP 存在，注入 personality + era 让召唤更精准。"""
+    """人设符召唤式 prompt：让 almighty 用 meta_grid 中对应 panel 渲染。
+    2026-05-24 重构：meta_grid panel 内已 100% 纯图无文字，召唤改用 panel index + 视觉描述匹配
+    (参考 strength04_x editorial 风格 — 标签从 image 移到 metadata 层)。"""
     speaker = scene.get("speaker", "speaker")
     dialogue = re.sub(r"\s+", " ", str(scene.get("text") or "")).strip()[:220]
     costume = _infer_meta_grid_costume(scene)
     pose = _infer_meta_grid_pose(scene)
+    # 从 IP cache 推断 panel index (1-8 是角色 panel, 9-12 是场景 panel)
+    # 默认按 costume index 映射到 row 1, 找不到 fallback 到 row 2
+    panel_idx, panel_pos = _meta_grid_panel_index(speaker, costume, pose)
     ip = _match_speaker_ip(speaker)
     ip_flavor = ""
     if ip:
         personality = ip.get("personality") or []
         if personality:
-            ip_flavor += f"角色性格：{' / '.join(str(p) for p in personality[:3])}。"
+            ip_flavor += f"Character traits: {' / '.join(str(p) for p in personality[:3])}. "
         era = ip.get("era", "")
         if era:
-            ip_flavor += f"时代背景：{era}。"
+            ip_flavor += f"Era: {era}. "
     return (
-        # B2 fix (2026-05-21): 明确禁止复刻 4×3 grid 布局，强调生成 single fullframe single shot
-        "CRITICAL — REFERENCE IS A CASTING CARD ONLY, NOT A SCENE REFERENCE. "
-        "The uploaded image is a 4×3 character casting card with 12 small panels. "
-        "DO NOT replicate the grid layout. DO NOT show split-screen, multi-panel, contact sheet, or collage. "
-        "DO NOT copy the layout, frame divisions, or text labels from the reference. "
-        "Generate ONE single fullframe cinematic shot (not 12 small frames). "
-        "Use the reference ONLY to identify the character's face, costume, and visual style — "
-        "then create a NEW single shot showing this character in the scene described below. "
-        # B3 fix (2026-05-21): 强化中文标签 NO COPY 措辞
-        "ABSOLUTELY NO TEXT IN FRAME: do not burn in subtitles, do not render Chinese/English captions, "
-        "no chyron / lower-thirds / speech bubbles / on-screen typography. "
-        "The Chinese text labels on the reference card (e.g. '令狐冲｜战袍｜说话') are metadata for AI guidance ONLY — "
-        "DO NOT copy, render, paint, or transcribe ANY of these Chinese characters into the output frame. "
-        "The output must be PURELY cinematic with zero text overlay. "
-        f"纪录片单一镜头（不是 grid，不是分屏）。参考图仅用于识别角色外形——"
-        f"从参考图中提取标记为「{speaker}｜{costume}｜{pose}」的 panel 的角色造型，"
-        f"渲染为一个完整的电影单镜头，背景符合下方台词描述的场景。"
+        # 2026-05-24 重构：meta_grid 已无文字标签，召唤更简洁
+        "CRITICAL — REFERENCE IS A 4×3 CHARACTER CASTING CARD (12 PANELS, NO TEXT). "
+        "Each panel is a pure cinematic image. DO NOT replicate the grid layout, "
+        "DO NOT show split-screen, multi-panel, contact sheet, or collage. "
+        "Generate ONE single fullframe cinematic shot using the visual identity from a specific panel. "
+        # 召唤指引: 用 panel 位置 + 视觉描述 (不用文字标签)
+        f"Target panel: panel {panel_idx:02d} ({panel_pos}) — character wearing {costume}, "
+        f"performing {pose}. "
+        "Extract this panel's character face, body, costume, and styling — then render a new "
+        "fullframe single shot of the same character in the scene below. "
+        # B3 fix: 文字 ban (即使 ref 无文字，输出也禁止)
+        "ABSOLUTELY NO TEXT IN OUTPUT FRAME: no subtitles, no captions, no Chinese/English text, "
+        "no chyron, no lower-thirds, no speech bubbles, no on-screen typography, no signage text. "
+        "The output is a 100% pure cinematic image. "
         f"{ip_flavor}"
-        f"生成普通话语音，演讲者准确说出：「{dialogue}」。"
-        f"上传的音频仅作为音色、语速、年龄感参考。"
-        f"嘴部可见，面部稳定，嘴型自然同步，符合真人节奏。"
-        f"画面绝对不要出现任何文字、字幕、标签、签条、grid 框架、分屏。"
+        f"Generate Mandarin speech, the speaker accurately says: 「{dialogue}」. "
+        "The uploaded audio is voice timbre reference only (color, pace, age). "
+        "Visible mouth with natural lip sync. Stable face. Real-time pacing."
     )[:2000]
+
+
+def _meta_grid_panel_index(speaker: str, costume: str, pose: str) -> tuple[int, str]:
+    """根据 costume + pose 推断 meta_grid 中对应 panel 的位置 (1-based index + 位置描述)。
+
+    grid 布局 (4 cols × 3 rows):
+      Row 1 (panels 01-04): 4 个 costume × neutral pose (说话)
+      Row 2 (panels 05-08): 4 个 pose 不同 (角色动作)
+      Row 3 (panels 09-12): 场景空镜 (无人脸)
+
+    优先按 costume 推断 column (1-4)，按 pose 推断 row (1 or 2)。"""
+    template = None
+    ip = _match_speaker_ip(speaker) if speaker else None
+    if ip:
+        cache = ip.get("meta_grid_template_cache") or {}
+        if cache:
+            template = next(iter(cache.values()))
+    if not template:
+        template = ERA_TEMPLATES.get("default") or {}
+    costumes = template.get("costume_variants") or []
+    poses = template.get("poses") or []
+    col_idx = 0  # 0-based column
+    for i, c in enumerate((costumes + [""] * 4)[:4]):
+        if c and c == costume:
+            col_idx = i
+            break
+    row_idx = 0  # 0=row 1, 1=row 2 (角色 panel)
+    # pose 索引 0-2 在 row 1，3-5 在 row 2 (按 grid prompt 约定)
+    for i, p in enumerate((poses + [""] * 6)[:6]):
+        if p and p == pose:
+            row_idx = 0 if i < 3 else 1
+            break
+    panel_idx = row_idx * 4 + col_idx + 1
+    positions = [
+        "top-left", "top center-left", "top center-right", "top-right",
+        "middle-left", "middle center-left", "middle center-right", "middle-right",
+        "bottom-left", "bottom center-left", "bottom center-right", "bottom-right",
+    ]
+    panel_pos = positions[panel_idx - 1] if 1 <= panel_idx <= 12 else "top-left"
+    return panel_idx, panel_pos
 
 
 # ── Speaker IP Card (2026-05-21) ──────────────────────────────────────────
@@ -7383,34 +7423,45 @@ def generate_character_meta_grid_gpt_image2(speaker: str, visual_subject: str, v
     poses = (poses * 6)[:6]
     scenes = (scenes * 4)[:4]
     era_label = template.get("era", "general")
-    # 行 1: 4 个 costume × 「说话」/对应动作
-    # 行 2: 角色不同动作 (4 个 pose 4-7 + costume)
-    # 行 3: 4 场景
+    # 2026-05-24 重构：参考 strength04_x meta_grid，panel 内 100% 纯图无文字
+    # 旧版把中文标签叠在 cell 上 → WERYDANCE 复刻进生成视频造成内嵌字幕 bug
+    # 新版: 12 panel 纯电影画面，召唤靠 panel index + 视觉描述匹配
+    # 行 1: 4 个不同 costume (说话/中性姿态)
+    # 行 2: 4 个不同 pose (同角色不同动作)
+    # 行 3: 4 个空场景 (无人脸 / 环境氛围)
     cell_lines = [
-        f"第 1 行：",
-        f"cell 1「{speaker}｜{costumes[0]}｜{poses[0]}」（中景，{costumes[0]}，{poses[0]}）；",
-        f"cell 2「{speaker}｜{costumes[1]}｜{poses[0]}」（{costumes[1]}，{poses[0]}）；",
-        f"cell 3「{speaker}｜{costumes[2]}｜{poses[1]}」（{costumes[2]}，{poses[1]}）；",
-        f"cell 4「{speaker}｜{costumes[3]}｜{poses[2]}」（{costumes[3]}，{poses[2]}）。",
-        f"第 2 行：",
-        f"cell 5「{speaker}｜{costumes[0]}｜{poses[3]}」（{costumes[0]}，{poses[3]}）；",
-        f"cell 6「{speaker}｜{costumes[1]}｜{poses[4]}」（{costumes[1]}，{poses[4]}）；",
-        f"cell 7「{speaker}｜{costumes[2]}｜{poses[5]}」（{costumes[2]}，{poses[5]}）；",
-        f"cell 8「{speaker}｜{costumes[3]}｜{poses[2]}」（特写表情）。",
-        f"第 3 行：",
-        f"cell 9「场景｜{scenes[0]}」（远景，无人脸特写）；",
-        f"cell 10「场景｜{scenes[1]}」；",
-        f"cell 11「场景｜{scenes[2]}」；",
-        f"cell 12「场景｜{scenes[3]}」。",
+        f"Row 1 — 4 wardrobe variants (mid-shot, neutral expressive pose):",
+        f"  panel 01: {speaker}, {costumes[0]}, {poses[0]}, cinematic mid-shot.",
+        f"  panel 02: {speaker}, {costumes[1]}, {poses[0]}, cinematic mid-shot.",
+        f"  panel 03: {speaker}, {costumes[2]}, {poses[1]}, cinematic mid-shot.",
+        f"  panel 04: {speaker}, {costumes[3]}, {poses[2]}, cinematic mid-shot.",
+        f"Row 2 — 4 action poses (same character, varied wardrobe):",
+        f"  panel 05: {speaker}, {costumes[0]}, {poses[3]}, expressive moment.",
+        f"  panel 06: {speaker}, {costumes[1]}, {poses[4]}, expressive moment.",
+        f"  panel 07: {speaker}, {costumes[2]}, {poses[5]}, expressive moment.",
+        f"  panel 08: {speaker}, {costumes[3]}, {poses[2]}, intimate facial close-up.",
+        f"Row 3 — 4 scene establishing shots (NO character face in these 4 panels):",
+        f"  panel 09: {scenes[0]}, wide establishing, atmospheric, no people facing camera.",
+        f"  panel 10: {scenes[1]}, environmental detail.",
+        f"  panel 11: {scenes[2]}, location atmosphere.",
+        f"  panel 12: {scenes[3]}, wide context.",
     ]
     grid_prompt = (
-        f"生成 4 列 × 3 行 人设符参考图，12 个独立 cell，细金色边框。\n"
-        f"角色主体：{subject}（{speaker} 原型，性别 {voice_gender}，era={era_label}）。\n"
-        f"每个 cell 左上角必须有清晰可读的中文文字标签（黑色衬线字体，白色描边，"
-        f"字号约 cell 高度 5%，不变形、不糊、不错字）——这是功能性元数据。\n"
-        f"布局：\n{' '.join(cell_lines)}\n"
-        f"同标签组内服装连续；同角色身份贯穿；每个 cell 是纪录片电影质感。"
-        f"严格按照 era={era_label} 风格渲染（不要混搭其他时代/题材的服装、道具、场景）。"
+        f"Generate a 4-column × 3-row character casting sheet, 12 distinct cinematic panels, "
+        f"editorial luxury pitch-deck layout with clean thin gold dividers between panels.\n"
+        f"Main subject: {subject} ({speaker} archetype, gender {voice_gender}, era={era_label}).\n\n"
+        f"★ CRITICAL — ABSOLUTELY NO TEXT IN ANY PANEL: \n"
+        f"   Every panel must be a 100% pure cinematic photograph. \n"
+        f"   NO labels, NO captions, NO numbers, NO Chinese characters, NO English text, \n"
+        f"   NO chyron, NO watermark, NO speech bubbles, NO on-screen typography of any kind. \n"
+        f"   The 12 panels are purely visual — they will be identified by position (top-left=01, "
+        f"   top-right=04, middle-left=05, ..., bottom-right=12), not by any printed label. \n"
+        f"   Treat this as a luxury fashion editorial spread where panels speak through image alone.\n\n"
+        f"Layout (each panel 4:3, evenly spaced grid):\n{chr(10).join(cell_lines)}\n\n"
+        f"Style continuity: same character identity / face / body type across panels 01-08; "
+        f"era={era_label} consistent wardrobe; cinematic film grain, motivated lighting, "
+        f"editorial composition. Panels 09-12 are pure environment, no people facing camera.\n"
+        f"Strictly era={era_label} — no anachronistic clothing / props / lighting."
     )
     payload = {
         "model": "GPT_IMAGE_2",
