@@ -47,6 +47,8 @@ Last updated: 2026-05-21
 | 2026-05-23 | step7 Ken Burns + 3 层降级 | 缺 seg 时 Ken Burns slow-zoom 兜底（1.2× scale 防 ffmpeg 超时）+ Ken Burns 失败降级静态图 + 静态也失败才丢弃 turn · ffmpeg 失败后 cleanup partial · 笑傲江湖 + 科比都验证 |
 | 2026-05-23 | B4 武戏 SFX | action_b variants generate_audio="true" + _adsd_action_b_motion_prompt 加 SFX_DIRECTIVE (combat SFX only, no dialogue/music) + 跳过 leading silence trim + _build_voice_clone_hybrid_audio 保留 action_b 内嵌音色 · 西游记 turn 4 (孙悟空) 1 action_b SFX 进 hybrid ✓ |
 | 2026-05-24 | meta_grid 重构（无文字版）| 参考 strength04_x editorial 风格：panel 内 100% 纯图无文字 + 召唤改 panel index + 位置描述 (top-left/middle-right/...) 取代「曹操｜战袍｜说话」中文标签 · 彻底解决 WERYDANCE 复刻 ref 文字进画面的根本 bug · 西游记验证完美: 0 fallback / 2 action_b SFX / 视频零内嵌字幕 ✓ |
+| 2026-05-25 | tools/quality_audit.py | 达尔文进化适应度评估器 · 扫所有 /tmp/adr_v8_*/lip_sync_qa.json + pipeline_state.json · 输出每 run 通过率/SFX 数/fallback/audit 触发词 · 趋势曲线 + markdown 报告 · 支持 --last N / --md |
+| 2026-05-25 | 批量清理旧版 cached meta_grid | 删 34 个含中文标签的旧 PNG (backup 在 /tmp) + 清 7 个 IP 的 meta_grid_template_cache · 留 4 个西游记新 grid · 让所有 IP 下次都享受新无文字 grid 红利 |
 | 2026-05-20 | TG deliver 假阴性 fix | status=200 后验证 body {"ok":true,"result":{}} |
 | 2026-05-20 | tools/rerun_downstream.py | 跳过 step1-66 跑下游，10x 调试加速 |
 
@@ -96,6 +98,20 @@ Last updated: 2026-05-21
 | 题材泛化验证 | 30min/题材 | ★ | planned | 跑科比/鲁迅/苏东坡/钱学森等验证 IP+人设符稳定性 |
 | resume 工具 e2e test | 1h | ★ | planned | tools/rerun_downstream.py 加自动测试套件 |
 
+### 🧬 达尔文进化 (2026-05-25 议定 · 共 11.5h, 分 4 个 Round)
+
+让 ADR 自动迭代优化：每次 run 收集质量数据 → 失败模式自动反哺 prompt → 高分配置自动遗传。
+
+| 阶段 | 工程量 | ROI | 状态 | 备注 |
+|------|--------|-----|------|------|
+| ~~quality_audit.py 适应度评估器~~ | ~~1h~~ | ~~★★★~~ | ✅ shipped 2026-05-25 | 扫所有 run 输出 通过率/SFX/fallback/audit msg + markdown 趋势报告 |
+| **阶段 A · Fitness Scorer 强化** | 1.5h | ★★★ | planned (Round 1) | quality_audit 加权 fitness score (0-100): 40% 通过率 + 20% SFX 比例 + 20% fallback 占比 + 20% audit 严重度 · --threshold 过滤进化失败 |
+| **阶段 B · Audit 黑名单自动学习** | 2h | ★★★ | planned (Round 1) | 解析 task_failed msg → LLM 提炼触发词聚类 → audit_blacklist.json · script-gen prompt 自动注入 "avoid: Lakers, NBA, Bryant..." · 黑名单按周更新 |
+| **阶段 C · 题材分类器** | 1h | ★★ | planned (Round 2) | topic_decomposition LLM 加 audit_risk_score (0-100) · 高危题材 (现代名人/品牌) 自动启 mutator 强脱敏 · 低危默认 prompt |
+| **阶段 E · 自动 IP 进化** | 2h | ★★ | planned (Round 2) | 每 IP 算 historical_success_rate · <60% 自动重孵化 (强脱敏) · >90% 标 production_ready 锁定不改 · IP 加 fitness_score 字段 |
+| **阶段 D · Multi-arm Bandit prompt** | 4h | ★★ | planned (Round 3) | 每个 prompt 函数维护 3 个变体 · epsilon-greedy 选 (90% best, 10% explore) · variant 表现存数据库 · 月度 review 删差 variant |
+| **阶段 F · Batch 自动跑 daemon** | 1h | ★ | planned (Round 4) | tools/evolve_run.py daemon · 每天 03:00 自动跑 3-5 个题材 · 跑完自动 audit + 黑名单更新 + IP 重孵化 · TG 推送报告 |
+
 ### 🐛 2026-05-21 笑傲江湖重跑发现的 bug
 
 | Bug | 严重度 | 工程量 | 状态 | 现象 + 修复方向 |
@@ -134,19 +150,16 @@ Last updated: 2026-05-21
 - ★★ 中等 ROI 或工程量 3-5h
 - ★ 长期价值或工具型
 
-**当前 top 3 (2026-05-24 更新):**
-1. **meta_grid 重构无文字版验证** (1h) — 跑测试题材验证 panel 内无文字 + 召唤效果
-2. **PR-A · merged_a 合并跑** (4-5h) — 大杀器，省 8-12min/run
-3. **B7 名人题材脱敏方案** (2h) — GPT_IMAGE_2 prompt 强力脱敏避免画名人脸+商标
+**当前 top 3 (2026-05-25 更新):**
+1. **达尔文进化 Round 1** (3.5h) — 阶段 A Fitness Scorer + 阶段 B 黑名单自动学习，建立数据闭环
+2. **B7 验证科比 (新 grid)** — 跑中，看 audit 在新 editorial grid 下是否仍拦
+3. **PR-A · merged_a 合并跑** (4-5h) — 大杀器，省 8-12min/run
 
-**当前 in_progress:**
-- #54 改造 meta_grid 移除图内文字 (代码 ship，待跑题材验证)
-
-**5/21-5/24 累计 ship 21 件:**
+**5/21-5/25 累计 ship 24 件:**
   · IP 系统 7 件 (A 孵化 / AUTO-IP / B 自学习 / C 关系 / F 统计 / I 版本 / 占位符过滤)
   · LLM 化 6 件 (topic_decomposition / BGM / role / 武戏密度 / 智能召唤标签 / action_b 标注)
   · Bug 修复 8 件 (duration=3 / step7 防御 / B1-B6 / Ken Burns)
-  · B4 武戏 SFX / FAST retry / task_failed 诊断 / meta_grid 重构 4 件
+  · 进化基础设施 3 件 (B4 武戏 SFX / FAST retry / task_failed 诊断 / meta_grid 重构 / quality_audit / 旧 grid 清理)
 
 零工 / 已可立刻用：
 - 跨题材召唤 (用 IP 即可)
