@@ -2984,29 +2984,73 @@ def _adsd_visual_contract(speaker: str, lip_sync: bool | None = None, gender: st
     )
 
 
+def _parse_risk_score(raw, default: int = 30) -> int:
+    """codex 审查 fix (2026-05-26): defensive parse, NaN/Infinity 安全 + range 字符串取最大值 + 关键词优先."""
+    if raw is None:
+        return default
+    if isinstance(raw, (int, float)):
+        try:
+            v = int(raw)
+            return max(0, min(100, v))
+        except (ValueError, OverflowError):
+            return default
+    if isinstance(raw, str):
+        s = raw.strip().lower()
+        # 关键词优先 (codex fix: "61-100 high" 取 high 而非首数 61)
+        if "high" in s or "高" in s:
+            return 80
+        if "medium" in s or "中" in s:
+            return 50
+        if "low" in s or "低" in s:
+            return 20
+        # 抽数字: 抓所有数字取最大 (codex fix: "61-100" 取 100 不是 61)
+        try:
+            nums = re.findall(r"\d+", s)
+            if nums:
+                return max(0, min(100, max(int(n) for n in nums)))
+        except Exception:
+            pass
+    return default
+
+
+def _check_high_risk_hard_abort(topic: str) -> None:
+    """R2 阶段 C++ (2026-05-26): audit_risk_score >= 75 → 直接 raise 拒跑.
+    避免浪费 30min 跑只能出 Ken Burns 兜底烂片的高危题材.
+    env ADR_HIGH_RISK_HARD_ABORT=0 关闭."""
+    if os.environ.get("ADR_HIGH_RISK_HARD_ABORT", "1").strip().lower() in ("0", "false", "no", "off"):
+        return
+    decomp = _llm_topic_decomposition(topic) or {}
+    score = _parse_risk_score(decomp.get("audit_risk_score"))
+    if score < 75:
+        return
+    reason = str(decomp.get("audit_risk_reason") or "")[:120]
+    err = (
+        f"⛔ 高危题材拒收: audit_risk={score}/100 ({reason})\n"
+        f"WeryAI 平台对此类题材 (现代真人 / 品牌商标 / 政治领导人) Image audit 强制拦截\n"
+        f"实测科比题材 R2 C+ 跑出 5/12 fallback 烂片，不值得 30min credits\n\n"
+        f"建议改成抽象题材:\n"
+        f"  · 删除真人具名 → 「篮球传奇 / 黑曼巴战士 / 科技先驱」\n"
+        f"  · 删除品牌商标 → 「职业联赛 / 紫金球队 / 科技公司」\n"
+        f"  · 或显式 opt-in: 加 env ADR_HIGH_RISK_HARD_ABORT=0 + ADR_NEUTRALIZE_HIGH_RISK_TOPIC=1"
+    )
+    try:
+        tg(err)
+    except Exception:
+        pass
+    raise RuntimeError(err)
+
+
 def _maybe_neutralize_topic(topic: str) -> str:
     """R2 阶段 C+ (2026-05-26): audit_risk_score >= 75 时 LLM 改写 topic 替换名人/品牌.
 
     保留题材内核 (训练偏执/绝杀/曼巴精神) + 替换具体名 (科比 → 篮球巨星).
     audit_risk < 75 直接返回原 topic 不改.
-    env ADR_NEUTRALIZE_HIGH_RISK_TOPIC=0 关闭."""
-    if os.environ.get("ADR_NEUTRALIZE_HIGH_RISK_TOPIC", "1").strip().lower() in ("0", "false", "no", "off"):
+    R2 C++ (2026-05-26): 默认关闭 (实测科比 7/12 通过但视频不能看), 用户显式 opt-in 才用.
+    env ADR_NEUTRALIZE_HIGH_RISK_TOPIC=1 启用."""
+    if os.environ.get("ADR_NEUTRALIZE_HIGH_RISK_TOPIC", "0").strip().lower() not in ("1", "true", "yes", "on"):
         return topic
     decomp = _llm_topic_decomposition(topic) or {}
-    # defensive int parse (codex 审查同款 fix)
-    raw_score = decomp.get("audit_risk_score")
-    score = 30
-    if isinstance(raw_score, (int, float)):
-        score = max(0, min(100, int(raw_score)))
-    elif isinstance(raw_score, str):
-        try:
-            m = re.search(r"\d+", raw_score)
-            if m:
-                score = max(0, min(100, int(m.group())))
-            elif "high" in raw_score.lower() or "高" in raw_score:
-                score = 80
-        except Exception:
-            pass
+    score = _parse_risk_score(decomp.get("audit_risk_score"))
     if score < 75:
         return topic
     log(f"R2 C+ neutralize: audit_risk={score} >= 75，LLM 改写 topic")
@@ -3037,12 +3081,15 @@ def _maybe_neutralize_topic(topic: str) -> str:
 
 def step1_script(topic: str) -> list[dict]:
     fmt_label = f"{ADSD_MODE_NAME} {'9:16' if IS_VERTICAL else '16:9'}" if ADS_DIALOGUE_MODE else ("VDAR 9:16" if IS_VERTICAL else "HDAR 16:9")
-    # R2 阶段 C+ (2026-05-26): 高危题材 audit_risk_score >= 75 自动 LLM 改写 topic
-    # 把现代名人/品牌名换成职业代称，绕开 WeryAI Image audit 死局
+    # R2 阶段 C++ (2026-05-26): Hard Abort 高危题材
+    # audit_risk_score >= 75 直接 raise, 不浪费 30min 跑废片
+    # env ADR_HIGH_RISK_HARD_ABORT=0 关闭硬阻断
+    _check_high_risk_hard_abort(topic)
+    # R2 阶段 C+ neutralize 改 opt-in: 默认关 (实测对科比题材通过率提升但视频不能看)
     original_topic = topic
     topic = _maybe_neutralize_topic(topic)
     if topic != original_topic:
-        tg(f"🛡 高危题材自动改写 (B7 audit 规避)\n原: {original_topic[:50]}...\n改: {topic[:50]}...\n下游用改写版生成")
+        tg(f"🛡 高危题材自动改写 (opt-in)\n原: {original_topic[:50]}...\n改: {topic[:50]}...")
         log(f"R2 C+ topic neutralized: '{original_topic[:60]}' → '{topic[:60]}'")
     tg(f"🎬 ADR V8 启动\n主题：{topic}\n格式：{fmt_label}\n\n斯皮尔伯格正在撰写台词...")
     log(f"开始处理：{topic} [{fmt_label}]")
@@ -13112,6 +13159,31 @@ def step66_adsd_lip_sync(script: list[dict]):
         tg(f"✅ {ADSD_MODE_NAME} WERYDANCE 渲染 QA 通过：A-roll {a_roll_success}/{a_roll_total} ✓ · B-roll {b_roll_success}/{b_roll_total} (motion only) · 注：本 QA 仅监控渲染 hard-fail，真实口型对错需人工抽检")
     else:
         tg(f"⚠️ {ADSD_MODE_NAME} WERYDANCE 渲染 QA 未达标：A-roll {a_roll_success}/{a_roll_total}（阈值 80%），可静态/motion兜底成片")
+    # R2 阶段 C++ Smart Abort (2026-05-26): A-roll 失败率 > 50% → kill 不出片
+    # codex 审查 fix: 用 A-roll 失败率 (跟 QA pass 同标准), B-roll transient fail 不误 kill
+    # 避免出「9 个 Ken Burns + 3 个真视频」的支离破碎烂片污染 TG
+    if os.environ.get("ADR_SMART_ABORT_HIGH_FAIL", "1").strip().lower() not in ("0", "false", "no", "off"):
+        # 跟 QA pass 同标准：a_roll_total >= 4 且 A-roll 失败率 >= 50%
+        a_roll_fail_rate = (a_roll_total - a_roll_success) / a_roll_total if a_roll_total else 0
+        total_fail_rate = sum(1 for r in records if not r.get("pass")) / len(records) if records else 0
+        # 触发条件: A-roll 严重失败 (>=50%) 或 整体严重失败 (>=60%)
+        should_abort = (
+            (a_roll_total >= 4 and a_roll_fail_rate >= 0.5)
+            or (len(records) >= 8 and total_fail_rate >= 0.6)
+        )
+        if should_abort:
+            err = (
+                f"⛔ Smart Abort: A-roll fail {a_roll_total - a_roll_success}/{a_roll_total} ({a_roll_fail_rate*100:.0f}%) "
+                f"+ 总 fail {sum(1 for r in records if not r.get('pass'))}/{len(records)} ({total_fail_rate*100:.0f}%)\n"
+                f"成片大半 Ken Burns 兜底，质量不可看，kill run 节省 step7-10 时间\n"
+                f"建议改题材 (audit hell 主题: 现代名人/品牌)\n"
+                f"或显式 opt-in: env ADR_SMART_ABORT_HIGH_FAIL=0 强制出 Ken Burns 兜底片"
+            )
+            try:
+                tg(err)
+            except Exception:
+                pass
+            raise RuntimeError(err)
 
 
 def step65_motion(script: list[dict]):
