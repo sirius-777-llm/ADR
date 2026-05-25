@@ -2347,26 +2347,51 @@ def _generate_adsd_dialogue_turns(topic: str, num_turns: int, tone: str, style_g
 ★ 角色名 / 道具 / 场景 / 称呼 都要符合上述铁律
 """
     # 达尔文 R2 阶段 C (2026-05-25): audit_risk_score 决定脱敏强度
-    _decomp_for_risk = _llm_topic_decomposition(topic) or {}
-    audit_risk = int(_decomp_for_risk.get("audit_risk_score") or 30)
-    audit_risk_reason = str(_decomp_for_risk.get("audit_risk_reason") or "")
+    # codex 审查 fix: 复用 _decomp_for_action (line 2308) 避免重复 LLM call
+    # codex 审查 fix: defensive int parse (LLM 可能返回 "high" / "80/100" 而非纯 int)
+    def _safe_risk_score(val, default: int = 30) -> int:
+        if val is None:
+            return default
+        if isinstance(val, (int, float)):
+            return max(0, min(100, int(val)))
+        try:
+            # 抽数字，支持 "80/100" "high (80)" 等
+            import re as _re
+            m = _re.search(r"\d+", str(val))
+            if m:
+                return max(0, min(100, int(m.group())))
+        except Exception:
+            pass
+        # 字符串关键词兜底
+        s = str(val).strip().lower()
+        if "high" in s or "高" in s:
+            return 80
+        if "medium" in s or "中" in s:
+            return 50
+        if "low" in s or "低" in s:
+            return 20
+        return default
+
+    audit_risk = _safe_risk_score(_decomp_for_action.get("audit_risk_score"))
+    audit_risk_reason = str(_decomp_for_action.get("audit_risk_reason") or "")[:120]
     risk_strategy_block = ""
     if audit_risk >= 61:
         # high risk: 现代名人/品牌 → 强脱敏
+        # codex 审查 fix: 不再写具体品牌示例 (Lakers/NBA/iPhone) 避免 LLM 抄
         risk_strategy_block = f"""
 【⚠️ 达尔文 R2 · Audit 高危题材 (risk={audit_risk}/100 · {audit_risk_reason})】
 本题材历史触发审核高发，编剧必须强脱敏:
-· 角色 speaker 字段用「职业代称」而非真人具名 (科比 → 球员 / Tesla 老板 → 创始人)
-· 台词避开品牌/商标/具体球队名 (Lakers / NBA / iPhone / 紫金球衣 → 紫金球衣队 / 主队)
-· 视觉描述用抽象身份 (篮球传奇 / 灯泡发明家) 而非个人识别特征
-· 旁白可以引用「他」「这位领袖」但避免反复点名
+· speaker 字段用「职业代称」而非真人具名
+· 台词避开任何具体品牌/商标/球队名/产品型号
+· 视觉描述用抽象身份和职业，而非个人识别特征 (年龄/姓名/具体外形)
+· 旁白可以用「他」「这位领袖」「这位选手」但避免反复点名
 """
     elif audit_risk >= 31:
         risk_strategy_block = f"""
 【⚠️ 达尔文 R2 · Audit 中等风险 (risk={audit_risk}/100 · {audit_risk_reason})】
 本题材轻度触发审核，建议适度脱敏:
-· 真名出现 1-2 次即可，多用代称 (鲁迅 → 这位作家 / 苏东坡 → 词人)
-· 涉及版权 IP 角色 (大话西游/三国/红楼梦) 时，用通用古风称呼优先
+· 真名出现 1-2 次即可，多用代称（这位作家 / 词人 / 主帅）
+· 涉及版权 IP 角色时，用通用古风称呼优先
 """
     # low risk 不加 block (默认流程)
     historical_block = ""

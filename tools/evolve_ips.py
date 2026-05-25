@@ -13,6 +13,8 @@
 """
 import json
 import os
+import re
+import shutil
 import sys
 from collections import defaultdict
 from datetime import datetime
@@ -21,6 +23,12 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 IP_DIR = ROOT / "voice_assets" / "speaker_ips"
 GRID_DIR = ROOT / "voice_assets" / "character_meta_grids"
+QUARANTINE_DIR = ROOT / "voice_assets" / "_quarantine"
+
+
+def _safe_speaker_filename(speaker: str) -> str:
+    """codex 审查 fix: 防 path traversal · 只允许中文/字母/数字, 长度截断."""
+    return re.sub(r"[^一-龥A-Za-z0-9]", "", speaker)[:30] or "speaker"
 
 
 def _load_env():
@@ -124,10 +132,14 @@ def evolve(dry_run: bool = False) -> dict:
             ip["needs_reincubate"] = True
             ip.pop("qa_status", None)
             actions["reincubate"].append((sp, rate))
-            # 删 cached meta_grid
-            grid_path = GRID_DIR / f"{sp}.png"
-            if not dry_run and grid_path.exists():
-                grid_path.unlink()
+            # codex 审查 fix: 用 sanitized basename + quarantine (不 unlink，可恢复)
+            safe_name = _safe_speaker_filename(sp)
+            grid_path = GRID_DIR / f"{safe_name}.png"
+            if not dry_run and grid_path.exists() and grid_path.is_file() and grid_path.parent == GRID_DIR:
+                QUARANTINE_DIR.mkdir(parents=True, exist_ok=True)
+                ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+                dest = QUARANTINE_DIR / f"{safe_name}_reincubate_{ts}.png"
+                shutil.move(str(grid_path), str(dest))
             # 清 template cache
             if not dry_run:
                 ip["meta_grid_template_cache"] = {}
