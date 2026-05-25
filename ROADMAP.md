@@ -46,7 +46,7 @@ Last updated: 2026-05-21
 | 2026-05-22 | almighty task_failed 诊断信号 | 从 data.msg 抽 reason 入 attempt 记录 + 不再 filter response · 现在 task_failed 看到具体「Content moderation / Image asset audit / Copyright restrictions」原因 |
 | 2026-05-23 | step7 Ken Burns + 3 层降级 | 缺 seg 时 Ken Burns slow-zoom 兜底（1.2× scale 防 ffmpeg 超时）+ Ken Burns 失败降级静态图 + 静态也失败才丢弃 turn · ffmpeg 失败后 cleanup partial · 笑傲江湖 + 科比都验证 |
 | 2026-05-23 | B4 武戏 SFX | action_b variants generate_audio="true" + _adsd_action_b_motion_prompt 加 SFX_DIRECTIVE (combat SFX only, no dialogue/music) + 跳过 leading silence trim + _build_voice_clone_hybrid_audio 保留 action_b 内嵌音色 · 西游记 turn 4 (孙悟空) 1 action_b SFX 进 hybrid ✓ |
-| 2026-05-24 | meta_grid 重构（无文字版）| 参考 strength04_x editorial 风格：panel 内 100% 纯图无文字 + 召唤改 panel index + 位置描述 (top-left/middle-right/...) 取代「曹操｜战袍｜说话」中文标签 · 彻底解决 WERYDANCE 复刻 ref 文字进画面的根本 bug · 38 个 cached 旧 PNG 待删让自然 regenerate |
+| 2026-05-24 | meta_grid 重构（无文字版）| 参考 strength04_x editorial 风格：panel 内 100% 纯图无文字 + 召唤改 panel index + 位置描述 (top-left/middle-right/...) 取代「曹操｜战袍｜说话」中文标签 · 彻底解决 WERYDANCE 复刻 ref 文字进画面的根本 bug · 西游记验证完美: 0 fallback / 2 action_b SFX / 视频零内嵌字幕 ✓ |
 | 2026-05-20 | TG deliver 假阴性 fix | status=200 后验证 body {"ok":true,"result":{}} |
 | 2026-05-20 | tools/rerun_downstream.py | 跳过 step1-66 跑下游，10x 调试加速 |
 
