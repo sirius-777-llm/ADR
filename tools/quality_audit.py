@@ -73,16 +73,61 @@ def scan_runs(limit: int | None = None) -> list[dict]:
             except Exception:
                 pass
 
+        # codex 审查 fix (2026-05-25): fitness 公式去重权
+        # 原 pass + fallback_inv 同源双重计权 → 改用 4 个独立信号
+        fallback_count = total - succ if total else 0
+        pass_rate = succ / total if total else 0
+
+        # audit 严重度: 0 fail=10pt / 1-3 fail=5pt / 4-8 fail=2pt / 9+=0pt
+        audit_fail_count = sum(fail_msgs.values())
+        if audit_fail_count == 0:
+            audit_severity_score = 10
+        elif audit_fail_count <= 3:
+            audit_severity_score = 5
+        elif audit_fail_count <= 8:
+            audit_severity_score = 2
+        else:
+            audit_severity_score = 0
+
+        # action_b 处理: 无 action_b 算 0.5 (中性) 而非 1.0 (虚高)
+        # 这避免「没武戏题材」白拿满分
+        if action_b_total > 0:
+            action_rate = action_b_pass / action_b_total
+        else:
+            action_rate = 0.5
+
+        # 加权 fitness score (0-100) - 4 独立信号:
+        #   50% 通过率 (主信号)
+        #   15% action_b 通过率
+        #   15% 单次重试效率 (records 长度均值: < 2 次 attempt = 10pt, > 3 次 = 0pt)
+        #   20% audit 严重度
+        avg_attempts = 0.0
+        if qa.get("records"):
+            attempt_counts = [len(r.get("attempts") or []) for r in qa["records"]]
+            avg_attempts = sum(attempt_counts) / len(attempt_counts) if attempt_counts else 0
+        retry_efficiency_score = max(0.0, min(10.0, 10.0 - max(0.0, avg_attempts - 1.5) * 5))
+
+        fitness_score = round(
+            pass_rate * 50 +
+            action_rate * 15 +
+            (retry_efficiency_score / 10) * 15 +
+            (audit_severity_score / 10) * 20,
+            1,
+        )
+
         runs.append({
             "run": run_name,
             "ts": ts,
             "topic": topic,
             "total": total,
             "pass_count": succ,
-            "pass_rate": succ / total if total else 0,
+            "pass_rate": pass_rate,
             "a_roll": (a_pass, a_total),
             "b_roll": (b_pass, b_total),
             "action_b": (action_b_pass, action_b_total),
+            "fallback_count": fallback_count,
+            "audit_fail_count": audit_fail_count,
+            "fitness_score": fitness_score,
             "fail_msgs": dict(fail_msgs.most_common(5)),
         })
     if limit:
@@ -90,17 +135,34 @@ def scan_runs(limit: int | None = None) -> list[dict]:
     return runs
 
 
-def print_table(runs: list[dict], markdown: bool = False) -> None:
+def _fitness_band(score: float) -> str:
+    """达尔文 R1 (2026-05-25): fitness score → 级别标签."""
+    if score >= 85:
+        return "🏆 elite"
+    if score >= 70:
+        return "✨ strong"
+    if score >= 50:
+        return "🟢 viable"
+    if score >= 30:
+        return "🟡 weak"
+    return "🔴 failed"
+
+
+def print_table(runs: list[dict], markdown: bool = False, threshold: float = 0) -> None:
+    # 阶段 A: --threshold 过滤进化失败 run
+    if threshold > 0:
+        runs = [r for r in runs if r.get("fitness_score", 0) >= threshold]
+
     if markdown:
         print("# ADR Quality Audit Report")
         print(f"\nGenerated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
         print(f"\nTotal runs scanned: {len(runs)}")
         print()
-        print("| Run | Topic | Pass | A-roll | B-roll | action_b | Top fail reason |")
-        print("|---|---|---|---|---|---|---|")
+        print("| Run | Topic | Fit | Band | Pass | A-roll | B-roll | action_b | Top fail |")
+        print("|---|---|---|---|---|---|---|---|---|")
     else:
-        print(f"{'Run':25} {'Pass':>8} {'A-roll':>7} {'B-roll':>7} {'act_b':>7} Topic")
-        print("-" * 110)
+        print(f"{'Run':25} {'Fit':>5} {'Band':>10} {'Pass':>8} {'A-roll':>7} {'B-roll':>7} {'act_b':>7} Topic")
+        print("-" * 130)
 
     for r in runs:
         ap, at = r["a_roll"]
@@ -110,11 +172,13 @@ def print_table(runs: list[dict], markdown: bool = False) -> None:
         top_fail = ""
         if r["fail_msgs"]:
             top_fail = list(r["fail_msgs"].keys())[0]
+        fit = r.get("fitness_score", 0)
+        band = _fitness_band(fit)
         if markdown:
-            print(f"| {r['ts']} | {topic_short} | {r['pass_count']}/{r['total']} ({r['pass_rate']*100:.0f}%) | "
+            print(f"| {r['ts']} | {topic_short} | {fit} | {band} | {r['pass_count']}/{r['total']} ({r['pass_rate']*100:.0f}%) | "
                   f"{ap}/{at} | {bp}/{bt} | {ap_act}/{at_act} | {top_fail} |")
         else:
-            print(f"{r['ts']:25} {r['pass_count']:>3}/{r['total']:<3} {ap}/{at:<5} {bp}/{bt:<5} {ap_act}/{at_act:<5} {topic_short}")
+            print(f"{r['ts']:25} {fit:>5.1f} {band:>10} {r['pass_count']:>3}/{r['total']:<3} {ap}/{at:<5} {bp}/{bt:<5} {ap_act}/{at_act:<5} {topic_short}")
 
     if markdown:
         # 趋势：累计失败原因 top 5
@@ -128,31 +192,43 @@ def print_table(runs: list[dict], markdown: bool = False) -> None:
         for msg, ct in all_fails.most_common(10):
             print(f"| {msg or '(none)'} | {ct} |")
 
-        # 改进趋势：前后期对比
+        # 改进趋势：前后期对比 (用 fitness_score 而非 pass_rate)
         if len(runs) >= 4:
             half = len(runs) // 2
             early = runs[:half]
             late = runs[half:]
-            early_rate = sum(r["pass_rate"] for r in early) / len(early) if early else 0
-            late_rate = sum(r["pass_rate"] for r in late) / len(late) if late else 0
-            print(f"\n## Quality trend\n")
-            print(f"- First half avg pass rate: **{early_rate*100:.1f}%**")
-            print(f"- Latest half avg pass rate: **{late_rate*100:.1f}%**")
-            print(f"- Delta: **{(late_rate - early_rate)*100:+.1f}%**")
+            early_fit = sum(r["fitness_score"] for r in early) / len(early) if early else 0
+            late_fit = sum(r["fitness_score"] for r in late) / len(late) if late else 0
+            print(f"\n## Fitness 进化趋势\n")
+            print(f"- First half avg fitness: **{early_fit:.1f}**")
+            print(f"- Latest half avg fitness: **{late_fit:.1f}**")
+            print(f"- Delta: **{late_fit - early_fit:+.1f}** ({_fitness_band(late_fit)} vs {_fitness_band(early_fit)})")
+            # Top 5 elite run
+            elite_runs = sorted(runs, key=lambda r: r["fitness_score"], reverse=True)[:5]
+            print(f"\n## Top 5 Elite Runs\n")
+            print("| Run | Topic | Fitness | Band |")
+            print("|---|---|---|---|")
+            for r in elite_runs:
+                print(f"| {r['ts']} | {r['topic'][:35]} | {r['fitness_score']} | {_fitness_band(r['fitness_score'])} |")
 
 
 def main():
     md = "--md" in sys.argv
     limit = None
+    threshold = 0.0
     if "--last" in sys.argv:
         i = sys.argv.index("--last")
         if i + 1 < len(sys.argv):
             limit = int(sys.argv[i + 1])
+    if "--threshold" in sys.argv:
+        i = sys.argv.index("--threshold")
+        if i + 1 < len(sys.argv):
+            threshold = float(sys.argv[i + 1])
     runs = scan_runs(limit=limit)
     if not runs:
         print("No ADR runs found in /tmp/adr_v8_*")
         sys.exit(1)
-    print_table(runs, markdown=md)
+    print_table(runs, markdown=md, threshold=threshold)
 
 
 if __name__ == "__main__":

@@ -2243,6 +2243,47 @@ def _adsd_pov_contract() -> str:
     )
 
 
+_AUDIT_BLACKLIST_CACHE: dict | None = None
+
+
+def _load_audit_blacklist_block() -> str:
+    """达尔文 R1 阶段 B (2026-05-25): 读 audit_blacklist.json 注入 script-gen prompt 让编剧避开历史触发词."""
+    global _AUDIT_BLACKLIST_CACHE
+    if _AUDIT_BLACKLIST_CACHE is None:
+        bl_path = Path(__file__).resolve().parent / "voice_assets" / "audit_blacklist.json"
+        if not bl_path.exists():
+            _AUDIT_BLACKLIST_CACHE = {}
+        else:
+            try:
+                _AUDIT_BLACKLIST_CACHE = json.loads(bl_path.read_text(encoding="utf-8"))
+            except Exception:
+                _AUDIT_BLACKLIST_CACHE = {}
+    bl = _AUDIT_BLACKLIST_CACHE if isinstance(_AUDIT_BLACKLIST_CACHE, dict) else {}
+    words = bl.get("blocked_words_global") or []
+    if not words:
+        return ""
+    # codex 审查 fix (2026-05-25): 不直注原词避免二次触发审查/prompt 污染
+    # 改用「类别 + 数量」抽象描述 + 替代策略，不暴露具体敏感词
+    by_type = bl.get("blocked_words_by_audit_type") or {}
+    categories = []
+    if by_type.get("image_asset_audit"):
+        categories.append(f"现代名人 + 体育品牌商标 ({len(by_type['image_asset_audit'])} 个历史触发点)")
+    if by_type.get("copyright_restrictions"):
+        categories.append(f"知名电影/小说角色与道具 ({len(by_type['copyright_restrictions'])} 个历史触发点)")
+    if by_type.get("content_moderation"):
+        categories.append(f"内容审核敏感词 ({len(by_type['content_moderation'])} 个历史触发点)")
+    if not categories:
+        return ""
+    return f"""
+【达尔文 R1 · 历史 Audit 触发模式 (基于 {bl.get('total_evidence', 0)} 条历史失败证据)】
+{chr(10).join('· ' + c for c in categories)}
+
+★ 编剧策略: 涉及现代名人 / 知名电影角色 / 著名商标时，用职业代称或抽象化描述
+  e.g. 名人具名 → 「这位球员/这位主帅」；电影角色名 → 「主角/师傅」；商标 → 「紫金球衣队」
+★ 角色名应该是「时代内合理称呼」而非「品牌商标」
+"""
+
+
 def _generate_adsd_dialogue_turns(topic: str, num_turns: int, tone: str, style_guide: str, historical_context: str = "", topic_meta: dict | None = None) -> list[dict]:
     """Generate ADSD dialogue turns. Each turn becomes one TTS unit and one video segment.
 
@@ -2305,16 +2346,42 @@ def _generate_adsd_dialogue_turns(topic: str, num_turns: int, tone: str, style_g
 ★ 编剧写台词时必须严格匹配该文化/年代/服饰，绝不写跨文化或跨年代细节
 ★ 角色名 / 道具 / 场景 / 称呼 都要符合上述铁律
 """
+    # 达尔文 R2 阶段 C (2026-05-25): audit_risk_score 决定脱敏强度
+    _decomp_for_risk = _llm_topic_decomposition(topic) or {}
+    audit_risk = int(_decomp_for_risk.get("audit_risk_score") or 30)
+    audit_risk_reason = str(_decomp_for_risk.get("audit_risk_reason") or "")
+    risk_strategy_block = ""
+    if audit_risk >= 61:
+        # high risk: 现代名人/品牌 → 强脱敏
+        risk_strategy_block = f"""
+【⚠️ 达尔文 R2 · Audit 高危题材 (risk={audit_risk}/100 · {audit_risk_reason})】
+本题材历史触发审核高发，编剧必须强脱敏:
+· 角色 speaker 字段用「职业代称」而非真人具名 (科比 → 球员 / Tesla 老板 → 创始人)
+· 台词避开品牌/商标/具体球队名 (Lakers / NBA / iPhone / 紫金球衣 → 紫金球衣队 / 主队)
+· 视觉描述用抽象身份 (篮球传奇 / 灯泡发明家) 而非个人识别特征
+· 旁白可以引用「他」「这位领袖」但避免反复点名
+"""
+    elif audit_risk >= 31:
+        risk_strategy_block = f"""
+【⚠️ 达尔文 R2 · Audit 中等风险 (risk={audit_risk}/100 · {audit_risk_reason})】
+本题材轻度触发审核，建议适度脱敏:
+· 真名出现 1-2 次即可，多用代称 (鲁迅 → 这位作家 / 苏东坡 → 词人)
+· 涉及版权 IP 角色 (大话西游/三国/红楼梦) 时，用通用古风称呼优先
+"""
+    # low risk 不加 block (默认流程)
     historical_block = ""
     if historical_context:
         historical_block = f"\n【上游 · 历史顾问 (完整制片人准则)】\n{historical_context[:1200]}\n"
+
+    # 达尔文 R1 阶段 B (2026-05-25): Audit 黑名单自动学习注入
+    audit_blacklist_block = _load_audit_blacklist_block()
 
     def _build_prompt(retry_hint: str = "") -> str:
         retry_block = f"\n【重试提醒】上一次输出违反约束：{retry_hint}\n请严格按以下规则重新生成。\n" if retry_hint else ""
         return f"""你是 ADSD 纪录片编剧。{retry_block}
 主题：「{topic}」
 目标：生成 {num_turns} 句视听节奏合理的纪录片镜头脚本。
-{producer_anchor_block}{historical_block}
+{producer_anchor_block}{historical_block}{audit_blacklist_block}{risk_strategy_block}
 {ip_relationships_block}
 
 【纪录片节奏铁律】
@@ -6651,18 +6718,35 @@ def _topic_cache_path(topic: str) -> Path:
     return _topic_cache_dir() / f"{safe}.json"
 
 
+# codex 审查 fix (2026-05-25): cache schema version 防旧 cache 漏新字段
+# v1: 原版 (era/culture/bgm_*/role_*/director_style)
+# v2: 2026-05-21 加 is_action_topic / action_density_hint / recommended_action_b_count
+# v3: 2026-05-25 加 director_style_route (PR-2)
+# v4: 2026-05-25 加 audit_risk_score (达尔文 R2 阶段 C)
+TOPIC_DECOMPOSITION_CACHE_VERSION = 4
+
+
 def _load_topic_decomposition_cache(topic: str) -> dict | None:
     p = _topic_cache_path(topic)
     if not p.exists():
         return None
     try:
-        return json.loads(p.read_text(encoding="utf-8"))
+        data = json.loads(p.read_text(encoding="utf-8"))
     except Exception:
         return None
+    # 旧 cache 缺新字段 → 失效让 LLM 重跑
+    if not isinstance(data, dict):
+        return None
+    cached_ver = int(data.get("_cache_version", 1))
+    if cached_ver < TOPIC_DECOMPOSITION_CACHE_VERSION:
+        log(f"topic_decomposition cache 失效 (v{cached_ver} < v{TOPIC_DECOMPOSITION_CACHE_VERSION})，将重新 LLM 推断")
+        return None
+    return data
 
 
 def _save_topic_decomposition_cache(topic: str, data: dict) -> None:
     p = _topic_cache_path(topic)
+    data["_cache_version"] = TOPIC_DECOMPOSITION_CACHE_VERSION
     p.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
@@ -6708,6 +6792,8 @@ def _llm_topic_decomposition(topic: str, use_cache: bool = True) -> dict:
   "is_action_topic": false,
   "action_density_hint": "low",
   "recommended_action_b_count": 0,
+  "audit_risk_score": 30,
+  "audit_risk_reason": "10 字内说明风险判断 (e.g. 涉及现代名人姓名 + 体育商标)",
   "reason": "10 字内说明 era 判断依据"
 }}
 
@@ -6721,7 +6807,12 @@ def _llm_topic_decomposition(topic: str, use_cache: bool = True) -> dict:
      · "medium" 战争/警匪/动作冒险/激烈商业冲突 → recommended_action_b_count=1-2
      · "low"    历史叙事/文化品鉴/书评/科普/节气 → recommended_action_b_count=0-1
    recommended_action_b_count 是「该题材在 8-12 turn 片子里应有的 action_b 数量」硬指标
-6. director_style_route 必填 (PR-2 题材路由 · 7 选 1)，每种风格对应一种镜头语言:
+6. audit_risk_score 必填 (达尔文 R2 阶段 C · 0-100 评估 WeryAI audit 触发风险):
+   · 0-30  low   纯虚构/古风/历史哲学 (古典武侠/西游记/聊斋/诗词品鉴/二十四节气/科学知识/纪录片)
+   · 31-60 medium 著名虚构 IP 但非品牌 (大话西游/三国演义/红楼梦) + 历史名人 (鲁迅/苏东坡/曹操) + 商业纪录
+   · 61-100 high  现代真实名人 + 品牌商标 (科比/NBA/Tesla/Musk/Apple/Lakers/PRC 政治领导人)
+   audit_risk_reason 简短说明触发风险点 (具体到哪种敏感性: 真人肖像 / 商标 / 版权 IP / 政治)
+7. director_style_route 必填 (PR-2 题材路由 · 7 选 1)，每种风格对应一种镜头语言:
    · intimate_wuxia     文武交织古风 (李安《卧虎藏龙》调): 文戏 close-up + 武戏 wirework / 留白
    · imax_war_epic      史诗战争/历史巨制 (诺兰调): wide vista + dramatic backlight + 时间感
    · saturated_folk     浓郁中国民俗/红色 (张艺谋调): 高饱和色彩 + 仪式感构图

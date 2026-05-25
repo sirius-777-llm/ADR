@@ -117,8 +117,8 @@ LLM 角色团队从「各跑各的」升级为「真正协作」+ 专业化分�
 | 阶段 | 工程量 | ROI | 状态 | 备注 |
 |------|--------|-----|------|------|
 | ~~quality_audit.py 适应度评估器~~ | ~~1h~~ | ~~★★★~~ | ✅ shipped 2026-05-25 | 扫所有 run 输出 通过率/SFX/fallback/audit msg + markdown 趋势报告 |
-| **阶段 A · Fitness Scorer 强化** | 1.5h | ★★★ | planned (Round 1) | quality_audit 加权 fitness score (0-100): 40% 通过率 + 20% SFX 比例 + 20% fallback 占比 + 20% audit 严重度 · --threshold 过滤进化失败 |
-| **阶段 B · Audit 黑名单自动学习** | 2h | ★★★ | planned (Round 1) | 解析 task_failed msg → LLM 提炼触发词聚类 → audit_blacklist.json · script-gen prompt 自动注入 "avoid: Lakers, NBA, Bryant..." · 黑名单按周更新 |
+| ~~**阶段 A · Fitness Scorer 强化**~~ | ~~1.5h~~ | ✅ shipped 2026-05-25 | quality_audit 加权 (50% pass + 15% action + 15% retry 效率 + 20% audit) · band 分级 elite/strong/viable/weak/failed · --threshold 过滤 · Top 5 Elite 排行 |
+| ~~**阶段 B · Audit 黑名单自动学习**~~ | ~~2h~~ | ✅ shipped 2026-05-25 | tools/learn_audit_blacklist.py 扫所有失败证据 LLM 提炼 11 触发词 · audit_blacklist.json · script-gen prompt 用「类别+数量」抽象描述注入 (避免原词二次触发审核) · codex 审查通过 |
 | **阶段 C · 题材分类器** | 1h | ★★ | planned (Round 2) | topic_decomposition LLM 加 audit_risk_score (0-100) · 高危题材 (现代名人/品牌) 自动启 mutator 强脱敏 · 低危默认 prompt |
 | **阶段 E · 自动 IP 进化** | 2h | ★★ | planned (Round 2) | 每 IP 算 historical_success_rate · <60% 自动重孵化 (强脱敏) · >90% 标 production_ready 锁定不改 · IP 加 fitness_score 字段 |
 | **阶段 D · Multi-arm Bandit prompt** | 4h | ★★ | planned (Round 3) | 每个 prompt 函数维护 3 个变体 · epsilon-greedy 选 (90% best, 10% explore) · variant 表现存数据库 · 月度 review 删差 variant |
@@ -165,11 +165,11 @@ LLM 角色团队从「各跑各的」升级为「真正协作」+ 专业化分�
 - ★ 长期价值或工具型
 
 **当前 top 3 (2026-05-25 更新):**
-1. **达尔文进化 Round 1** (3.5h) — 阶段 A Fitness Scorer + 阶段 B 黑名单自动学习，建立数据闭环
-2. **B7 验证科比 (新 grid)** — 跑中，看 audit 在新 editorial grid 下是否仍拦
+1. **达尔文 Round 2** (3h) — 阶段 C 题材分类器 + 阶段 E 自动 IP 进化
+2. **PR-3 专业角色补全** (4h) — 武术指导/美术指导/剪辑师/音效师
 3. **PR-A · merged_a 合并跑** (4-5h) — 大杀器，省 8-12min/run
 
-**5/21-5/25 累计 ship 24 件:**
+**5/21-5/25 累计 ship 32 件 (含今日 7 件):**
   · IP 系统 7 件 (A 孵化 / AUTO-IP / B 自学习 / C 关系 / F 统计 / I 版本 / 占位符过滤)
   · LLM 化 6 件 (topic_decomposition / BGM / role / 武戏密度 / 智能召唤标签 / action_b 标注)
   · Bug 修复 8 件 (duration=3 / step7 防御 / B1-B6 / Ken Burns)
