@@ -2848,7 +2848,13 @@ def _sweep_speaker_field(turns: list[dict], role_candidates: list[str]) -> None:
             t["speaker"] = fallback
             fixed += 1
             continue
-        is_bad = any(kw in sp for kw in bad_keywords) or len(sp) > 8
+        # 2026-05-26 加: 含括号/斜杠等不规则字符 → bad (科比题材 LLM 脱敏过头生成「科比（训练间隙的自述/内」)
+        has_special_chars = any(c in sp for c in "（）()/\\、,，；;:：")
+        is_bad = (
+            any(kw in sp for kw in bad_keywords)
+            or len(sp) > 8
+            or has_special_chars
+        )
         if not is_bad:
             continue
         # 从 bad speaker 字符串中找已知角色名 (子串匹配)
@@ -4508,9 +4514,11 @@ def _tts_turn_to_audio(turn: dict, idx: int, max_retries: int = 3) -> tuple[str,
             audios = data.get("audios") or []
             if not audios:
                 raise RuntimeError(f"text-to-audio 成功但无 audios: {json.dumps(data, ensure_ascii=False)[:200]}")
-            mp3_path = str(OUTPUT_DIR / f"turn_{idx+1:02d}_{speaker}.mp3")
+            # 2026-05-26 fix: sanitize speaker 写文件路径，防 / 等特殊字符
+            safe_sp = re.sub(r"[^一-龥A-Za-z0-9_]", "_", speaker)[:30] or "speaker"
+            mp3_path = str(OUTPUT_DIR / f"turn_{idx+1:02d}_{safe_sp}.mp3")
             urllib.request.urlretrieve(audios[0], mp3_path)
-            wav_path = str(OUTPUT_DIR / f"turn_{idx+1:02d}_{speaker}.wav")
+            wav_path = str(OUTPUT_DIR / f"turn_{idx+1:02d}_{safe_sp}.wav")
             ffmpeg("-i", mp3_path, "-ar", "44100", "-ac", "1", "-c:a", "pcm_s16le", wav_path, timeout=60)
             dur = ffprobe_duration(wav_path)
             return wav_path, dur, {
