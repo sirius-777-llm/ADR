@@ -2243,7 +2243,7 @@ def _adsd_pov_contract() -> str:
     )
 
 
-def _generate_adsd_dialogue_turns(topic: str, num_turns: int, tone: str, style_guide: str) -> list[dict]:
+def _generate_adsd_dialogue_turns(topic: str, num_turns: int, tone: str, style_guide: str, historical_context: str = "", topic_meta: dict | None = None) -> list[dict]:
     """Generate ADSD dialogue turns. Each turn becomes one TTS unit and one video segment.
 
     三类 turn (silent_b PR):
@@ -2257,11 +2257,12 @@ def _generate_adsd_dialogue_turns(topic: str, num_turns: int, tone: str, style_g
     fallback_role = role_candidates[0]
     # Speaker IP 关系网络注入：扫描 topic + role_candidates 找匹配 IP，提供关系上下文
     ip_relationships_block = _build_speaker_ip_context_for_script(topic, role_candidates)
-    # narrated_b 全片硬上限：3（开场+结尾+最多 1 个关键转场）
-    max_narrated = min(3, num_turns // 4 + 2)
-    # silent_b 占比目标：20%-35%
-    min_silent = max(1, int(num_turns * 0.20))
-    max_silent = max(min_silent + 1, int(num_turns * 0.35))
+    # narrated_b 全片硬上限：2（开场 + 结尾，中段不再加）
+    # B9 (2026-05-25 调整): 3 → 2，避免节目感
+    max_narrated = 2
+    # silent_b 占比目标：15%-25% (B9 调整: 原 20-35% B-roll 占比过高出戏)
+    min_silent = max(1, int(num_turns * 0.15))
+    max_silent = max(min_silent + 1, int(num_turns * 0.25))
     # P1 (2026-05-21) action_b 密度硬指标：LLM topic_decomposition 推断的武戏含量
     _decomp_for_action = _llm_topic_decomposition(topic) or {}
     _density = (_decomp_for_action.get("action_density_hint") or "low").strip().lower()
@@ -2289,11 +2290,31 @@ def _generate_adsd_dialogue_turns(topic: str, num_turns: int, tone: str, style_g
             f"  纯叙述题材可全无 action_b，不强求"
         )
 
+    # PR-1 (2026-05-25) 跨层 Context 协作：编剧拿 topic_meta + historical_context 上游信号
+    tm = topic_meta or {}
+    producer_anchor_block = ""
+    if tm:
+        producer_anchor_block = f"""
+【上游 · 总制片人文化铁律 (最高优先级，编剧必须遵守)】
+· CULTURE: {tm.get('culture', '')}
+· REGION: {tm.get('region', '')}
+· ERA: {tm.get('era', '')}
+· PERIOD_COSTUME: {tm.get('period_costume', '')}
+· NEGATIVE (排除元素): {tm.get('negative', '')}
+
+★ 编剧写台词时必须严格匹配该文化/年代/服饰，绝不写跨文化或跨年代细节
+★ 角色名 / 道具 / 场景 / 称呼 都要符合上述铁律
+"""
+    historical_block = ""
+    if historical_context:
+        historical_block = f"\n【上游 · 历史顾问 (完整制片人准则)】\n{historical_context[:1200]}\n"
+
     def _build_prompt(retry_hint: str = "") -> str:
         retry_block = f"\n【重试提醒】上一次输出违反约束：{retry_hint}\n请严格按以下规则重新生成。\n" if retry_hint else ""
         return f"""你是 ADSD 纪录片编剧。{retry_block}
 主题：「{topic}」
 目标：生成 {num_turns} 句视听节奏合理的纪录片镜头脚本。
+{producer_anchor_block}{historical_block}
 {ip_relationships_block}
 
 【纪录片节奏铁律】
@@ -2382,6 +2403,13 @@ action_b    武戏 / 激烈对抗 / 突破冲击 镜头
                 a_roll: speaker 入镜说话
                 narrated_b: 必须写「无嘴部特写」类构图 (剪影/背影/远景/群像/雕像/画卷)
                 silent_b: 写空镜/物件/环境氛围
+                ★ B9 内容衔接铁律 (2026-05-25):
+                  silent_b / narrated_b 的 shot 必须**继承前 turn 的视觉/情绪/场景元素**
+                  例如:
+                    前 turn 「紫霞在洞外说话」→ silent_b 写「同洞外，月光下风吹纱帘 / 紫霞刚离去的痕迹」
+                    NOT「忽然剪到远山雪景」（这种突切让观众出戏）
+                  silent_b 必须是「前 turn 场景的呼吸延续」(同地点 / 同道具 / 同光影)
+                  narrated_b 必须跟下 turn a_roll 的主题强关联 (做转场铺垫)
 - emotion      neutral / tense / solemn / explanatory（silent_b 写 "neutral"）
 - duration_hint 数字，秒
                 a_roll: 自适应（按 text 长度估算 3-10）
@@ -2578,7 +2606,120 @@ action_b    武戏 / 激烈对抗 / 突破冲击 镜头
         turn["speaker_count"] = speaker_count
     # B5 (2026-05-21): speaker sweep 校验 — 修 LLM 把场景描述当 speaker 的 bug
     _sweep_speaker_field(turns, role_candidates)
+    # B9 (2026-05-25): B-roll 节奏 LLM Reviewer — 判断每个 B-roll 是否合理 + 衔接前后
+    if os.environ.get("ADR_BROLL_REVIEWER", "1").strip().lower() not in ("0", "false", "no", "off"):
+        try:
+            _broll_rhythm_reviewer(turns, topic)
+        except Exception as e:
+            log(f"B-roll Reviewer 跳过: {e}")
     return _adsd_immersion_qa_rewrite_turns(topic, turns, role_candidates)
+
+
+def _broll_rhythm_reviewer(turns: list[dict], topic: str) -> None:
+    """B9 (2026-05-25): LLM 审 B-roll 节奏 + 内容衔接.
+
+    对每个 narrated_b / silent_b turn 判断:
+      keep    保留 (节奏合理 + 内容衔接)
+      merge   建议跟前后 a_roll 合并
+      relocate 位置不对，建议移动
+      rewrite shot 内容跟前后不衔接，重写
+
+    自动应用: merge → 删除该 turn / rewrite → 重写 shot 字段
+    保守策略: 只删 merge 提议、采纳 rewrite 建议；relocate 留 log。
+    """
+    if not turns or len(turns) < 4:
+        return
+    broll_indices = [i for i, t in enumerate(turns)
+                     if _resolve_turn_type(t) in ("narrated_b", "silent_b")]
+    if not broll_indices:
+        return
+    compact = []
+    for i, t in enumerate(turns):
+        tt = _resolve_turn_type(t)
+        compact.append({
+            "idx": i,
+            "turn_type": tt,
+            "speaker": t.get("speaker", ""),
+            "text": (t.get("text") or "")[:60],
+            "shot": (t.get("shot") or "")[:80],
+            "is_broll": tt in ("narrated_b", "silent_b"),
+        })
+    prompt = f"""你是纪录片节奏审稿人。给以下 turn 序列做 B-roll 优化判断。
+
+主题: {topic}
+
+turn 序列:
+{json.dumps(compact, ensure_ascii=False)}
+
+只看 is_broll=true 的 turn (narrated_b / silent_b)，判断每个:
+1. keep    节奏合理 + 内容跟前后 a_roll 衔接 → 不动
+2. merge   B-roll 不必要 (前后 a_roll 可以连贯) → 建议删除
+3. rewrite shot 跟前后断层 → 建议改写 shot (返回新 shot 文本)
+4. relocate 位置不对 (该在别处出现) → log 提醒不自动改
+
+输出严格 JSON:
+{{
+  "decisions": [
+    {{"idx": 2, "action": "rewrite", "new_shot": "新 shot 文本，必须衔接前后"}},
+    {{"idx": 5, "action": "merge", "reason": "节奏过频"}},
+    {{"idx": 7, "action": "keep"}}
+  ]
+}}
+
+约束:
+- 默认 keep，只在 B-roll 明显出戏才动
+- merge 建议要保守 (最多删 1 个 B-roll)
+- rewrite 的 new_shot 必须含前 turn 出现的视觉元素 (人/物/地)
+- 不动 a_roll / action_b
+"""
+    try:
+        raw = chat("GEMINI_25_FLASH", "你只输出严格 JSON 对象。", prompt, max_tokens=1000, timeout=60)
+    except Exception as e:
+        log(f"B-roll Reviewer LLM 异常: {e}")
+        return
+    obj = _extract_json_object(raw)
+    if not isinstance(obj, dict) or "decisions" not in obj:
+        log(f"B-roll Reviewer 输出格式错误: {raw[:200]}")
+        return
+    decisions = obj.get("decisions") or []
+    if not isinstance(decisions, list):
+        return
+    merge_indices = []
+    rewrite_count = 0
+    relocate_count = 0
+    for d in decisions:
+        if not isinstance(d, dict):
+            continue
+        idx = d.get("idx")
+        action = str(d.get("action") or "keep").lower()
+        if not isinstance(idx, int) or not (0 <= idx < len(turns)):
+            continue
+        if action == "merge":
+            merge_indices.append(idx)
+        elif action == "rewrite":
+            new_shot = str(d.get("new_shot") or "").strip()
+            if new_shot:
+                turns[idx]["shot"] = new_shot[:200]
+                rewrite_count += 1
+        elif action == "relocate":
+            log(f"B-roll Reviewer: turn {idx+1} relocate 建议 (不自动改): {d.get('reason', '')}")
+            relocate_count += 1
+    # merge 保守: 最多删 1 个，且不能删开场/结尾
+    merge_indices = [i for i in merge_indices if 0 < i < len(turns) - 1][:1]
+    if merge_indices:
+        # 从后往前删避免 index 漂移
+        for idx in sorted(merge_indices, reverse=True):
+            removed = turns.pop(idx)
+            log(f"B-roll Reviewer: merge 删除 turn {idx+1} ({_resolve_turn_type(removed)})")
+        # 重新排 dialogue_turn 编号
+        for new_i, t in enumerate(turns):
+            t["dialogue_turn"] = new_i + 1
+    if rewrite_count or merge_indices or relocate_count:
+        log(f"B-roll Reviewer: rewrite {rewrite_count} / merge {len(merge_indices)} / relocate {relocate_count}")
+        try:
+            tg(f"🎬 B-roll 节奏 Reviewer: rewrite {rewrite_count} turn / merge {len(merge_indices)} turn / relocate {relocate_count} turn")
+        except Exception:
+            pass
 
 
 def _sweep_speaker_field(turns: list[dict], role_candidates: list[str]) -> None:
@@ -3005,7 +3146,7 @@ def step1_script(topic: str) -> list[dict]:
     if ADS_DIALOGUE_MODE and not almanac_data and not _script_injected:
         for _try in range(3):
             try:
-                dialogue_turns = _generate_adsd_dialogue_turns(topic, num_lines, tone, style_guide)
+                dialogue_turns = _generate_adsd_dialogue_turns(topic, num_lines, tone, style_guide, topic_meta=topic_meta)
                 lines = [t["text"] for t in dialogue_turns]
                 num_lines = len(lines)
                 roles = " / ".join(dict.fromkeys(t.get("speaker", "") for t in dialogue_turns if t.get("speaker")))
@@ -3212,10 +3353,18 @@ THUMBNAIL_ANCHOR: Air Force One stairs, black leather jacket figure, glowing chi
         lines_display = chr(10).join(f'{i+1}. {l}' for i, l in enumerate(lines))
         almanac_visual_guide = ""
 
-    jiangwen_prompt = f"""你是顶级电影导演姜文，同时精通黑泽明/张艺谋/李安/王家卫/诺兰/昆汀的镜头语言。你的任务不是"描述画面"，是"设计电影镜头"。
+    # PR-2 (2026-05-25) 题材路由：从 topic_decomposition 拿 director_style_route
+    _decomp_for_director = _llm_topic_decomposition(topic) or {}
+    _director_route = (_decomp_for_director.get("director_style_route") or "modern_documentary").strip().lower()
+    director_route_block = _director_route_block(_director_route)
+    log(f"PR-2 导演路由: topic={topic[:30]} → route={_director_route}")
+
+    jiangwen_prompt = f"""你是顶级电影画面导演。任务: 为给定台词设计统一的电影镜头。
 以下是纪录片的 {num_lines} 句旁白台词（主题：{topic}）：
 
 {lines_display}
+
+{director_route_block}
 
 【制片人准则（最高优先级，所有画面必须严格遵循：价值观 · 风格 · 事实）】
 {historical_context}{almanac_visual_guide}
@@ -6554,6 +6703,7 @@ def _llm_topic_decomposition(topic: str, use_cache: bool = True) -> dict:
   "bgm_mood": "BGM 情绪短语 (e.g. 稳健进取 / 史诗激昂 / 静谧沉思)",
   "role_candidates": ["4-6 个现场角色名 中文短语，符合 topic 时代和性质"],
   "director_style": "导演风格 英文短语 (e.g. corporate clean handheld documentary / epic dramatic backlight)",
+  "director_style_route": "intimate_wuxia | imax_war_epic | saturated_folk | slow_poetic | gritty_kinetic | classical_realism | modern_documentary",
   "cover_art_direction": "封面美术方向 中文短语 (e.g. 极简金融感冷色调 / 史诗水墨卷轴)",
   "is_action_topic": false,
   "action_density_hint": "low",
@@ -6571,6 +6721,14 @@ def _llm_topic_decomposition(topic: str, use_cache: bool = True) -> dict:
      · "medium" 战争/警匪/动作冒险/激烈商业冲突 → recommended_action_b_count=1-2
      · "low"    历史叙事/文化品鉴/书评/科普/节气 → recommended_action_b_count=0-1
    recommended_action_b_count 是「该题材在 8-12 turn 片子里应有的 action_b 数量」硬指标
+6. director_style_route 必填 (PR-2 题材路由 · 7 选 1)，每种风格对应一种镜头语言:
+   · intimate_wuxia     文武交织古风 (李安《卧虎藏龙》调): 文戏 close-up + 武戏 wirework / 留白
+   · imax_war_epic      史诗战争/历史巨制 (诺兰调): wide vista + dramatic backlight + 时间感
+   · saturated_folk     浓郁中国民俗/红色 (张艺谋调): 高饱和色彩 + 仪式感构图
+   · slow_poetic        文人慢节奏/情感纪录 (王家卫调): 浅景深 + 慢推 + 暖光
+   · gritty_kinetic     体育/动作/快剪 (昆汀调): 快剪辑 + 低角度 + 紧凑张力
+   · classical_realism  历史人物/教科书 (黑泽明调): 黑白对比 + 古典构图 + 历史还原
+   · modern_documentary 现代纪录片/商业职场 (默认): 手持纪实 + 自然光 + 静观
 
 只输出 JSON。"""
     try:
@@ -6598,6 +6756,72 @@ def _llm_topic_decomposition(topic: str, use_cache: bool = True) -> dict:
 # ── era-aware meta_grid 模板系统 (2026-05-21) ────────────────────────────────
 # 历史题材 + 现代题材 + 未来题材 通用：LLM 推断 era + 标签集
 # 兜底：IP era + 预设 era 模板 + 默认「日常」
+
+# PR-2 (2026-05-25) 题材专家路由：7 种导演风格 → 镜头语言关键词集
+# 让 topic_decomposition 选一种 route，然后 jiangwen_prompt 用这种 route 的纯描述词
+# 严禁出现具体导演/画家名（GPT_IMAGE_2 audit）
+DIRECTOR_STYLE_ROUTES: dict[str, dict] = {
+    "intimate_wuxia": {
+        "label": "文武交织古风 (文戏 close-up + 武戏 wirework)",
+        "anchor": "intimate emotional close-ups, restrained framing, wirework-style action with airborne silk and dust motes, soft restrained natural light, classical Chinese ink composition",
+        "palette": "warm cream and ink-black, occasional jade green, soft amber rim light",
+        "rhythm": "slow patient breath cuts for dialogue / kinetic short bursts for combat with negative space",
+    },
+    "imax_war_epic": {
+        "label": "史诗战争/历史巨制",
+        "anchor": "IMAX-style wide vistas, dramatic backlight, vast deep-focus landscapes, towering silhouettes against sky, time-collapsed compositions",
+        "palette": "high-contrast warm sun versus cool blue shadow, dust and ember orange highlights",
+        "rhythm": "slow majestic dolly + sudden cuts to extreme close-up of human eye / weapon detail",
+    },
+    "saturated_folk": {
+        "label": "浓郁中国民俗/仪式感",
+        "anchor": "high-saturation color-block composition, symmetric centered framing, ritual ceremonial geometry, fabric and lantern color fields",
+        "palette": "deep red, gold, indigo, with paper-white and ink-black accents",
+        "rhythm": "static framed tableaux holding breath, then sudden flag/banner motion",
+    },
+    "slow_poetic": {
+        "label": "文人慢节奏/情感纪录",
+        "anchor": "shallow depth-of-field portraits, slow push-ins, soft window-light reflections, fabric and tea-steam textures, asymmetric negative space",
+        "palette": "muted warm amber, soft umber, faded ink, never neon",
+        "rhythm": "long takes with patient camera breathing, dialogue lingering on faces",
+    },
+    "gritty_kinetic": {
+        "label": "体育/动作/快剪",
+        "anchor": "low-angle kinetic compositions, snap-zoom impact frames, hard rim light, sweat and dust particles, motion-blur fragments",
+        "palette": "high-contrast saturated team colors, deep blacks, accent neon",
+        "rhythm": "rapid cuts, freeze-frame on peak impact, whip pans between subjects",
+    },
+    "classical_realism": {
+        "label": "历史人物/教科书还原",
+        "anchor": "classical balanced composition, deep grayscale tones with selective sepia warmth, historically accurate period detail, archive-photograph texture",
+        "palette": "muted sepia, charcoal black, faded paper cream",
+        "rhythm": "deliberate static medium shots, archival-photograph stillness with subtle film grain animation",
+    },
+    "modern_documentary": {
+        "label": "现代纪录片/商业职场",
+        "anchor": "handheld documentary realism with subtle organic shake, natural office or street lighting, observational fly-on-the-wall framing, real-world product and environment detail",
+        "palette": "neutral cool grays, navy blue, soft beige, accent corporate color",
+        "rhythm": "patient observational long takes, occasional cut to detail insert (hands, screens, gestures)",
+    },
+}
+
+
+def _director_route_block(route: str) -> str:
+    """PR-2: 取 director_style_route 路由后的英文风格关键词块, 注入 jiangwen_prompt."""
+    route = (route or "modern_documentary").strip().lower()
+    if route not in DIRECTOR_STYLE_ROUTES:
+        route = "modern_documentary"
+    r = DIRECTOR_STYLE_ROUTES[route]
+    return (
+        f"★★★ DIRECTOR STYLE ROUTE (题材路由 · 全片必须严格统一这一种风格) ★★★\n"
+        f"路由: {route} ({r['label']})\n"
+        f"VISUAL ANCHOR: {r['anchor']}\n"
+        f"PALETTE: {r['palette']}\n"
+        f"RHYTHM: {r['rhythm']}\n"
+        f"全片所有镜头必须遵循这一套风格关键词 — 严禁切换到其他路由的描述词\n"
+        f"（不要混搭其他导演风格 / 不要写「混合」「fusion」/ 一条路走到底）\n"
+    )
+
 
 # A · 预设 era 模板（LLM 失败兜底）
 ERA_TEMPLATES: dict[str, dict] = {

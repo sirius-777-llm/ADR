@@ -98,6 +98,18 @@ Last updated: 2026-05-21
 | 题材泛化验证 | 30min/题材 | ★ | planned | 跑科比/鲁迅/苏东坡/钱学森等验证 IP+人设符稳定性 |
 | resume 工具 e2e test | 1h | ★ | planned | tools/rerun_downstream.py 加自动测试套件 |
 
+### 👥 团队进化 (2026-05-25 议定 · 共 11h, 5 个 PR)
+
+LLM 角色团队从「各跑各的」升级为「真正协作」+ 专业化分工。
+
+| PR | 工程量 | ROI | 状态 | 备注 |
+|---|--------|-----|------|------|
+| ~~**PR-1 · 跨层 Context 协作**~~ | ~~3h~~ | ✅ shipped 2026-05-25 | 编剧 _generate_adsd_dialogue_turns 新增 topic_meta + historical_context 参数 · prompt 头部注入「总制片人文化铁律」(CULTURE/REGION/ERA/PERIOD_COSTUME/NEGATIVE) · 编剧台词必须严格匹配上游文化年代 · 1h vs 3h 预算 (节奏 Reviewer 在 B9 已 ship 简化路径) |
+| ~~**PR-2 · 题材专家路由**~~ | ~~2h~~ | ✅ shipped 2026-05-25 | DIRECTOR_STYLE_ROUTES 7 种路由表 (intimate_wuxia/imax_war_epic/saturated_folk/slow_poetic/gritty_kinetic/classical_realism/modern_documentary) · _director_route_block helper · topic_decomposition LLM 输出 director_style_route 字段 · jiangwen_prompt 用单一路由风格关键词不再混搭 6 大师 |
+| **PR-3 · 专业角色补全** | 4h | ★★★ | planned | 新增 4 个专业 LLM 角色: 武术指导 (action_b prompt) / 美术指导 (调色板+道具+服装) / 剪辑师 (节奏决定) / 音效师 (SFX 设计) |
+| **PR-4 · LLM 分级** | 1h | ★★ | planned | 按角色重要度分配 LLM: 制片人 Claude Opus / 编剧导演 Gemini 2.5 / 总监审稿 Gemini Flash Lite / 数据层 Haiku 4.5。预期成本降 30% 速度升 20% |
+| **PR-5 · 团队学习机制** | 与达尔文联动 | ★★ | planned | 每个角色记录 historical_success_rate 输出是否最终通过 audit · 失败 case 反馈对应角色 prompt · 团队自动进化适应 ADR 项目 |
+
 ### 🧬 达尔文进化 (2026-05-25 议定 · 共 11.5h, 分 4 个 Round)
 
 让 ADR 自动迭代优化：每次 run 收集质量数据 → 失败模式自动反哺 prompt → 高分配置自动遗传。
@@ -120,6 +132,8 @@ Last updated: 2026-05-21
 | ~~**B2 meta_grid 12 宫格漏进**~~ | ~~★★★ P0~~ | ~~1.5h~~ | ✅ shipped 2026-05-21 | step7 防御层缺失 seg 时用 meta_grid 当 still 导致 4×3 grid 漏入画面 → 检测 meta_grid_ 文件名 + 优先用邻 turn 合法图/cover.jpg 兜底 + prompt 强化禁止复刻 grid + negative_prompt 加 grid/split/panel ban |
 | ~~**B3 内嵌字幕**~~ | ~~★★★ P0~~ | ~~30min~~ | ✅ shipped 2026-05-21 | meta_grid_call prompt 强化禁止复刻参考图中文标签 + negative_prompt 强化 text ban，重跑笑傲江湖未复现 |
 | **B7 名人题材 Image audit fail** | ★★★ P0 | ? | **blocked** | 2026-05-22 诊断：科比/NBA 题材 GPT_IMAGE_2 画真人+商标 → WeryAI 平台 Image asset audit 拦截全部 task。DOUBAO spike 验证：跨端点 fallback 无效（同 audit 服务）。**唯一路径：避免 GPT_IMAGE_2 画名人脸+商标**（重写 step6 prompt 抽象化 / 直接放弃现代名人题材）|
+| **B8 历史顾问条件触发** | ★★ P1 | 30min | planned | _adsd_immersion_qa_rewrite_turns 默认对所有题材跑，可能把现代题材角色误替换（云计算工程师→画师）+ 跟 B5 sweep 重叠。修：按 topic_decomposition era 字段，仅 historical_*/period_* 才跑 |
+| ~~**B9 B-roll 出戏**~~ | ~~★★★ P1~~ | ~~2.5h~~ | ✅ shipped 2026-05-25 | A: _broll_rhythm_reviewer LLM 节奏审稿 (keep/merge/rewrite/relocate 决策) · B: script-gen prompt 加 silent_b/narrated_b shot 必须继承前 turn 视觉元素铁律 · 同时收紧 max_narrated 3→2 / silent_b 占比 20-35%→15-25% · env ADR_BROLL_REVIEWER 控制 |
 | ~~**B4 武戏无 SFX 配音**~~ | ~~★★ P1~~ | ~~2h~~ | ✅ shipped 2026-05-23 | action_b generate_audio=true + SFX_DIRECTIVE prompt · 西游记 turn 4 验证通过 |
 | ~~**B5 LLM 把场景描述当 speaker**~~ | ~~★★ P1~~ | ~~1h~~ | ✅ shipped 2026-05-21 | prompt 加 speaker 铁律 + _sweep_speaker_field 后处理 (bad_keywords 检测 + 从 bad speaker 提取已知角色 + role_candidates fallback) · 7/7 case 通过 |
 | ~~**B6 短喊招漏关键词**~~ | ~~★ P2~~ | ~~15min~~ | ✅ shipped 2026-05-21 | _is_action_shout 加 再来/换我/还击/反攻/拦住/挡住/拼了/决胜 等 16 个攻势/反击/换场词 · 6/6 case 通过 |
