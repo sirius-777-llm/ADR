@@ -2984,8 +2984,66 @@ def _adsd_visual_contract(speaker: str, lip_sync: bool | None = None, gender: st
     )
 
 
+def _maybe_neutralize_topic(topic: str) -> str:
+    """R2 阶段 C+ (2026-05-26): audit_risk_score >= 75 时 LLM 改写 topic 替换名人/品牌.
+
+    保留题材内核 (训练偏执/绝杀/曼巴精神) + 替换具体名 (科比 → 篮球巨星).
+    audit_risk < 75 直接返回原 topic 不改.
+    env ADR_NEUTRALIZE_HIGH_RISK_TOPIC=0 关闭."""
+    if os.environ.get("ADR_NEUTRALIZE_HIGH_RISK_TOPIC", "1").strip().lower() in ("0", "false", "no", "off"):
+        return topic
+    decomp = _llm_topic_decomposition(topic) or {}
+    # defensive int parse (codex 审查同款 fix)
+    raw_score = decomp.get("audit_risk_score")
+    score = 30
+    if isinstance(raw_score, (int, float)):
+        score = max(0, min(100, int(raw_score)))
+    elif isinstance(raw_score, str):
+        try:
+            m = re.search(r"\d+", raw_score)
+            if m:
+                score = max(0, min(100, int(m.group())))
+            elif "high" in raw_score.lower() or "高" in raw_score:
+                score = 80
+        except Exception:
+            pass
+    if score < 75:
+        return topic
+    log(f"R2 C+ neutralize: audit_risk={score} >= 75，LLM 改写 topic")
+    prompt = f"""你是 AI 视频脱敏编辑。以下 topic 因含「现代真人/商标/版权 IP」会触发平台审核拦截，请改写。
+
+原 topic: 「{topic}」
+
+改写规则:
+1. **核心精神/概念保留** (e.g. 曼巴精神 / 训练偏执 / 决战 / 退役)
+2. 删除具体真名 (科比、布莱恩特、Bryant → 「篮球传奇」「黑曼巴战士」)
+3. 删除商标/球队/商业品牌 (Lakers、NBA、Tesla、iPhone → 「职业联赛」「科技公司」)
+4. 删除政治领导人具名 (Trump → 「美国总统」)
+5. 题材气质完全保留: 武戏密度 / 文戏深度 / 情感曲线 不变
+6. 输出 1 行新 topic 中文, 40-80 字, 包含 4-6 个关键概念
+
+只输出新 topic 字符串，不要解释/引号/markdown。"""
+    try:
+        raw = chat("GEMINI_25_FLASH", "你只输出 1 行新 topic 文本，不加任何解释。", prompt, max_tokens=200, timeout=45)
+        new_topic = (raw or "").strip().strip('"').strip("'").splitlines()[0].strip()[:200]
+        # 防御: 改完比原还短不到一半 → 失败回退
+        if new_topic and len(new_topic) >= max(20, len(topic) // 3):
+            return new_topic
+        log(f"R2 C+ neutralize 输出太短 ({len(new_topic)}字), 回退原 topic")
+    except Exception as e:
+        log(f"R2 C+ neutralize 异常 (回退原 topic): {e}")
+    return topic
+
+
 def step1_script(topic: str) -> list[dict]:
     fmt_label = f"{ADSD_MODE_NAME} {'9:16' if IS_VERTICAL else '16:9'}" if ADS_DIALOGUE_MODE else ("VDAR 9:16" if IS_VERTICAL else "HDAR 16:9")
+    # R2 阶段 C+ (2026-05-26): 高危题材 audit_risk_score >= 75 自动 LLM 改写 topic
+    # 把现代名人/品牌名换成职业代称，绕开 WeryAI Image audit 死局
+    original_topic = topic
+    topic = _maybe_neutralize_topic(topic)
+    if topic != original_topic:
+        tg(f"🛡 高危题材自动改写 (B7 audit 规避)\n原: {original_topic[:50]}...\n改: {topic[:50]}...\n下游用改写版生成")
+        log(f"R2 C+ topic neutralized: '{original_topic[:60]}' → '{topic[:60]}'")
     tg(f"🎬 ADR V8 启动\n主题：{topic}\n格式：{fmt_label}\n\n斯皮尔伯格正在撰写台词...")
     log(f"开始处理：{topic} [{fmt_label}]")
 
