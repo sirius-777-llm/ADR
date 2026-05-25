@@ -123,7 +123,8 @@ LLM 角色团队从「各跑各的」升级为「真正协作」+ 专业化分�
 | ~~**阶段 E · 自动 IP 进化**~~ | ~~2h~~ | ✅ shipped 2026-05-25 | tools/evolve_ips.py 扫历史 run 算 IP fitness · <60% 自动重孵化 (删 grid+清 cache+标 needs_reincubate) · >=90% production_ready · 6 attempt 阈值防新 IP 误判 · 实测: 科比 0% reincubate / 唐僧/孙悟空/旁白/曹操/紫霞 production_ready |
 | ~~**阶段 C+ · 高危题材 LLM 改写**~~ | ~~1h~~ | 🟡 shipped 2026-05-26 (default-off) | _maybe_neutralize_topic LLM 改写高危题材替换名人/品牌 · 实测科比 7/12 pass + 1 SFX 通过但视频 5 cover 兜底不能看 · 改 opt-in: ADR_NEUTRALIZE_HIGH_RISK_TOPIC=1 显式启用 |
 | ~~**阶段 C++ · Hard+Smart Abort**~~ | ~~30min~~ | ✅ shipped 2026-05-26 | A: step1 检 audit_risk>=75 直接 raise + TG 提示改题材 (省 30min credits) · B: step66 A-roll fail>=50% 或 total fail>=60% 自动 kill · _parse_risk_score helper 防 NaN/Infinity 抓最大数字 + 关键词优先 · codex 审查通过 |
-| ~~**R3 · 题材推荐器**~~ | ~~1h~~ | ✅ shipped 2026-05-26 | tools/topic_recommender.py 扫历史 fitness 数据 · n-gram 提取 topic 关键词聚类 · 自动识别 elite (>=80) 题材模式 + failed (<30) 模式 · --next 推下一个题材方向 · 真正「适者生存」: 系统自己学会做什么 |
+| ~~**R3 · 题材推荐器**~~ | ~~1h~~ | ✅ shipped 2026-05-26 | tools/topic_recommender.py 扫历史 fitness 数据 · sliding window n-gram + Jaccard 聚类 + confidence 标记 · 自动识别 elite (>=80) 题材模式 + failed (<30) 模式 · --next 推下一个题材 · codex 审 5 fix |
+| ~~**R4 · Batch 演化 Runner**~~ | ~~1h~~ | ✅ shipped 2026-05-26 | tools/evolve_runner.py 闭环达尔文 · 读 R3 elite 关键词 + LLM 生成 N 个新题材(变异) · 自动跑 ADR(选择) · 跑完自动 evolve_ips + learn_audit_blacklist(遗传) · argparse + --max-hours 全局 budget · _validate_topics 验证 LLM 输出 · 实测生成「蟠桃偷渡客紫霞泪未干」继承 elite 气质 |
 | **阶段 D · Multi-arm Bandit prompt** | 4h | ★★ | planned (Round 3) | 每个 prompt 函数维护 3 个变体 · epsilon-greedy 选 (90% best, 10% explore) · variant 表现存数据库 · 月度 review 删差 variant |
 | **阶段 F · Batch 自动跑 daemon** | 1h | ★ | planned (Round 4) | tools/evolve_run.py daemon · 每天 03:00 自动跑 3-5 个题材 · 跑完自动 audit + 黑名单更新 + IP 重孵化 · TG 推送报告 |
 
