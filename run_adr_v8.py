@@ -7530,14 +7530,20 @@ def _adsd_meta_grid_call_prompt(scene: dict) -> str:
 
 
 def _meta_grid_panel_index(speaker: str, costume: str, pose: str) -> tuple[int, str]:
-    """根据 costume + pose 推断 meta_grid 中对应 panel 的位置 (1-based index + 位置描述)。
+    """根据 costume + pose 推断 meta_grid 中对应 panel 的位置 (1-based index + 位置描述).
+    B11 (2026-05-26): 适配 IS_VERTICAL 双布局.
 
-    grid 布局 (4 cols × 3 rows):
+    横屏 grid 布局 (4 cols × 3 rows):
       Row 1 (panels 01-04): 4 个 costume × neutral pose (说话)
       Row 2 (panels 05-08): 4 个 pose 不同 (角色动作)
       Row 3 (panels 09-12): 场景空镜 (无人脸)
 
-    优先按 costume 推断 column (1-4)，按 pose 推断 row (1 or 2)。"""
+    竖屏 grid 布局 (3 cols × 4 rows):
+      Row 1 (panels 01-03): 3 个 wardrobe (中性 pose)
+      Row 2 (panels 04-06): 3 个 action pose
+      Row 3 (panels 07-09): 3 个 facial close-up
+      Row 4 (panels 10-12): 3 个 scene (无人脸)
+    """
     template = None
     ip = _match_speaker_ip(speaker) if speaker else None
     if ip:
@@ -7548,23 +7554,51 @@ def _meta_grid_panel_index(speaker: str, costume: str, pose: str) -> tuple[int, 
         template = ERA_TEMPLATES.get("default") or {}
     costumes = template.get("costume_variants") or []
     poses = template.get("poses") or []
-    col_idx = 0  # 0-based column
-    for i, c in enumerate((costumes + [""] * 4)[:4]):
-        if c and c == costume:
-            col_idx = i
-            break
-    row_idx = 0  # 0=row 1, 1=row 2 (角色 panel)
-    # pose 索引 0-2 在 row 1，3-5 在 row 2 (按 grid prompt 约定)
-    for i, p in enumerate((poses + [""] * 6)[:6]):
-        if p and p == pose:
-            row_idx = 0 if i < 3 else 1
-            break
-    panel_idx = row_idx * 4 + col_idx + 1
-    positions = [
-        "top-left", "top center-left", "top center-right", "top-right",
-        "middle-left", "middle center-left", "middle center-right", "middle-right",
-        "bottom-left", "bottom center-left", "bottom center-right", "bottom-right",
-    ]
+
+    if IS_VERTICAL:
+        # 竖屏 3 cols × 4 rows: col_idx = costume_index mod 3 (4 costume 折叠到 3 列)
+        # row 0=wardrobe (说话/中性 pose) / 1=action / 2=close-up / 3=scene
+        col_idx = 0
+        for i, c in enumerate(costumes[:4]):  # 看 4 个 costume 而不是 3 个 (codex fix C3 漏定位)
+            if c and c == costume:
+                col_idx = i % 3  # 折叠到 0-2 列
+                break
+        # pose 池约定: index 0 是「说话/中性」, 1-3 是 action, 4-5 是 close-up
+        row_idx = 0  # 默认 wardrobe row
+        for i, p in enumerate((poses + [""] * 6)[:6]):
+            if p and p == pose:
+                if i == 0:
+                    row_idx = 0  # 「说话」类中性 → wardrobe
+                elif i <= 3:
+                    row_idx = 1  # action
+                else:
+                    row_idx = 2  # close-up
+                break
+        panel_idx = row_idx * 3 + col_idx + 1
+        positions = [
+            "top-left", "top-center", "top-right",
+            "row2-left", "row2-center", "row2-right",
+            "row3-left", "row3-center", "row3-right",
+            "bottom-left", "bottom-center", "bottom-right",
+        ]
+    else:
+        # 横屏 4 cols × 3 rows (原版)
+        col_idx = 0
+        for i, c in enumerate((costumes + [""] * 4)[:4]):
+            if c and c == costume:
+                col_idx = i
+                break
+        row_idx = 0
+        for i, p in enumerate((poses + [""] * 6)[:6]):
+            if p and p == pose:
+                row_idx = 0 if i < 3 else 1
+                break
+        panel_idx = row_idx * 4 + col_idx + 1
+        positions = [
+            "top-left", "top center-left", "top center-right", "top-right",
+            "middle-left", "middle center-left", "middle center-right", "middle-right",
+            "bottom-left", "bottom center-left", "bottom center-right", "bottom-right",
+        ]
     panel_pos = positions[panel_idx - 1] if 1 <= panel_idx <= 12 else "top-left"
     return panel_idx, panel_pos
 
@@ -8000,9 +8034,11 @@ def _character_meta_grid_cache_dir() -> Path:
 
 
 def _character_meta_grid_cache_path(speaker: str) -> Path:
-    """speaker 的 meta_grid 跨 run 缓存路径。"""
+    """speaker 的 meta_grid 跨 run 缓存路径.
+    B11 (2026-05-26): 横竖屏分开存防 cross-aspect 污染."""
     safe = re.sub(r"[^一-龥A-Za-z0-9]", "", speaker)[:30] or "speaker"
-    return _character_meta_grid_cache_dir() / f"{safe}.png"
+    suffix = "_v" if IS_VERTICAL else "_h"
+    return _character_meta_grid_cache_dir() / f"{safe}{suffix}.png"
 
 
 def _character_meta_grid_path(speaker: str) -> Path:
@@ -8063,49 +8099,77 @@ def generate_character_meta_grid_gpt_image2(speaker: str, visual_subject: str, v
     scenes = (scenes * 4)[:4]
     era_label = template.get("era", "general")
     # 2026-05-24 重构：参考 strength04_x meta_grid，panel 内 100% 纯图无文字
-    # 旧版把中文标签叠在 cell 上 → WERYDANCE 复刻进生成视频造成内嵌字幕 bug
-    # 新版: 12 panel 纯电影画面，召唤靠 panel index + 视觉描述匹配
-    # 行 1: 4 个不同 costume (说话/中性姿态)
-    # 行 2: 4 个不同 pose (同角色不同动作)
-    # 行 3: 4 个空场景 (无人脸 / 环境氛围)
-    cell_lines = [
-        f"Row 1 — 4 wardrobe variants (mid-shot, neutral expressive pose):",
-        f"  panel 01: {speaker}, {costumes[0]}, {poses[0]}, cinematic mid-shot.",
-        f"  panel 02: {speaker}, {costumes[1]}, {poses[0]}, cinematic mid-shot.",
-        f"  panel 03: {speaker}, {costumes[2]}, {poses[1]}, cinematic mid-shot.",
-        f"  panel 04: {speaker}, {costumes[3]}, {poses[2]}, cinematic mid-shot.",
-        f"Row 2 — 4 action poses (same character, varied wardrobe):",
-        f"  panel 05: {speaker}, {costumes[0]}, {poses[3]}, expressive moment.",
-        f"  panel 06: {speaker}, {costumes[1]}, {poses[4]}, expressive moment.",
-        f"  panel 07: {speaker}, {costumes[2]}, {poses[5]}, expressive moment.",
-        f"  panel 08: {speaker}, {costumes[3]}, {poses[2]}, intimate facial close-up.",
-        f"Row 3 — 4 scene establishing shots (NO character face in these 4 panels):",
-        f"  panel 09: {scenes[0]}, wide establishing, atmospheric, no people facing camera.",
-        f"  panel 10: {scenes[1]}, environmental detail.",
-        f"  panel 11: {scenes[2]}, location atmosphere.",
-        f"  panel 12: {scenes[3]}, wide context.",
-    ]
+    # B11 (2026-05-26): 竖屏 (VDAR/VADSD) 用 3 cols × 4 rows + 9:16 aspect, 横屏 4 × 3 + 16:9
+    if IS_VERTICAL:
+        # 竖屏布局: 3 cols × 4 rows = 12 panel, 整体 9:16
+        # Row 1 (3 wardrobe), Row 2 (3 pose), Row 3 (3 emotion close-up), Row 4 (3 scene)
+        cell_lines = [
+            f"Row 1 — 3 wardrobe variants (vertical portrait framing, head-to-waist):",
+            f"  panel 01: {speaker}, {costumes[0]}, {poses[0]}, vertical portrait, head-to-waist.",
+            f"  panel 02: {speaker}, {costumes[1]}, {poses[0]}, vertical portrait, head-to-waist.",
+            f"  panel 03: {speaker}, {costumes[2]}, {poses[1]}, vertical portrait, head-to-waist.",
+            f"Row 2 — 3 action poses (vertical portrait, same character):",
+            f"  panel 04: {speaker}, {costumes[3]}, {poses[2]}, vertical action, expressive moment.",
+            f"  panel 05: {speaker}, {costumes[0]}, {poses[3]}, vertical action.",
+            f"  panel 06: {speaker}, {costumes[1]}, {poses[4]}, vertical action.",
+            f"Row 3 — 3 facial/emotion close-ups (vertical portrait):",
+            f"  panel 07: {speaker}, {costumes[2]}, {poses[5]}, vertical facial close-up.",
+            f"  panel 08: {speaker}, {costumes[3]}, {poses[2]}, vertical intimate close-up.",
+            f"  panel 09: {speaker}, {costumes[0]}, {poses[1]}, vertical reflective close-up.",
+            f"Row 4 — 3 scene establishing shots (vertical orientation, NO character face):",
+            f"  panel 10: {scenes[0]}, vertical wide establishing, atmospheric, no people facing camera.",
+            f"  panel 11: {scenes[1]}, vertical environmental detail.",
+            f"  panel 12: {scenes[2]}, vertical location atmosphere.",
+        ]
+        grid_cols, grid_rows = 3, 4
+        layout_aspect = "each panel 3:4 portrait"
+        canvas_aspect = "9:16(4k)"
+        position_hint = "top-left=01, top-right=03, row2-left=04, ..., bottom-right=12"
+    else:
+        # 横屏布局 (原版): 4 cols × 3 rows = 12 panel, 整体 16:9
+        cell_lines = [
+            f"Row 1 — 4 wardrobe variants (mid-shot, neutral expressive pose):",
+            f"  panel 01: {speaker}, {costumes[0]}, {poses[0]}, cinematic mid-shot.",
+            f"  panel 02: {speaker}, {costumes[1]}, {poses[0]}, cinematic mid-shot.",
+            f"  panel 03: {speaker}, {costumes[2]}, {poses[1]}, cinematic mid-shot.",
+            f"  panel 04: {speaker}, {costumes[3]}, {poses[2]}, cinematic mid-shot.",
+            f"Row 2 — 4 action poses (same character, varied wardrobe):",
+            f"  panel 05: {speaker}, {costumes[0]}, {poses[3]}, expressive moment.",
+            f"  panel 06: {speaker}, {costumes[1]}, {poses[4]}, expressive moment.",
+            f"  panel 07: {speaker}, {costumes[2]}, {poses[5]}, expressive moment.",
+            f"  panel 08: {speaker}, {costumes[3]}, {poses[2]}, intimate facial close-up.",
+            f"Row 3 — 4 scene establishing shots (NO character face in these 4 panels):",
+            f"  panel 09: {scenes[0]}, wide establishing, atmospheric, no people facing camera.",
+            f"  panel 10: {scenes[1]}, environmental detail.",
+            f"  panel 11: {scenes[2]}, location atmosphere.",
+            f"  panel 12: {scenes[3]}, wide context.",
+        ]
+        grid_cols, grid_rows = 4, 3
+        layout_aspect = "each panel 4:3"
+        canvas_aspect = "16:9(4k)"
+        position_hint = "top-left=01, top-right=04, middle-left=05, ..., bottom-right=12"
+
     grid_prompt = (
-        f"Generate a 4-column × 3-row character casting sheet, 12 distinct cinematic panels, "
+        f"Generate a {grid_cols}-column × {grid_rows}-row character casting sheet, 12 distinct cinematic panels, "
         f"editorial luxury pitch-deck layout with clean thin gold dividers between panels.\n"
         f"Main subject: {subject} ({speaker} archetype, gender {voice_gender}, era={era_label}).\n\n"
         f"★ CRITICAL — ABSOLUTELY NO TEXT IN ANY PANEL: \n"
         f"   Every panel must be a 100% pure cinematic photograph. \n"
         f"   NO labels, NO captions, NO numbers, NO Chinese characters, NO English text, \n"
         f"   NO chyron, NO watermark, NO speech bubbles, NO on-screen typography of any kind. \n"
-        f"   The 12 panels are purely visual — they will be identified by position (top-left=01, "
-        f"   top-right=04, middle-left=05, ..., bottom-right=12), not by any printed label. \n"
+        f"   The 12 panels are purely visual — they will be identified by position ({position_hint}), "
+        f"not by any printed label. \n"
         f"   Treat this as a luxury fashion editorial spread where panels speak through image alone.\n\n"
-        f"Layout (each panel 4:3, evenly spaced grid):\n{chr(10).join(cell_lines)}\n\n"
-        f"Style continuity: same character identity / face / body type across panels 01-08; "
+        f"Layout ({layout_aspect}, evenly spaced grid):\n{chr(10).join(cell_lines)}\n\n"
+        f"Style continuity: same character identity / face / body type across all character panels; "
         f"era={era_label} consistent wardrobe; cinematic film grain, motivated lighting, "
-        f"editorial composition. Panels 09-12 are pure environment, no people facing camera.\n"
+        f"editorial composition. Scene panels are pure environment, no people facing camera.\n"
         f"Strictly era={era_label} — no anachronistic clothing / props / lighting."
     )
     payload = {
         "model": "GPT_IMAGE_2",
         "prompt": grid_prompt,
-        "aspect_ratio": "16:9(4k)",
+        "aspect_ratio": canvas_aspect,
         "image_number": 1,
         "quality": "high",
     }
