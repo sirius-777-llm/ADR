@@ -173,7 +173,7 @@ python3 run_adr_v8.py "唐宋八大家" h --no-motion          # 罕用：HADR �
 每次改管线后至少验证：
 
 - `python3 -m py_compile run_adr_v8.py`
-- HADS 不带 `--ads-reporter` 时，日志必须显示 `HDAR/VDAR`，不能出现“拟现场记者”。
+- HADS/VADS 不带 `--ads-reporter` 时，日志必须显示 `HADS/VADS`（或 `--no-motion` 下 `HADR/VADR`），不能出现"拟现场记者"。
 - `motion_qa.json` 里应记录参考图数量、字幕策略、音色策略。
 - storyboard crop QA 不能把两个分镜切在同一张输出里。
 - WeryDance 字幕失败时，ASS 兜底必须仍能合成。

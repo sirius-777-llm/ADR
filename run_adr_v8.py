@@ -960,6 +960,16 @@ ADS_RETENTION_MODE = (
 
 ADSD_MODE_NAME = ("VADSD" if IS_VERTICAL else "HADSD") if ADS_DIALOGUE_MODE else ""
 
+# B12.2 (2026-05-26): 模式短标统一 helper, 让显示/文件名/QA json 都吃同一份命名
+# 映射: ADSD → HADSD/VADSD; WITH_MOTION → HADS/VADS; 否则 → HADR/VADR
+if ADS_DIALOGUE_MODE:
+    CURRENT_MODE_LABEL = ADSD_MODE_NAME
+elif WITH_MOTION:
+    CURRENT_MODE_LABEL = "VADS" if IS_VERTICAL else "HADS"
+else:
+    CURRENT_MODE_LABEL = "VADR" if IS_VERTICAL else "HADR"
+CURRENT_MODE_WITH_ASPECT = f"{CURRENT_MODE_LABEL} {'9:16' if IS_VERTICAL else '16:9'}"
+
 # ADSD_VOICES / ADSD_MALE_VOICE_POOL / ADSD_FEMALE_VOICE_POOL 等
 # 已抽到 adr_data/voices.py（顶部已 import）
 
@@ -1038,7 +1048,7 @@ ADS_RETENTION_VISUAL_GUIDE = """
 • 仍然遵守事实、年代、服饰、器物一致性；吸引播放量不等于制造穿帮或低质标题党。
 """
 
-# --speaker <id[:name]> 指定 Podcast 音色（覆盖 VDAR 默认晓曼 / LLM 自选）
+# --speaker <id[:name]> 指定 Podcast 音色（覆盖 VADS/VADR 竖屏默认晓曼 / LLM 自选）
 # 常用：gushijingling-720c0ae5:故事精灵（少儿）、chat-girl-105-cn:晓曼（温柔女声）、
 #       gaoqing3-bfb5c88a:高晴（明亮女声）、liyan2-ef9401ec:国栋（沉稳男声）
 SPEAKER_OVERRIDE_ID   = ""
@@ -3176,7 +3186,7 @@ def _maybe_neutralize_topic(topic: str) -> str:
 
 
 def step1_script(topic: str) -> list[dict]:
-    fmt_label = f"{ADSD_MODE_NAME} {'9:16' if IS_VERTICAL else '16:9'}" if ADS_DIALOGUE_MODE else ("VDAR 9:16" if IS_VERTICAL else "HDAR 16:9")
+    fmt_label = CURRENT_MODE_WITH_ASPECT  # B12.2: HADS/VADS/HADR/VADR/HADSD/VADSD
     # R2 阶段 C++ (2026-05-26): Hard Abort 高危题材
     # audit_risk_score >= 75 直接 raise, 不浪费 30min 跑废片
     # env ADR_HIGH_RISK_HARD_ABORT=0 关闭硬阻断
@@ -4043,13 +4053,13 @@ THUMBNAIL_ANCHOR: Air Force One stairs, black leather jacket figure, glowing chi
 
 只输出一行 JSON：{{"speaker_id": "xxx", "speaker_name": "xxx", "reason": "一句话理由"}}"""
 
-    # 音色选择优先级：--speaker 显式指定 > VDAR 竖屏默认晓曼 > LLM 自选 > 硬编码兜底
+    # 音色选择优先级：--speaker 显式指定 > 竖屏 (VADS/VADR) 默认晓曼 > LLM 自选 > 硬编码兜底
     if SPEAKER_OVERRIDE_ID:
         picked_id = SPEAKER_OVERRIDE_ID
         picked_name = SPEAKER_OVERRIDE_NAME
         tg(f"🎤 用户指定音色：{picked_name}（{picked_id}）")
     elif IS_VERTICAL:
-        # 竖屏 VDAR 默认女声（面向中老年受众）
+        # 竖屏 (VADS/VADR) 默认女声（面向中老年受众）
         picked_id = "chat-girl-105-cn"
         picked_name = "晓曼"
         tg(f"🎤 竖屏模式，使用女声：{picked_name}")
@@ -6232,7 +6242,7 @@ def _write_text_visual_alignment_qa(script: list[dict]) -> dict:
     records = [_scene_text_visual_alignment(scene, i) for i, scene in enumerate(script)]
     failed = [r for r in records if not r.get("pass")]
     payload = {
-        "mode": ADSD_MODE_NAME if ADS_DIALOGUE_MODE else ("VDAR" if IS_VERTICAL else "HDAR"),
+        "mode": CURRENT_MODE_LABEL,
         "policy": "warn_on_dialogue_visual_prompt_mismatch",
         "total": len(records),
         "failed_count": len(failed),
@@ -8109,7 +8119,7 @@ def generate_character_meta_grid_gpt_image2(speaker: str, visual_subject: str, v
     scenes = (scenes * 4)[:4]
     era_label = template.get("era", "general")
     # 2026-05-24 重构：参考 strength04_x meta_grid，panel 内 100% 纯图无文字
-    # B11 (2026-05-26): 竖屏 (VDAR/VADSD) 用 3 cols × 4 rows + 9:16 aspect, 横屏 4 × 3 + 16:9
+    # B11 (2026-05-26): 竖屏 (VADS/VADR/VADSD) 用 3 cols × 4 rows + 9:16 aspect, 横屏 4 × 3 + 16:9
     if IS_VERTICAL:
         # 竖屏布局: 3 cols × 4 rows = 12 panel, 整体 9:16
         # Row 1 (3 wardrobe), Row 2 (3 pose), Row 3 (3 emotion close-up), Row 4 (3 scene)
@@ -9378,7 +9388,7 @@ def step6_parallel(script: list[dict], topic: str, pregenerated_bgm_path: str | 
             anomaly_idxs = _llm_check_scenes_anomalies(script)
             qa_path = OUTPUT_DIR / "scene_qa.json"
             qa_payload = {
-                "mode": ADSD_MODE_NAME if ADS_DIALOGUE_MODE else ("VDAR" if IS_VERTICAL else "HDAR"),
+                "mode": CURRENT_MODE_LABEL,
                 "total": n,
                 "anomaly_indices": sorted(int(i) for i in anomaly_idxs),
                 "anomaly_scene_numbers": sorted(int(i) + 1 for i in anomaly_idxs),
@@ -9390,7 +9400,7 @@ def step6_parallel(script: list[dict], topic: str, pregenerated_bgm_path: str | 
             except Exception as e:
                 log(f"scene_qa.json 写入失败: {e}")
             if anomaly_idxs:
-                mode_name = ADSD_MODE_NAME if ADS_DIALOGUE_MODE else ("VDAR" if IS_VERTICAL else "HDAR")
+                mode_name = CURRENT_MODE_LABEL
                 tg(
                     f"⚠️ {mode_name} 场景 QA 提醒：Vision 标记 {len(anomaly_idxs)} 张疑似异常 "
                     f"{sorted(i+1 for i in anomaly_idxs)}，已记录 {qa_path.name}；免审核模式不等待人工确认，继续合成"
@@ -14943,7 +14953,7 @@ def step9_render(raw_path: str, voice_path: str, bgm_path: str | None, ass_path:
         except Exception as e:
             log(f"音画同步修正失败（使用原视频）：{e}")
 
-    fmt_tag = ADSD_MODE_NAME if ADS_DIALOGUE_MODE else ("VDAR" if IS_VERTICAL else "HDAR")
+    fmt_tag = CURRENT_MODE_LABEL
     final_path = str(OUTPUT_DIR / f"ADR_V8_{fmt_tag}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.mp4")
     ass_escaped = ass_path.replace("\\", "/").replace(":", "\\:") if ass_path else ""
     vf_base = f"scale={VIDEO_W}:{VIDEO_H},setsar=1,setdar={ASPECT_RATIO},tpad=stop_mode=clone:stop_duration=1.5"
@@ -16709,7 +16719,7 @@ def step10_deliver(final_path: str, topic: str, script: list[dict]):
 def _print_execution_plan() -> None:
     """启动时打印本次 run 会激活哪些可选模块 + 预估时间/credits。
     目的：开 mode flag 时让"无消费方但仍激活的浪费"立刻可见，避免我（PM）忘记 short-circuit。"""
-    fmt = "VDAR 9:16" if IS_VERTICAL else "HDAR 16:9"
+    fmt = CURRENT_MODE_WITH_ASPECT
     # (模块名, 是否激活, 预估时间 min, 预估 credits, 说明)
     plan: list[tuple[str, bool, str, str, str]] = [
         ("Step1 剧本+视觉规划", True, "1-2", "0", "LLM 链 (Gemini/Claude)"),
