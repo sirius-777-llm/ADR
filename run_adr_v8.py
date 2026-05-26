@@ -793,12 +793,13 @@ DEFAULT_MALE_VOICE_ASSET = os.environ.get("ADR_DEFAULT_MALE_VOICE_ASSET", ADSD_D
 
 # B10 (2026-05-26): podcast_id (step1 picked_id) → voice_asset_id (音色库 wav)
 # 音色库 reference_audios 必须存在该 asset_id, 否则 fallback gender
-# 当前映射: 主要男女各 1 个 default + 知名播音
+# codex 审查 fix: 补全 voice_prompt 列出的所有候选 + 兼容 podcast 平台变体 id
 _PODCAST_TO_VOICE_ASSET_MAP = {
     # 女声
     "chat-girl-105-cn": "external_by2_e7gn_001",     # 晓曼 → BY2 (柔甜女声)
     "gaoqing3-bfb5c88a": "external_by2_e7gn_001",    # 高晴 → BY2
     "shuoshurennan-b09f844f": "external_by2_e7gn_001",  # 柳飞霜 → BY2
+    "shuoshurennan-fdfa85f9": "external_by2_e7gn_001",  # 柳飞霜变体 → BY2
     # 男声
     "liyan2-ef9401ec": "external_luo_xiang_xyma_001",  # 国栋 → 罗翔 (沉稳)
     "liyan3-f74976d9": "external_liang_wendao_yt_001",  # 子墨 → 梁文道 (儒雅)
@@ -806,15 +807,27 @@ _PODCAST_TO_VOICE_ASSET_MAP = {
     "CN-Man-Beijing-V2": "external_luo_xiang_xyma_001",  # 原野 → 罗翔
     "gushijingling-720c0ae5": "external_xu_zhiyuan_xyma_001",  # 故事精灵 → 许知远
     "suzhe-45bbbe54": "external_xu_zhiyuan_xyma_001",  # 苏哲 → 许知远 (知性)
+    "pingshu-c7c18f5a": "external_liang_wendao_yt_001",  # 评书 → 梁文道 (古风讲述)
 }
 
 
 def _podcast_id_to_voice_asset(podcast_id: str) -> str:
     """B10: 把 step1 picked_id (podcast format) 映射到 voice_asset_id (音色库).
-    映射失败回退 DEFAULT_MALE_VOICE_ASSET. 用于 ADS 全片锁定单一克隆音色 ref."""
+    映射失败回退 DEFAULT_MALE_VOICE_ASSET.
+    codex fix: 验证 fallback asset 在音色库存在, 否则强制硬编码 ADSD_DEFAULT_MALE_VOICE_ASSET."""
     if not podcast_id:
         return ""
-    return _PODCAST_TO_VOICE_ASSET_MAP.get(podcast_id, DEFAULT_MALE_VOICE_ASSET)
+    asset_id = _PODCAST_TO_VOICE_ASSET_MAP.get(podcast_id, DEFAULT_MALE_VOICE_ASSET)
+    # fallback safety: env 可能 override 成不存在的 id → 验证
+    try:
+        data = _load_voice_assets()
+        existing_ids = {a.get("voice_id") for a in data.get("assets", []) if a.get("voice_id")}
+        if asset_id not in existing_ids:
+            log(f"B10 _podcast_id_to_voice_asset: {asset_id} 不在音色库 → 硬兜底 {ADSD_DEFAULT_MALE_VOICE_ASSET}")
+            return ADSD_DEFAULT_MALE_VOICE_ASSET  # 已知存在
+    except Exception:
+        pass
+    return asset_id
 
 DEFAULT_FEMALE_VOICE_ASSET = os.environ.get("ADR_DEFAULT_FEMALE_VOICE_ASSET", ADSD_DEFAULT_FEMALE_VOICE_ASSET)
 DEFAULT_VOICE_ASSET = os.environ.get("ADR_DEFAULT_VOICE_ASSET", "").strip()
@@ -3996,21 +4009,17 @@ THUMBNAIL_ANCHOR: Air Force One stairs, black leather jacket figure, glowing chi
             picked_id = "liyan2-ef9401ec"
             picked_name = "国栋"
 
-    # B10 fix (2026-05-26): ADS 单旁白模式锁定 voice_asset 全片用
-    # step65 motion audio_dub 会调 _select_voice_asset_reference(scene, mode="motion")
-    # 默认 per-scene 走 gender fallback → 跨 scene asset 切换 → 多音色
-    # 修: step1 把 picked_id 映射到 voice_asset_id, 写入所有 scene["voice_asset_id"]
-    # 注: 只写 voice_asset_id 不写 voice_id (避免 podcast_id 串入 voice_asset 字段导致 asset 找不到)
+    # B10 fix (2026-05-26): ADS 单旁白模式 force lock voice_asset 全片用
+    # codex 审查 fix: ADSD 模式 scene 可能从 dialogue_meta 带 voice_asset_id (line 3932)
+    # ADS 单旁白模式应该 force override, 不能 setdefault 漏掉已有 voice_asset_id 的 scene
+    # 仅在 ADS 模式 (非 ADSD) 下 force lock
     ads_voice_asset_id = _podcast_id_to_voice_asset(picked_id)
-    if ads_voice_asset_id:
-        locked = 0
+    if ads_voice_asset_id and not ADS_DIALOGUE_MODE:
         for s in script:
-            if not s.get("voice_asset_id"):
-                s["voice_asset_id"] = ads_voice_asset_id
-                locked += 1
-        log(f"B10 ADS voice lock: picked_id={picked_id} → voice_asset={ads_voice_asset_id} 全片 {locked}/{len(script)} scene 锁定")
+            s["voice_asset_id"] = ads_voice_asset_id  # force override
+        log(f"B10 ADS voice lock: picked_id={picked_id} → voice_asset={ads_voice_asset_id} 全片 {len(script)} scene 锁定 (force)")
         try:
-            tg(f"🔒 ADS 单旁白锁定 voice_asset: {ads_voice_asset_id} ({locked}/{len(script)} scene)")
+            tg(f"🔒 ADS 单旁白锁定 voice_asset: {ads_voice_asset_id} (全片 {len(script)} scene)")
         except Exception:
             pass
 
