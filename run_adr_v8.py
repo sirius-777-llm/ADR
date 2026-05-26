@@ -147,7 +147,22 @@ IS_VERTICAL = VIDEO_FORMAT == "v"
 SKIP_APPROVAL = "--with-approval" not in sys.argv
 if "--skip-approval" in sys.argv:
     SKIP_APPROVAL = True  # 显式 skip 也支持
-WITH_MOTION = "--with-motion" in sys.argv  # 每分镜走 WERYDANCE_2_0 生成带运动视频，~2x 时长 + $0.3/scene
+ADS_DIALOGUE_MODE_EARLY_CHECK = (
+    "--ads-dialogue" in sys.argv
+    or "--adsd" in sys.argv
+    or os.environ.get("ADR_ADS_DIALOGUE", "").strip().lower() in ("1", "true", "yes", "on")
+)
+# B12 (2026-05-26): VDAR (竖屏 ADS 非 ADSD) 默认开 motion 动态化
+# 用户认知: VADS 默认就该动 (静态分镜叙述不算视频成品)
+# 加 --no-motion override 显式关
+WITH_MOTION = (
+    "--with-motion" in sys.argv
+    or (
+        IS_VERTICAL
+        and not ADS_DIALOGUE_MODE_EARLY_CHECK
+        and "--no-motion" not in sys.argv
+    )
+)  # 每分镜走 WERYDANCE_2_0 生成带运动视频，~2x 时长 + $0.3/scene
 BGM_ONLY_REQUESTED = (
     "--bgm-only" in sys.argv
     or "--no-tts" in sys.argv
