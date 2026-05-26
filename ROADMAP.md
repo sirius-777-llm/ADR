@@ -140,9 +140,29 @@ LLM 角色团队从「各跑各的」升级为「真正协作」+ 专业化分�
 | **B8 历史顾问条件触发** | ★★ P1 | 30min | planned | _adsd_immersion_qa_rewrite_turns 默认对所有题材跑，可能把现代题材角色误替换（云计算工程师→画师）+ 跟 B5 sweep 重叠。修：按 topic_decomposition era 字段，仅 historical_*/period_* 才跑 |
 | ~~**B9 B-roll 出戏**~~ | ~~★★★ P1~~ | ~~2.5h~~ | ✅ shipped 2026-05-25 | A: _broll_rhythm_reviewer LLM 节奏审稿 (keep/merge/rewrite/relocate 决策) · B: script-gen prompt 加 silent_b/narrated_b shot 必须继承前 turn 视觉元素铁律 · 同时收紧 max_narrated 3→2 / silent_b 占比 20-35%→15-25% · env ADR_BROLL_REVIEWER 控制 |
 | ~~**B10 ADS 单旁白多音色**~~ | ~~★★★ P1~~ | ~~1h~~ | ✅ shipped 2026-05-26 | **现象**: ADS (HADS/VADS) 单旁白模式跨 scene 音色不一致 · **Root cause**: step65 motion audio_dub `_select_voice_asset_reference` per-scene 走 gender fallback · **修**: 新增 `_PODCAST_TO_VOICE_ASSET_MAP` 映射 podcast_id → voice_asset_id · `_podcast_id_to_voice_asset` helper · step1_script 末尾把映射后 voice_asset 写入所有 script[i]["voice_asset_id"] · 复用现有 line 12527 优先级 (scene.voice_asset_id 高于 gender fallback) · 阶段 3 (跨 scene task 波动) 留 PR-A 合并跑根治 |
+| ~~**CCP v1.0 协同协议**~~ | ~~1.5h~~ | ✅ shipped 2026-05-26 | tools/codex_collab.py 4 阶段 CLI (review-spec/propose-alt/review-code/final-qa) · voice_assets/collab_history.json 跨 session 持久 · CLAUDE.md ADR-CCP 强制规则 · feedback memory feedback_adr_ccp_protocol · 让任何 Claude session 自动走协同, 不再单向 ship 后才 codex 审 |
 | ~~**B4 武戏无 SFX 配音**~~ | ~~★★ P1~~ | ~~2h~~ | ✅ shipped 2026-05-23 | action_b generate_audio=true + SFX_DIRECTIVE prompt · 西游记 turn 4 验证通过 |
 | ~~**B5 LLM 把场景描述当 speaker**~~ | ~~★★ P1~~ | ~~1h~~ | ✅ shipped 2026-05-21 | prompt 加 speaker 铁律 + _sweep_speaker_field 后处理 (bad_keywords 检测 + 从 bad speaker 提取已知角色 + role_candidates fallback) · 7/7 case 通过 |
 | ~~**B6 短喊招漏关键词**~~ | ~~★ P2~~ | ~~15min~~ | ✅ shipped 2026-05-21 | _is_action_shout 加 再来/换我/还击/反攻/拦住/挡住/拼了/决胜 等 16 个攻势/反击/换场词 · 6/6 case 通过 |
+
+---
+
+## 📋 协同 SOP · CCP v1.0 (2026-05-26)
+
+**CCP (Claude × Codex Protocol)** — 让任何 Claude session 跟 codex 全链路协同, 不再单向 ship 后才审.
+
+| Stage | 触发 | 工具 |
+|---|---|---|
+| 1 review-spec | 收到需求/bug | `tools/codex_collab.py review-spec --topic ... --context ...` |
+| 2 propose-alt | 出方案 A 后 | `tools/codex_collab.py propose-alt --topic ... --my-plan ...` |
+| 3 review-code | 改 3+ 文件 / 100+ 行 | `tools/codex_collab.py review-code --files ... --topic ...` |
+| 4 final-qa | ship 完 | `tools/codex_collab.py final-qa --topic ... --files ...` |
+
+**例外** (跳过 Stage 1-2): 5 行内 / 单文件 typo / 改文档.
+
+**持久化**: 每次协同写 `voice_assets/collab_history.json` 跨 session.
+
+**约束** (写进 feedback memory + CLAUDE.md): Claude 收到 ADR 需求自动走 CCP, 不能拍脑袋.
 
 ---
 
