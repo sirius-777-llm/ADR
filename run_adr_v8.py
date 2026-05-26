@@ -792,39 +792,57 @@ def _apply_llm_voice_assignment(turns: list[dict]) -> dict | None:
 DEFAULT_MALE_VOICE_ASSET = os.environ.get("ADR_DEFAULT_MALE_VOICE_ASSET", ADSD_DEFAULT_MALE_VOICE_ASSET)
 
 # B10 (2026-05-26): podcast_id (step1 picked_id) → voice_asset_id (音色库 wav)
-# 音色库 reference_audios 必须存在该 asset_id, 否则 fallback gender
-# codex 审查 fix: 补全 voice_prompt 列出的所有候选 + 兼容 podcast 平台变体 id
+# 2026-05-26 修订: 女声映射全部改说话类 (原 BY2 是「甜妹歌声音色」music_contaminated 导致跨 scene 克隆不稳)
 _PODCAST_TO_VOICE_ASSET_MAP = {
-    # 女声
-    "chat-girl-105-cn": "external_by2_e7gn_001",     # 晓曼 → BY2 (柔甜女声)
-    "gaoqing3-bfb5c88a": "external_by2_e7gn_001",    # 高晴 → BY2
-    "shuoshurennan-b09f844f": "external_by2_e7gn_001",  # 柳飞霜 → BY2
-    "shuoshurennan-fdfa85f9": "external_by2_e7gn_001",  # 柳飞霜变体 → BY2
+    # 女声 (全改说话类，不用歌声/音乐污染 asset)
+    "chat-girl-105-cn": "external_meng_man_yt_001",        # 晓曼 → 蒙曼 (学者女声/古典文化/清晰)
+    "gaoqing3-bfb5c88a": "external_zhang_quanling_yt_001", # 高晴 → 张泉灵 (主持转创业/清晰/知识)
+    "shuoshurennan-b09f844f": "external_meng_man_yt_001",  # 柳飞霜古风 → 蒙曼 (古典)
+    "shuoshurennan-fdfa85f9": "external_meng_man_yt_001",
     # 男声
-    "liyan2-ef9401ec": "external_luo_xiang_xyma_001",  # 国栋 → 罗翔 (沉稳)
-    "liyan3-f74976d9": "external_liang_wendao_yt_001",  # 子墨 → 梁文道 (儒雅)
+    "liyan2-ef9401ec": "external_luo_xiang_xyma_001",      # 国栋 → 罗翔 (沉稳)
+    "liyan3-f74976d9": "external_liang_wendao_yt_001",     # 子墨 → 梁文道 (儒雅)
     "zh-male-guchuan-9d6a4666": "external_duan_yihong_yt_001",  # 谷川 → 段奕宏 (低沉)
-    "CN-Man-Beijing-V2": "external_luo_xiang_xyma_001",  # 原野 → 罗翔
+    "CN-Man-Beijing-V2": "external_luo_xiang_xyma_001",    # 原野 → 罗翔
     "gushijingling-720c0ae5": "external_xu_zhiyuan_xyma_001",  # 故事精灵 → 许知远
-    "suzhe-45bbbe54": "external_xu_zhiyuan_xyma_001",  # 苏哲 → 许知远 (知性)
-    "pingshu-c7c18f5a": "external_liang_wendao_yt_001",  # 评书 → 梁文道 (古风讲述)
+    "suzhe-45bbbe54": "external_xu_zhiyuan_xyma_001",      # 苏哲 → 许知远 (知性)
+    "pingshu-c7c18f5a": "external_liang_wendao_yt_001",    # 评书 → 梁文道 (古风讲述)
 }
+
+# B10 防回归: 自动禁用的 quality_flags (歌声/音乐污染不适合说话克隆)
+# 注: not_speaker_diarized 太常见 (YouTube 抽取 wav 多数有), 不算禁忌
+_VOICE_ASSET_FORBIDDEN_FLAGS = {
+    "singing_not_speech",       # 显式标记歌声
+    "music_contaminated",       # 音乐污染 → 克隆带歌唱感
+    "not_vocal_separated",      # 未做人声分离 → 含背景音
+}
+
+
+def _voice_asset_is_speech_safe(asset: dict) -> bool:
+    """B10 防回归: 检查 asset 是否适合说话克隆 (无歌声/音乐污染 flag)."""
+    flags = set(asset.get("quality_flags") or [])
+    return not (flags & _VOICE_ASSET_FORBIDDEN_FLAGS)
 
 
 def _podcast_id_to_voice_asset(podcast_id: str) -> str:
     """B10: 把 step1 picked_id (podcast format) 映射到 voice_asset_id (音色库).
     映射失败回退 DEFAULT_MALE_VOICE_ASSET.
-    codex fix: 验证 fallback asset 在音色库存在, 否则强制硬编码 ADSD_DEFAULT_MALE_VOICE_ASSET."""
+    codex fix: 验证 fallback asset 在音色库存在, 否则强制硬编码 ADSD_DEFAULT_MALE_VOICE_ASSET.
+    防回归: 映射结果若含 forbidden quality_flags (歌声/音乐污染) → 强制 fallback."""
     if not podcast_id:
         return ""
     asset_id = _PODCAST_TO_VOICE_ASSET_MAP.get(podcast_id, DEFAULT_MALE_VOICE_ASSET)
-    # fallback safety: env 可能 override 成不存在的 id → 验证
     try:
         data = _load_voice_assets()
-        existing_ids = {a.get("voice_id") for a in data.get("assets", []) if a.get("voice_id")}
-        if asset_id not in existing_ids:
+        by_id = {a.get("voice_id"): a for a in data.get("assets", []) if a.get("voice_id")}
+        asset = by_id.get(asset_id)
+        if not asset:
             log(f"B10 _podcast_id_to_voice_asset: {asset_id} 不在音色库 → 硬兜底 {ADSD_DEFAULT_MALE_VOICE_ASSET}")
-            return ADSD_DEFAULT_MALE_VOICE_ASSET  # 已知存在
+            return ADSD_DEFAULT_MALE_VOICE_ASSET
+        # 防回归: 如果 mapping 结果是歌声/污染 asset, 强制 fallback 到 male default
+        if not _voice_asset_is_speech_safe(asset):
+            log(f"B10 _podcast_id_to_voice_asset: {asset_id} 含 forbidden quality_flags ({set(asset.get('quality_flags') or []) & _VOICE_ASSET_FORBIDDEN_FLAGS}) → 兜底 {ADSD_DEFAULT_MALE_VOICE_ASSET}")
+            return ADSD_DEFAULT_MALE_VOICE_ASSET
     except Exception:
         pass
     return asset_id
@@ -2913,8 +2931,37 @@ def _sweep_speaker_field(turns: list[dict], role_candidates: list[str]) -> None:
             pass
 
 
+def _should_run_immersion_qa(topic: str) -> tuple[bool, str]:
+    """B8 (2026-05-26): 决定是否对该 topic 跑沉浸感 LLM 审稿.
+
+    历史/古装题材跑: 防现代节目感角色出戏.
+    现代/科技/商业题材跳过: 防误把现代职业改成时代化角色 (云计算工程师→画师 这种荒谬).
+    依据 topic_decomposition.era 字段决策.
+    env ADR_IMMERSION_QA_ALL=1 强制所有题材都跑 (回到旧行为)."""
+    if os.environ.get("ADR_IMMERSION_QA_ALL", "0").strip().lower() in ("1", "true", "yes", "on"):
+        return True, "force_all"
+    try:
+        decomp = _llm_topic_decomposition(topic) or {}
+    except Exception as e:
+        log(f"B8 immersion QA gate: topic_decomposition 异常, 默认跑: {e}")
+        return True, f"decomp_error:{e}"
+    era = str(decomp.get("era") or "").strip().lower()
+    if not era:
+        return True, "era_missing_default_run"
+    historical_prefixes = ("historical_", "period_", "ancient_", "classical_", "qing_", "ming_", "song_", "tang_", "han_")
+    if any(era.startswith(p) for p in historical_prefixes) or "history" in era or "古" in era:
+        return True, f"historical_era:{era}"
+    return False, f"non_historical_skip:{era}"
+
+
 def _adsd_immersion_qa_rewrite_turns(topic: str, turns: list[dict], role_candidates: list[str]) -> list[dict]:
     """Use LLM judgment to keep ADSD roles immersive without hard-banning period news roles."""
+    # B8 (2026-05-26): 仅 historical/period 题材跑, 现代题材跳过防误替换
+    should_run, reason = _should_run_immersion_qa(topic)
+    if not should_run:
+        log(f"B8 immersion QA 跳过 (reason={reason}, topic={topic[:40]})")
+        return _finalize_adsd_turns(turns)
+    log(f"B8 immersion QA 启用 (reason={reason}, topic={topic[:40]})")
     try:
         # silent_b / narrated_b 不参与 immersion QA：silent 没台词、narrated 是旁白不算「现场角色」
         compact = [
@@ -5886,6 +5933,70 @@ def _detect_contact_sheet_like_image(path: str) -> dict:
 
 _weryai_upload_lock = threading.Lock()
 
+# CCP B-tier (2026-05-26): weryai upload sha256 缓存
+# 同一 voice_asset wav (e.g. external_meng_man_yt_001) 跨 run 重复上传浪费时间 + SSL 抖动失败
+# 按 sha256 缓存 URL, TTL 24h, 命中直接复用
+_UPLOAD_CACHE_PATH = Path(__file__).resolve().parent / "voice_assets" / "upload_cache.json"
+_UPLOAD_CACHE_TTL = 24 * 3600
+_upload_cache_lock = threading.Lock()
+
+
+def _file_sha256(path: str) -> str:
+    """计算文件 sha256, 防止读取大文件时内存爆."""
+    import hashlib
+    h = hashlib.sha256()
+    try:
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(65536), b""):
+                h.update(chunk)
+        return h.hexdigest()
+    except Exception:
+        return ""
+
+
+def _load_upload_cache() -> dict:
+    if not _UPLOAD_CACHE_PATH.exists():
+        return {}
+    try:
+        return json.loads(_UPLOAD_CACHE_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def _save_upload_cache(cache: dict) -> None:
+    try:
+        _UPLOAD_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        _UPLOAD_CACHE_PATH.write_text(json.dumps(cache, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception as e:
+        log(f"upload_cache 写入失败: {e}")
+
+
+def _cached_upload_url(sha256: str) -> str | None:
+    """codex 边界 fix: 命中 audit URL 是否还有效 (TTL + 非空)."""
+    if not sha256:
+        return None
+    cache = _load_upload_cache()
+    entry = cache.get(sha256)
+    if not entry:
+        return None
+    url = entry.get("url", "").strip()
+    ts = float(entry.get("ts", 0))
+    if not url:
+        return None
+    if time.time() - ts > _UPLOAD_CACHE_TTL:
+        return None  # 过期
+    return url
+
+
+def _store_upload_url(sha256: str, url: str) -> None:
+    """codex 边界 fix: 空 URL 不写, 防并发 dup 用 lock."""
+    if not sha256 or not url or not url.strip():
+        return
+    with _upload_cache_lock:
+        cache = _load_upload_cache()
+        cache[sha256] = {"url": url.strip(), "ts": time.time()}
+        _save_upload_cache(cache)
+
 
 def _guess_upload_mime(file_path: str) -> str:
     """Prefer file signatures over extensions because WeryAI image URLs may save PNG bytes as .jpg."""
@@ -5911,12 +6022,30 @@ def _guess_upload_mime(file_path: str) -> str:
 
 
 def _upload_to_weryai(file_path: str) -> str:
-    """Upload a local media file to WeryAI official storage and return its URL."""
+    """Upload a local media file to WeryAI official storage and return its URL.
+    CCP B-tier (2026-05-26): sha256 缓存命中直接复用, 不浪费上传时间 + 降 SSL 抖动风险.
+    codex final-qa fix: double-check locking 防并发冷缓存重复上传.
+    env ADR_UPLOAD_CACHE=0 关闭缓存."""
+    use_cache = os.environ.get("ADR_UPLOAD_CACHE", "1").strip().lower() not in ("0", "false", "no", "off")
+    sha = ""
+    if use_cache:
+        sha = _file_sha256(file_path)
+        # 第一次 lookup (无锁快路径)
+        cached = _cached_upload_url(sha) if sha else None
+        if cached:
+            log(f"upload-file cache 命中 ({Path(file_path).name} sha={sha[:8]}) → 跳过上传")
+            return cached
     mime = _guess_upload_mime(file_path)
     last_err = None
     for attempt in range(3):
         try:
             with _weryai_upload_lock:
+                # codex fix: double-check 防并发两线程同时 cache miss 后重复 upload
+                if use_cache and sha:
+                    cached_now = _cached_upload_url(sha)
+                    if cached_now:
+                        log(f"upload-file double-check 命中 ({Path(file_path).name} sha={sha[:8]}) → 跳过上传")
+                        return cached_now
                 with open(file_path, "rb") as f:
                     r = requests.post(
                         f"{BASE_URL}/generation/upload-file",
@@ -5929,7 +6058,11 @@ def _upload_to_weryai(file_path: str) -> str:
             urls = (data.get("data") or {}).get("object_url_list") or []
             if not urls:
                 raise RuntimeError(f"upload-file 无 object_url_list: {json.dumps(data, ensure_ascii=False)[:300]}")
-            return urls[0]
+            url = urls[0]
+            # codex 边界 fix: 空 URL 不写; 成功才入 cache
+            if use_cache and sha and url:
+                _store_upload_url(sha, url)
+            return url
         except Exception as e:
             last_err = e
             if attempt < 2:

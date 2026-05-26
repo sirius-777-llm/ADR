@@ -86,7 +86,7 @@ Last updated: 2026-05-21
 | meta_grid 缓存预热 | 30min | ★★ | planned | 跑 driver 给常用 speaker 预生成 meta_grid 入缓存 |
 | 0.5s submit interval 重测 | 5min | ★★ | planned | 用户之前实测过不行，现在 ref 减少可能能用 |
 | ~~duration 计算优化~~ | ~~30min~~ | ~~★★~~ | ✅ shipped 2026-05-21 | api_dur 下限 5s→3s + tts_dur+0.3 |
-| voice_asset upload 缓存 | 1h | ★ | planned | 按 sha256 缓存 weryai upload URL |
+| ~~voice_asset upload 缓存~~ | ~~1h~~ | ✅ shipped 2026-05-26 (CCP) | _upload_to_weryai 入口加 sha256 + cache lookup (24h TTL) · double-check locking 防并发冷缓存 dup (codex final-qa 发现) · voice_assets/upload_cache.json 跨 run 持久 · 减少 SSL 抖动失败概率 · env ADR_UPLOAD_CACHE=0 关闭 |
 | WERYDANCE_2_0_FAST 主路径 | 30min+测 | ★ | planned | A/B 验证 FAST 质量是否够，省 30-40% step66 时间 |
 
 ### 其他方向
@@ -137,10 +137,11 @@ LLM 角色团队从「各跑各的」升级为「真正协作」+ 专业化分�
 | ~~**B2 meta_grid 12 宫格漏进**~~ | ~~★★★ P0~~ | ~~1.5h~~ | ✅ shipped 2026-05-21 | step7 防御层缺失 seg 时用 meta_grid 当 still 导致 4×3 grid 漏入画面 → 检测 meta_grid_ 文件名 + 优先用邻 turn 合法图/cover.jpg 兜底 + prompt 强化禁止复刻 grid + negative_prompt 加 grid/split/panel ban |
 | ~~**B3 内嵌字幕**~~ | ~~★★★ P0~~ | ~~30min~~ | ✅ shipped 2026-05-21 | meta_grid_call prompt 强化禁止复刻参考图中文标签 + negative_prompt 强化 text ban，重跑笑傲江湖未复现 |
 | **B7 名人题材 Image audit fail** | ★★★ P0 | ? | **blocked** | 2026-05-22 诊断：科比/NBA 题材 GPT_IMAGE_2 画真人+商标 → WeryAI 平台 Image asset audit 拦截全部 task。DOUBAO spike 验证：跨端点 fallback 无效（同 audit 服务）。**唯一路径：避免 GPT_IMAGE_2 画名人脸+商标**（重写 step6 prompt 抽象化 / 直接放弃现代名人题材）|
-| **B8 历史顾问条件触发** | ★★ P1 | 30min | planned | _adsd_immersion_qa_rewrite_turns 默认对所有题材跑，可能把现代题材角色误替换（云计算工程师→画师）+ 跟 B5 sweep 重叠。修：按 topic_decomposition era 字段，仅 historical_*/period_* 才跑 |
+| ~~**B8 历史顾问条件触发**~~ | ~~★★ P1~~ | ~~30min~~ | ✅ shipped 2026-05-26 (CCP) | 新增 `_should_run_immersion_qa(topic)` gate 看 topic_decomposition.era · historical_/period_/ancient_/classical_ 前缀或含 '古'/'history' → 跑 LLM 审稿; 现代/商业/科技 → skip 防误替换 (云计算工程师→画师 这种荒谬) · env ADR_IMMERSION_QA_ALL=1 强制 override · 5/5 case 测试 (西游/紫霞跑, 科比/南京/云计算跳过) · CCP 全 4 阶段走完 |
 | ~~**B9 B-roll 出戏**~~ | ~~★★★ P1~~ | ~~2.5h~~ | ✅ shipped 2026-05-25 | A: _broll_rhythm_reviewer LLM 节奏审稿 (keep/merge/rewrite/relocate 决策) · B: script-gen prompt 加 silent_b/narrated_b shot 必须继承前 turn 视觉元素铁律 · 同时收紧 max_narrated 3→2 / silent_b 占比 20-35%→15-25% · env ADR_BROLL_REVIEWER 控制 |
 | ~~**B10 ADS 单旁白多音色**~~ | ~~★★★ P1~~ | ~~1h~~ | ✅ shipped 2026-05-26 | **现象**: ADS (HADS/VADS) 单旁白模式跨 scene 音色不一致 · **Root cause**: step65 motion audio_dub `_select_voice_asset_reference` per-scene 走 gender fallback · **修**: 新增 `_PODCAST_TO_VOICE_ASSET_MAP` 映射 podcast_id → voice_asset_id · `_podcast_id_to_voice_asset` helper · step1_script 末尾把映射后 voice_asset 写入所有 script[i]["voice_asset_id"] · 复用现有 line 12527 优先级 (scene.voice_asset_id 高于 gender fallback) · 阶段 3 (跨 scene task 波动) 留 PR-A 合并跑根治 |
 | ~~**CCP v1.0 协同协议**~~ | ~~1.5h~~ | ✅ shipped 2026-05-26 | tools/codex_collab.py 4 阶段 CLI (review-spec/propose-alt/review-code/final-qa) · voice_assets/collab_history.json 跨 session 持久 · CLAUDE.md ADR-CCP 强制规则 · feedback memory feedback_adr_ccp_protocol · 让任何 Claude session 自动走协同, 不再单向 ship 后才 codex 审 |
+| ~~**B10.1 mapping 女声修订 + 防回归**~~ | ~~30min~~ | ✅ shipped 2026-05-26 (CCP 首跑) | 李莫愁思春 VADS 实测发现 BY2 是「甜妹歌声 music_contaminated」克隆不稳 · **修**: 女声映射 BY2 → 蒙曼/张泉灵/武亦姝 (说话类) · 加 `_VOICE_ASSET_FORBIDDEN_FLAGS` (singing_not_speech/music_contaminated/not_vocal_separated) + `_voice_asset_is_speech_safe` helper 自动过滤 · CCP 全 4 阶段走完: codex 提融合方案 A+B / Stage 3 自审发现 not_speaker_diarized 误加移除 / Stage 4 PASS · 协同验证 |
 | ~~**B4 武戏无 SFX 配音**~~ | ~~★★ P1~~ | ~~2h~~ | ✅ shipped 2026-05-23 | action_b generate_audio=true + SFX_DIRECTIVE prompt · 西游记 turn 4 验证通过 |
 | ~~**B5 LLM 把场景描述当 speaker**~~ | ~~★★ P1~~ | ~~1h~~ | ✅ shipped 2026-05-21 | prompt 加 speaker 铁律 + _sweep_speaker_field 后处理 (bad_keywords 检测 + 从 bad speaker 提取已知角色 + role_candidates fallback) · 7/7 case 通过 |
 | ~~**B6 短喊招漏关键词**~~ | ~~★ P2~~ | ~~15min~~ | ✅ shipped 2026-05-21 | _is_action_shout 加 再来/换我/还击/反攻/拦住/挡住/拼了/决胜 等 16 个攻势/反击/换场词 · 6/6 case 通过 |
