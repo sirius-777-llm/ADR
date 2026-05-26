@@ -8,19 +8,19 @@ ADR 是一套自动纪录片生成管线。输入一个主题或带时间戳的�
 
 | 模式 | 画幅 | 触发 | 含义 |
 |---|---:|---|---|
-| `HDAR` | 16:9 | `h` | 横屏纪录片，默认模式 |
-| `VDAR` | 9:16 | `v` | 竖屏纪录片，偏短视频发布 |
-| `HADS` | 16:9 | `h --with-motion` | 横屏动态纪录片，WeryDance 逐分镜动态化 |
-| `VADS` | 9:16 | `v --with-motion` | 竖屏动态纪录片，WeryDance 逐分镜动态化 |
+| `HADS` | 16:9 | `h` | 横屏动态纪录片（默认），WeryDance 逐分镜动态化 |
+| `VADS` | 9:16 | `v` | 竖屏动态纪录片（默认），WeryDance 逐分镜动态化 |
+| `HADR` | 16:9 | `h --no-motion` | 横屏静态分镜叙述（罕用） |
+| `VADR` | 9:16 | `v --no-motion` | 竖屏静态分镜叙述（罕用） |
 | `HADSD` | 16:9 | `h --ads-dialogue` | 横屏多角色对话纪录片 |
 | `VADSD` | 9:16 | `v --ads-dialogue` | 竖屏多角色对话纪录片 |
 
 重要边界：
 
-- `HADS/VADS` 只表示“动态纪录片”，不等于现场记者。
-- 只有显式传 `--ads-reporter`，或用户明确说“拟现场记者 / 战地记者 / dispatch / 第一人称记者 / POV 记者”，才进入记者 POV。
-- `--ads-reporter` 会自动开启 `--with-motion`，但 `--with-motion` 不会反向开启记者。
+- `HADS/VADS` 只表示"动态纪录片"，不等于现场记者。
+- 只有显式传 `--ads-reporter`，或用户明确说"拟现场记者 / 战地记者 / dispatch / 第一人称记者 / POV 记者"，才进入记者 POV。
 - `--ads-dialogue` 和 `--ads-reporter` 互斥；多角色对话优先。
+- ADSD 走 step66 lip_sync，不参与 step65 motion；`--no-motion` 对 ADSD 无效。
 
 ## 默认策略
 
@@ -91,18 +91,19 @@ export TG_BOT_TOKEN="your-bot-token"
 export TG_CHAT_ID="your-chat-id"
 
 python3 run_adr_v8.py "1924年泰戈尔访华" h
-python3 run_adr_v8.py "黄仁勋CMU毕业演讲核心内容" h --with-motion
+python3 run_adr_v8.py "黄仁勋CMU毕业演讲核心内容" h
 python3 run_adr_v8.py "1915年二十一条最后通牒" v --ads-reporter
 python3 run_adr_v8.py "AI时代就业市场访谈" h --ads-dialogue
-python3 run_adr_v8.py "江南春日风物" v --bgm-only --with-motion
+python3 run_adr_v8.py "江南春日风物" v --bgm-only
+python3 run_adr_v8.py "唐宋八大家" h --no-motion          # 罕用：HADR 静态分镜
 ```
 
 ## 常用参数
 
 | 参数 | 用途 |
 |---|---|
-| `h` / `v` | 横屏 16:9 / 竖屏 9:16 |
-| `--with-motion` | 开启 WeryDance 动态化 |
+| `h` / `v` | 横屏 16:9 / 竖屏 9:16，默认 HADS/VADS 动态化 |
+| `--no-motion` | 退化为 HADR/VADR 静态分镜叙述（罕用） |
 | `--ads-reporter` | 开启第一人称现场记者 POV |
 | `--no-ads-reporter` | 强制禁止 reporter |
 | `--ads-dialogue` | 开启多角色对话纪录片 |

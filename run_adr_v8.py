@@ -152,16 +152,11 @@ ADS_DIALOGUE_MODE_EARLY_CHECK = (
     or "--adsd" in sys.argv
     or os.environ.get("ADR_ADS_DIALOGUE", "").strip().lower() in ("1", "true", "yes", "on")
 )
-# B12 (2026-05-26): VDAR (竖屏 ADS 非 ADSD) 默认开 motion 动态化
-# 用户认知: VADS 默认就该动 (静态分镜叙述不算视频成品)
-# 加 --no-motion override 显式关
+# B12 (2026-05-26): h/v 默认 = HADS/VADS 动态化, ADSD 走 step66 不参与, --no-motion 显式关
+# B12.1 (2026-05-26): 删除冗余 --with-motion (默认就 ON, flag 无意义), 老脚本传它自然 no-op
 WITH_MOTION = (
-    "--with-motion" in sys.argv
-    or (
-        IS_VERTICAL
-        and not ADS_DIALOGUE_MODE_EARLY_CHECK
-        and "--no-motion" not in sys.argv
-    )
+    not ADS_DIALOGUE_MODE_EARLY_CHECK
+    and "--no-motion" not in sys.argv
 )  # 每分镜走 WERYDANCE_2_0 生成带运动视频，~2x 时长 + $0.3/scene
 BGM_ONLY_REQUESTED = (
     "--bgm-only" in sys.argv
@@ -925,7 +920,7 @@ if ADSD_LIPS_CHANGE_ALL:
     ADSD_LIPS_CHANGE_REPAIR = True
 
 # --ads-reporter：把 ADS 的"拟现场第一人称记者感"并入 ADR 动态化。
-# 该模式自动开启 --with-motion，并约束剧本、分镜与 motion prompt；
+# 该模式默认就跑 motion (B12)，并约束剧本、分镜与 motion prompt；
 # 注意它是"拟现场报道"，不是现代直播，严禁手机/电视台/现代麦克风穿帮。
 ADS_REPORTER_MODE = (
     "--no-ads-reporter" not in sys.argv
@@ -9542,7 +9537,7 @@ def step6_parallel(script: list[dict], topic: str, pregenerated_bgm_path: str | 
     return bgm_path
 
 
-# ── 第 6.5 步：动态化（可选，--with-motion 开启）─────────────────────────────
+# ── 第 6.5 步：动态化（HADS/VADS 默认 ON，--no-motion 关）─────────────────────────────
 # 把每个静态 seg_N.mp4 替换为 WERYDANCE_2_0 生成的带镜头运动的短视频
 # 原则：per-scene 失败不中断，保留静态 seg 作为兜底
 def _generate_motion_prompts(script: list[dict]) -> list[str]:

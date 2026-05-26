@@ -65,7 +65,7 @@ Write 1~22 lines to `/tmp/adr_script_override.txt` before launching ADR to bypas
 | Flag | Env Var | Effect |
 |---|---|---|
 | `--adsd` / `--ads-dialogue` | `ADR_ADS_DIALOGUE=1` | ADSD mode (per-turn TTS + lip-sync, ensemble dialogue) |
-| `--with-motion` | — | Per-scene WERYDANCE motion (+$0.3/scene) |
+| `--no-motion` | — | Disable per-scene WERYDANCE motion (HADS/VADS default ON; falls back to HADR/VADR static segs) |
 | `--grid-multiref-main` | `ADR_STORYBOARD_GRID_MULTIREF_MAIN=1` | HDAR: grid-multiref as main video source (saves WERYDANCE calls vs per-scene) |
 | `--storyboard-trailer-main` | `ADR_STORYBOARD_TRAILER_MAIN=1` | HDAR: single WERYDANCE trailer with all panels |
 | `--adsd-speaker-batch` | `ADR_ADSD_SPEAKER_BATCH=1` | ADSD: analyze consecutive-same-speaker grouping (analysis only; actual batching TBD) |
