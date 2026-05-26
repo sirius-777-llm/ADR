@@ -790,6 +790,32 @@ def _apply_llm_voice_assignment(turns: list[dict]) -> dict | None:
 
 
 DEFAULT_MALE_VOICE_ASSET = os.environ.get("ADR_DEFAULT_MALE_VOICE_ASSET", ADSD_DEFAULT_MALE_VOICE_ASSET)
+
+# B10 (2026-05-26): podcast_id (step1 picked_id) → voice_asset_id (音色库 wav)
+# 音色库 reference_audios 必须存在该 asset_id, 否则 fallback gender
+# 当前映射: 主要男女各 1 个 default + 知名播音
+_PODCAST_TO_VOICE_ASSET_MAP = {
+    # 女声
+    "chat-girl-105-cn": "external_by2_e7gn_001",     # 晓曼 → BY2 (柔甜女声)
+    "gaoqing3-bfb5c88a": "external_by2_e7gn_001",    # 高晴 → BY2
+    "shuoshurennan-b09f844f": "external_by2_e7gn_001",  # 柳飞霜 → BY2
+    # 男声
+    "liyan2-ef9401ec": "external_luo_xiang_xyma_001",  # 国栋 → 罗翔 (沉稳)
+    "liyan3-f74976d9": "external_liang_wendao_yt_001",  # 子墨 → 梁文道 (儒雅)
+    "zh-male-guchuan-9d6a4666": "external_duan_yihong_yt_001",  # 谷川 → 段奕宏 (低沉)
+    "CN-Man-Beijing-V2": "external_luo_xiang_xyma_001",  # 原野 → 罗翔
+    "gushijingling-720c0ae5": "external_xu_zhiyuan_xyma_001",  # 故事精灵 → 许知远
+    "suzhe-45bbbe54": "external_xu_zhiyuan_xyma_001",  # 苏哲 → 许知远 (知性)
+}
+
+
+def _podcast_id_to_voice_asset(podcast_id: str) -> str:
+    """B10: 把 step1 picked_id (podcast format) 映射到 voice_asset_id (音色库).
+    映射失败回退 DEFAULT_MALE_VOICE_ASSET. 用于 ADS 全片锁定单一克隆音色 ref."""
+    if not podcast_id:
+        return ""
+    return _PODCAST_TO_VOICE_ASSET_MAP.get(podcast_id, DEFAULT_MALE_VOICE_ASSET)
+
 DEFAULT_FEMALE_VOICE_ASSET = os.environ.get("ADR_DEFAULT_FEMALE_VOICE_ASSET", ADSD_DEFAULT_FEMALE_VOICE_ASSET)
 DEFAULT_VOICE_ASSET = os.environ.get("ADR_DEFAULT_VOICE_ASSET", "").strip()
 VOICE_ASSET_AUDIO_DUB_EXPERIMENT = (
@@ -3969,6 +3995,24 @@ THUMBNAIL_ANCHOR: Air Force One stairs, black leather jacket figure, glowing chi
             log(f"音色推荐失败，使用默认: {e}")
             picked_id = "liyan2-ef9401ec"
             picked_name = "国栋"
+
+    # B10 fix (2026-05-26): ADS 单旁白模式锁定 voice_asset 全片用
+    # step65 motion audio_dub 会调 _select_voice_asset_reference(scene, mode="motion")
+    # 默认 per-scene 走 gender fallback → 跨 scene asset 切换 → 多音色
+    # 修: step1 把 picked_id 映射到 voice_asset_id, 写入所有 scene["voice_asset_id"]
+    # 注: 只写 voice_asset_id 不写 voice_id (避免 podcast_id 串入 voice_asset 字段导致 asset 找不到)
+    ads_voice_asset_id = _podcast_id_to_voice_asset(picked_id)
+    if ads_voice_asset_id:
+        locked = 0
+        for s in script:
+            if not s.get("voice_asset_id"):
+                s["voice_asset_id"] = ads_voice_asset_id
+                locked += 1
+        log(f"B10 ADS voice lock: picked_id={picked_id} → voice_asset={ads_voice_asset_id} 全片 {locked}/{len(script)} scene 锁定")
+        try:
+            tg(f"🔒 ADS 单旁白锁定 voice_asset: {ads_voice_asset_id} ({locked}/{len(script)} scene)")
+        except Exception:
+            pass
 
     _write_ads_retention_qa(script)
     return script, picked_id, picked_name
