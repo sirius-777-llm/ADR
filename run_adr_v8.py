@@ -590,6 +590,8 @@ def _llm_assign_voice_assets(turns: list[dict]) -> dict[int, str]:
         })
     if not selectable:
         return {}
+    # B13 (2026-05-27): silent_b 占位 turn 不需要 voice (没声音)，
+    # 喂给 LLM 会让 ensemble speaker_count 多算 1 + 浪费一个 voice slot
     turn_summary = [
         {
             "idx": i,
@@ -599,7 +601,10 @@ def _llm_assign_voice_assets(turns: list[dict]) -> dict[int, str]:
             "text": str(t.get("text", ""))[:80],
         }
         for i, t in enumerate(turns)
+        if isinstance(t, dict) and not _is_silent_b(t)
     ]
+    if not turn_summary:
+        return {}
     prompt = f"""你是 ADR 纪录片音色总监。为每个 turn 从音色库选最匹配的 voice_id。
 
 候选音色池（已过滤歌声 / 混音 / 高风险公众人物）:
@@ -12388,10 +12393,14 @@ def _postprocess_lip_sync_segment(src_video: str, scene: dict, target_dur: float
     src_dur = ffprobe_duration(src_video)
     pad = max(0.0, target_dur - src_dur)
     panel_path = scene.get("img_path", "")
+    # B16 (2026-05-27): img_path 是 meta_grid_*.png 4×3 grid 时不能当 Ken Burns still
+    # 复用 B2 (L13937) 同款 guard, 走 tpad clone 末帧兜底防 12 宫格漏入画面
+    is_meta_grid_panel = bool(panel_path) and os.path.basename(panel_path).startswith("meta_grid_")
     use_panel_pad = (
         pad > 0.04
         and panel_path
         and os.path.exists(panel_path)
+        and not is_meta_grid_panel
         and os.environ.get("ADR_ADSD_PAD_WITH_PANEL", "1").strip().lower() not in ("0", "false", "no", "off")
     )
     if use_panel_pad:
@@ -12512,10 +12521,14 @@ def _postprocess_audio_dub_segment(src_video: str, scene: dict, target_dur: floa
     pad = max(0.0, effective_dur - src_dur)
     scene["_audio_dub_effective_dur"] = effective_dur
     panel_path = scene.get("img_path", "")
+    # B16 (2026-05-27): img_path 是 meta_grid_*.png 4×3 grid 时不能当 Ken Burns still
+    # 「南京学区房」HADSD run t=85.0-85.6s 出现 12 宫格满屏即此 bug 复现
+    is_meta_grid_panel = bool(panel_path) and os.path.basename(panel_path).startswith("meta_grid_")
     use_panel_pad = (
         pad > 0.04
         and panel_path
         and os.path.exists(panel_path)
+        and not is_meta_grid_panel
         and os.environ.get("ADR_ADSD_PAD_WITH_PANEL", "1").strip().lower() not in ("0", "false", "no", "off")
     )
     if use_panel_pad:
@@ -13939,12 +13952,12 @@ def step7_concat(script: list[dict]) -> str:
     cover_path = str(OUTPUT_DIR / "cover.jpg") if (OUTPUT_DIR / "cover.jpg").exists() else ""
     legit_imgs = [s.get("img_path", "") for s in script
                   if s.get("img_path") and os.path.exists(s["img_path"])
-                  and "meta_grid_" not in os.path.basename(s["img_path"])]
+                  and not os.path.basename(s["img_path"]).startswith("meta_grid_")]
     for i, s in enumerate(script):
         vp = s.get("vid_path") or ""
         if not vp or not os.path.exists(vp) or os.path.getsize(vp) < 1000:
             img = s.get("img_path") or ""
-            is_meta_grid_img = img and "meta_grid_" in os.path.basename(img)
+            is_meta_grid_img = img and os.path.basename(img).startswith("meta_grid_")
             still_src = ""
             if img and os.path.exists(img) and not is_meta_grid_img:
                 still_src = img  # 合法单图（非 grid）
@@ -14672,8 +14685,16 @@ def _write_adsd_delivery_qa(final_path: str) -> dict | None:
     dialogue_shape = None
     speaker_count = 0
     if isinstance(timeline, list):
-        speakers = [str(t.get("speaker", "")).strip() for t in timeline if isinstance(t, dict)]
-        speaker_count = len([s for s in dict.fromkeys(speakers) if s])
+        # B13 (2026-05-27): silent_b 占位 turn (speaker='(silent)' 或 turn_type=silent_b)
+        # 不算独立 ADSD speaker, 否则 ensemble speaker_count 会多算触发 "too many ADSD speakers"
+        speakers = [
+            str(t.get("speaker", "")).strip()
+            for t in timeline
+            if isinstance(t, dict)
+            and not _is_silent_b(t)
+            and str(t.get("speaker", "")).strip() not in ("(silent)", "")
+        ]
+        speaker_count = len(dict.fromkeys(speakers))
         shapes = [str(t.get("dialogue_shape", "")).strip() for t in timeline if isinstance(t, dict) and t.get("dialogue_shape")]
         dialogue_shape = shapes[0] if shapes else None
         if not speakers:
