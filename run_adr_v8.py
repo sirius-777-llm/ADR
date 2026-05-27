@@ -1644,13 +1644,14 @@ def poll_storyboard_task(task_id: str, label: str, max_wait: float) -> dict:
     raise RuntimeError(f"{label} 轮询超时（{max_wait:.0f}s, last_status={last_status or 'unknown'}）")
 
 
-# PR-4 (2026-05-27): LLM 分级映射. 按 tier 选模型, 简单任务降到 Haiku 4.5 省成本.
+# PR-4 (2026-05-27): LLM 分级映射. 按 tier 选模型, 简单任务降到便宜模型省成本.
 # tier_chat 是别名 alias dispatcher, 不破坏 chat() 旧签名 (26 个调用站点零侵入).
+# 2026-05-27 hotfix: data tier 从 CLAUDE_4_5_HAIKU (WeryAI 不支持) 改 GEMINI_3_1_FLASH_LITE (gateway 已验证 work).
 _LLM_TIER = {
     "producer":  "CLAUDE_4_6_OPUS",          # Tier 1 决策性创意 (制片人, 导演 jiangwen)
     "creative":  "GEMINI_25_FLASH",          # Tier 2 创意输出 (台词/分镜 prompt 等)
     "review":    "GEMINI_3_1_FLASH_LITE",    # Tier 3 审稿/规划 (情绪/plan/校验)
-    "data":      "CLAUDE_4_5_HAIKU",         # Tier 4 数据/机械任务 (短文 JSON / 一行 rewrite / id 选择)
+    "data":      "GEMINI_3_1_FLASH_LITE",    # Tier 4 数据/机械任务 (短文 JSON / 一行 rewrite / id 选择)
 }
 
 
