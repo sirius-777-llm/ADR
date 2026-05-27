@@ -11168,11 +11168,13 @@ def _grid_multiref_prompt(
     action_mode = False
     for offset, scene in enumerate(group):
         idx = start_idx + offset
-        visual = _short_board_text(scene.get("prompt") or scene.get("text"), 180)
+        # B34.2 (2026-05-27): 精算 prompt cap 2000 (WeryAI doc 限制), 4 panel × ~245 + style 300 + char_rule 250 + prefix 150 = ~1680
+        visual = _short_board_text(scene.get("prompt") or scene.get("text"), 80)
         motion = _short_board_text(motion_prompts[idx] if idx < len(motion_prompts) else "", 120)
         if _is_action_scene(scene.get("text", ""), scene.get("prompt", "")):
             action_mode = True
-        lines.append(f"{offset + 1}. Scene {idx + 1}: {visual} Camera: {motion}")
+        # B34.2: 每 panel line 强调 distinct (Shot N + 简短标签)
+        lines.append(f"{offset + 1}. Shot {idx + 1}: {visual} | Cam: {motion}")
     if action_mode:
         style = (
             "Create one coherent high-energy cinematic action video that treats the uploaded references as a "
@@ -11184,10 +11186,13 @@ def _grid_multiref_prompt(
             "No idle posing, no frozen tableau, no slideshow, no gentle-only motion."
         )
     else:
+        # B34.2 (2026-05-27): 强制 panel-distinct, 修大哥反馈"镜头语言高度相似". 简短版控 prompt cap.
         style = (
-            "Create one coherent cinematic video that moves through these shots in order, preserving character "
-            "identity, costume, period setting, lighting, color palette, and scene geography. Animate plausible motion: "
-            "camera push, handheld drift, cloth, paper, rain, crowd, smoke, and natural human movements."
+            "Coherent cinematic video through shots in order, preserve character/costume/setting/palette. "
+            "★ CRITICAL: Each shot MUST be visually distinct — vary angle (low/high/eye), distance "
+            "(close-up/medium/wide), lighting (front/side/back-lit/silhouette), framing, and energy. "
+            "No two shots share same camera language. Plausible per-shot motion: push, drift, cloth, smoke, "
+            "natural human movements matching the emotional beat."
         )
     character_rule = (
         "The first uploaded image is a character/model sheet only. Use it to lock the hero/subject identity, "
@@ -11427,13 +11432,23 @@ def _apply_grid_multiref_segments(script: list[dict], motion_qa: dict | None) ->
             "segments": [],
             "pass": False,
         }
+        # B34.3 (2026-05-27): 切片对齐 panel boundary (修缺点 2/4)
+        # 之前按 target_dur 比例切 source: source 内 N panel 等距, 切点落 panel 中间 → panel 内容不完整
+        # 现在按 raw_dur/N 等距切 panel boundary, ratio = target_dur / panel_dur 计算拉伸
+        # 代价: 单 turn 加速/减速明显 (但 panel 完整, max_stretch=2.5 保护)
+        n_panels = max(len(scene_indices), 1)
+        panel_dur_in_source = raw_dur / n_panels
         cursor = 0.0
         for local_i, idx in enumerate(scene_indices):
             scene = script[idx]
             target_dur = target_durations[local_i]
-            source_start = raw_dur * (cursor / total_target) if total_target > 0 else 0.0
-            source_dur = raw_dur * (target_dur / total_target) if total_target > 0 else raw_dur / max(len(scene_indices), 1)
-            source_dur = max(0.05, min(source_dur, max(0.05, raw_dur - source_start)))
+            # B34.3: panel-aligned cut
+            source_start = panel_dur_in_source * local_i
+            source_dur = panel_dur_in_source
+            # 尾段 clamp 防超 raw_dur (浮点累计误差)
+            if source_start + source_dur > raw_dur:
+                source_dur = max(0.05, raw_dur - source_start)
+            source_dur = max(0.05, source_dur)
             ratio = target_dur / source_dur if source_dur > 0 else 1.0
             tmp_path = str(OUTPUT_DIR / f"seg_{idx}.grid_multiref.tmp.mp4")
             final_path = scene.get("vid_path") or str(OUTPUT_DIR / f"seg_{idx}.mp4")
@@ -11444,6 +11459,7 @@ def _apply_grid_multiref_segments(script: list[dict], motion_qa: dict | None) ->
                 "source_start": round(source_start, 3),
                 "source_duration": round(source_dur, 3),
                 "speed_ratio": round(ratio, 4),
+                "panel_aligned": True,  # B34.3 audit marker
                 "pass": False,
             }
             if ratio > qa["max_stretch_ratio"]:
