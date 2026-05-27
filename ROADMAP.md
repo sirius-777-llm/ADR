@@ -82,7 +82,7 @@ Last updated: 2026-05-21
 
 | 项目 | 工程量 | ROI | 状态 | 备注 |
 |------|--------|-----|------|------|
-| **PR-A · merged_a 合并跑** | 4-5h | ★★★ | planned | 同 speaker 连续 turn 合并 almighty，API 调用 12→6-8 (Spike 2 已验证) |
+| ~~**PR-A · merged_a 合并跑**~~ | ~~4-5h~~ | ✅ shipped 2026-05-27 (CCP 全 4 阶段, MVP default-off) | 同 speaker 连续 turn 合并 almighty 调用, 砍 30-50% API · 实施 3 部分: (1) L12618 `_concat_audio_files_for_group` + `_split_lip_sync_raw_by_durations` helpers (ffmpeg concat demuxer + 按 dur 切片重编码) (2) L13089 `_lip_sync_one_group` 主函数 (拼接 audio + 提交 almighty audio_dub generate_audio=true + poll + split + 各段 postprocess; 失败返回 [False]*n 让调用方回退) (3) L13700 step66 主循环加 group/scene 分流提交, group 失败时 fallback 走单 turn _lip_sync_one_scene · 触发条件: ADSD_CONSECUTIVE_SPEAKER_BATCHING + audio_dub_experiment + multi-turn group + all A-roll + total_dur ≤ 15s · CCP Stage 3 抓 3 个 High/Medium: split 边界用 actual audio dur / 15s 二次校验用 actual_total / generate_audio='true' 对齐单 turn · Default OFF 需 --adsd-speaker-batch 显式启用, 待大哥实测验证后再考虑改默认 |
 | meta_grid 缓存预热 | 30min | ★★ | planned | 跑 driver 给常用 speaker 预生成 meta_grid 入缓存 |
 | ~~0.5s submit interval 重测~~ | ~~5min~~ | ~~★★~~ | ❌ rejected 2026-05-27 (PM 重评估) | 计算: 12 turn run 总 motion+image submit 共 22 次, 每次省 (2.5-0.5)=2s, 总省 ~44s. 全程 wallclock ~22min, 实际提速 ~3%. ROI 远低于 ★★ 标记. WERYDANCE 单镜 processing ~25-90s 才是瓶颈, submit interval 在并发模型下影响极小. 不 ship, env ADR_*_SUBMIT_INTERVAL 仍可手动 override 测试 |
 | ~~duration 计算优化~~ | ~~30min~~ | ~~★★~~ | ✅ shipped 2026-05-21 | api_dur 下限 5s→3s + tts_dur+0.3 |

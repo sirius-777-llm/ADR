@@ -12614,6 +12614,67 @@ def _detect_audio_leading_silence(src_video: str, threshold_db: int = -30, min_s
     return 0.0
 
 
+# ── PR-A (2026-05-27): merged_a 合并跑 helpers ──────────────────────────────
+# 同 speaker 连续 turn 合并成 1 个 WERYDANCE 调用, 砍 30-50% API.
+
+def _concat_audio_files_for_group(audio_paths: list[str], out_path: str) -> bool:
+    """PR-A: ffmpeg concat 多个 audio 文件成单一 audio_ref. 用 pcm wav 中转避免编码漂移."""
+    if not audio_paths:
+        return False
+    try:
+        list_file = str(Path(out_path).with_suffix(".concat.txt"))
+        with open(list_file, "w", encoding="utf-8") as f:
+            for p in audio_paths:
+                # ffmpeg concat demuxer 要求 path 转义单引号
+                safe = str(p).replace("'", r"'\''")
+                f.write(f"file '{safe}'\n")
+        ffmpeg(
+            "-f", "concat", "-safe", "0", "-i", list_file,
+            "-c:a", "pcm_s16le", "-ar", "44100", "-ac", "1",
+            out_path,
+            timeout=120,
+        )
+        return os.path.exists(out_path) and os.path.getsize(out_path) > 1000
+    except Exception as e:
+        log(f"PR-A audio concat 失败: {e}")
+        return False
+
+
+def _split_lip_sync_raw_by_durations(raw_video: str, durations: list[float], out_paths: list[str]) -> bool:
+    """PR-A: 按 turn duration 切分 WERYDANCE 长视频为 group 内各 turn seg.
+    用 ffmpeg -ss/-t 精确切片, 不重编码 (-c copy) 保速度."""
+    if len(durations) != len(out_paths) or not out_paths:
+        log(f"PR-A split mismatch: durations={len(durations)} out_paths={len(out_paths)}")
+        return False
+    raw_dur = ffprobe_duration(raw_video)
+    total_target = sum(durations)
+    # WERYDANCE 输出实际时长可能略短于请求 duration, 按比例缩放各 turn
+    scale = (raw_dur / total_target) if (raw_dur > 0 and total_target > 0) else 1.0
+    cursor = 0.0
+    ok_all = True
+    for i, (dur, out_path) in enumerate(zip(durations, out_paths)):
+        cut_dur = dur * scale
+        try:
+            ffmpeg(
+                "-ss", f"{cursor:.3f}",
+                "-i", raw_video,
+                "-t", f"{cut_dur:.3f}",
+                "-c:v", "libx264", "-crf", "20", "-preset", "fast",
+                "-c:a", "aac", "-b:a", "128k",
+                "-pix_fmt", "yuv420p",
+                out_path,
+                timeout=120,
+            )
+            if not (os.path.exists(out_path) and os.path.getsize(out_path) > 10000):
+                log(f"PR-A split turn {i} 输出过小: {out_path}")
+                ok_all = False
+        except Exception as e:
+            log(f"PR-A split turn {i} 失败: {e}")
+            ok_all = False
+        cursor += cut_dur
+    return ok_all
+
+
 def _postprocess_audio_dub_segment(src_video: str, scene: dict, target_dur: float) -> bool:
     """Normalize Almighty audio-dub video while preserving generated segment audio for QA sidecars.
 
@@ -13023,6 +13084,183 @@ def _lip_sync_poll_download_and_process(idx: int, task_id: str, scene: dict, tar
         time.sleep(5)
     info.update({"pass": False, "reason": "poll_timeout"})
     return False, info
+
+
+def _lip_sync_one_group(group: list[int], script: list[dict], target_durs: list[float], aspect_ratio: str) -> tuple[list[int], list[bool], list[dict]]:
+    """PR-A (2026-05-27) merged_a: 同 speaker 连续 turn 合并 almighty 调用.
+    Steps:
+      1. 拼接 group 内 turn TTS audio → 单 audio_dub ref
+      2. base panel = group[0].img_path, alt panels = group[1..]
+      3. submit almighty WERYDANCE audio_dub, duration=sum(target_durs)
+      4. poll 拿 raw_video
+      5. ffmpeg 按 turn target_dur 切回 seg_i.mp4 for each i in group
+      6. 每段走 _postprocess_audio_dub_segment retiming
+    失败时回退到逐 turn 调 _lip_sync_one_scene (调用方处理).
+    """
+    if not group:
+        return [], [], []
+    idxs = list(group)
+    g_size = len(idxs)
+    scenes = [script[i] for i in idxs]
+    durs = [target_durs[i] for i in idxs]
+    total_dur = sum(durs)
+    speaker = (scenes[0].get("speaker") or "").strip()
+    group_label = f"group_{idxs[0]}_{idxs[-1]}"
+
+    # 先粗筛 target_dur, 后面拼接后再用实际 audio dur 二次校验
+    if total_dur > 15.0:
+        log(f"PR-A {group_label}: target total_dur={total_dur:.1f}s > 15s 上限, 回退")
+        return idxs, [False] * g_size, [{"turn": i + 1, "pass": False, "reason": "group_exceeds_15s_target"} for i in idxs]
+
+    # 收集 turn audio (TTS) + 校验全部存在
+    turn_audios: list[str] = []
+    for s in scenes:
+        a = s.get("dialogue_audio_mp3") or s.get("dialogue_audio")
+        if not a or not os.path.exists(a):
+            log(f"PR-A {group_label}: turn {s.get('dialogue_turn', '?')} 缺 TTS audio, 回退")
+            return idxs, [False] * g_size, [{"turn": i + 1, "pass": False, "reason": "missing_turn_audio_in_group"} for i in idxs]
+        turn_audios.append(a)
+
+    # 拼接 audio
+    concat_audio = str(OUTPUT_DIR / f"merged_a_{group_label}.wav")
+    if not _concat_audio_files_for_group(turn_audios, concat_audio):
+        log(f"PR-A {group_label}: audio concat 失败, 回退")
+        return idxs, [False] * g_size, [{"turn": i + 1, "pass": False, "reason": "audio_concat_failed"} for i in idxs]
+
+    # codex High 1+ Medium fix: 用每个 turn 实际 audio duration 作切分边界, 防 target/actual 偏差
+    actual_audio_durs = [ffprobe_duration(a) for a in turn_audios]
+    actual_total = sum(actual_audio_durs)
+    if actual_total > 15.0:
+        log(f"PR-A {group_label}: actual concat audio={actual_total:.1f}s > 15s 上限, 回退")
+        return idxs, [False] * g_size, [{"turn": i + 1, "pass": False, "reason": "group_exceeds_15s_actual_audio"} for i in idxs]
+
+    # voice_asset ref (base turn 决定音色)
+    voice_asset_ref = _select_voice_asset_reference(scenes[0])
+    source_audio = voice_asset_ref["path"] if voice_asset_ref else concat_audio
+    # 提交需要把 dub audio 作为 audio_dub: WERYDANCE 用拼接 audio 直接配音
+    audio_dub_audio = concat_audio
+
+    # base panel = group[0].img_path; alt panels = group[1..].img_path (上限 3 张防 ref 过多)
+    base_panel = scenes[0].get("img_path", "")
+    alt_panels = [s.get("img_path", "") for s in scenes[1:]][:3]
+    if not (base_panel and os.path.exists(base_panel)):
+        log(f"PR-A {group_label}: base panel 缺失, 回退")
+        return idxs, [False] * g_size, [{"turn": i + 1, "pass": False, "reason": "missing_base_panel"} for i in idxs]
+
+    # 标记 group flag (供 split 后 postprocess 用)
+    for s in scenes:
+        s["_merged_a_group"] = group_label
+        s["_almighty_reference_audio"] = audio_dub_audio
+        s["_almighty_reference_audio_role"] = "merged_a_group_audio_dub"
+        s["_almighty_voice_asset_reference"] = voice_asset_ref
+        s["_almighty_audio_dub_attempt"] = True
+
+    try:
+        image_url = _upload_to_weryai(base_panel)
+        alt_panel_urls: list[str] = []
+        for ap in alt_panels:
+            if ap and os.path.exists(ap):
+                try:
+                    alt_panel_urls.append(_upload_to_weryai(ap))
+                except Exception as e:
+                    log(f"PR-A {group_label} alt panel upload skipped: {e}")
+        audio_url = _upload_to_weryai(audio_dub_audio)
+        ref_images = alt_panel_urls + [image_url]
+
+        # 合并 prompt: 各 turn text 顺接, 让 WERYDANCE 知道完整对白
+        merged_text = " ".join(str(s.get("text") or "")[:80] for s in scenes)
+        prompt = (
+            f"Cinematic documentary dialogue scene. {speaker} speaks in Mandarin: 「{merged_text}」. "
+            "Use uploaded audio as the audio dub source (mouth must sync to this audio precisely, "
+            "do NOT regenerate speech). Use uploaded images for identity/costume reference. "
+            "Visible mouth, natural lip sync, stable face, realistic human timing throughout."
+        )
+        # codex Medium fix: 用 actual_total (实际拼接 audio 时长) 算 api_dur
+        api_dur = int(round(min(15, max(4, actual_total + 0.3))))
+        payload = {
+            "model": "WERYDANCE_2_0",
+            "images": ref_images,
+            "audios": [audio_url],
+            "prompt": prompt,
+            "duration": api_dur,
+            "aspect_ratio": aspect_ratio,
+            "resolution": "720p",
+            "generate_audio": "true",  # codex High 2 fix: 与单 turn audio_dub variants 一致 (true 才有视频音轨, 实际是 audio_dub 用 ref audio)
+        }
+        _wait_motion_submit_slot(f"PR-A {group_label}")
+        r = req_post("/generation/almighty-reference-to-video", payload, timeout=30)
+        task_id = r.get("data", {}).get("task_id") or (r.get("data", {}).get("task_ids") or [None])[0]
+        if not task_id:
+            log(f"PR-A {group_label}: submit 无 task_id: {r}")
+            return idxs, [False] * g_size, [{"turn": i + 1, "pass": False, "reason": "submit_no_task_id"} for i in idxs]
+    except Exception as e:
+        log(f"PR-A {group_label} submit 异常: {e}")
+        return idxs, [False] * g_size, [{"turn": i + 1, "pass": False, "reason": f"submit_exception: {e}"} for i in idxs]
+
+    # poll
+    raw_path = str(OUTPUT_DIR / f"lip_sync_raw_{group_label}.mp4")
+    succeed = False
+    for iteration in range(181):
+        try:
+            s = req_get(f"/generation/{task_id}/status")
+            data = s.get("data", {})
+            st = data.get("task_status", "")
+            if iteration == 0 or iteration % 12 == 0 or st in ("succeed", "failed"):
+                log(f"[PR-A {group_label}] poll #{iteration+1}: {st}")
+            if st == "succeed":
+                vid_url = _extract_video_url(data)
+                if not vid_url:
+                    log(f"PR-A {group_label}: succeed 但无 video url")
+                    return idxs, [False] * g_size, [{"turn": i + 1, "pass": False, "reason": "succeed_without_video_url"} for i in idxs]
+                urllib.request.urlretrieve(vid_url, raw_path)
+                succeed = True
+                break
+            if st == "failed":
+                log(f"PR-A {group_label}: task_failed {data.get('msg', '')[:120]}")
+                return idxs, [False] * g_size, [{"turn": i + 1, "pass": False, "reason": "group_task_failed"} for i in idxs]
+        except Exception as e:
+            if iteration in (0, 12, 60, 120):
+                log(f"PR-A {group_label} poll 异常: {e}")
+        time.sleep(5)
+
+    if not succeed:
+        return idxs, [False] * g_size, [{"turn": i + 1, "pass": False, "reason": "poll_timeout"} for i in idxs]
+
+    # ffmpeg split → seg_i.mp4 for each i in group
+    # codex High 1 fix: 用实际 audio dur 作切分边界, 不用 target_dur
+    out_paths = [scenes[k]["vid_path"] for k in range(g_size)]
+    if not _split_lip_sync_raw_by_durations(raw_path, actual_audio_durs, out_paths):
+        log(f"PR-A {group_label}: split 失败, 回退到逐 turn (调用方处理)")
+        return idxs, [False] * g_size, [{"turn": i + 1, "pass": False, "reason": "split_failed"} for i in idxs]
+
+    # 每个切分段走 _postprocess_audio_dub_segment retiming
+    oks: list[bool] = []
+    infos: list[dict] = []
+    raw_dur = ffprobe_duration(raw_path)
+    for k, (i, scene, dur) in enumerate(zip(idxs, scenes, durs)):
+        ok = _postprocess_audio_dub_segment(scene["vid_path"], scene, dur)
+        final_dur = ffprobe_duration(scene["vid_path"]) if ok else None
+        infos.append({
+            "turn": i + 1,
+            "speaker": speaker,
+            "task_id": task_id,
+            "merged_a_group": group_label,
+            "merged_a_group_size": g_size,
+            "raw_video_path": raw_path,
+            "raw_video_duration": raw_dur,
+            "final_segment_path": scene["vid_path"],
+            "final_segment_duration": final_dur,
+            "source_audio_duration": dur,
+            "video_has_audio": True,
+            "pass": ok,
+            "candidate": "merged_a_group_audio_dub",
+            "needs_master_audio_mux": False,
+            "generated_audio_from_prompt_dialogue": True,
+        })
+        oks.append(ok)
+    saved_api_calls = g_size - 1
+    log(f"PR-A {group_label}: {sum(oks)}/{g_size} turn 切分 + postprocess ok, 节省 {saved_api_calls} 次 API")
+    return idxs, oks, infos
 
 
 def _lip_sync_one_scene(idx: int, scene: dict, target_dur: float, aspect_ratio: str) -> tuple[int, bool, dict]:
@@ -13472,20 +13710,80 @@ def step66_adsd_lip_sync(script: list[dict]):
     records: list[dict] = []
     # weryai 并发上限 20，贴顶以便长 ADR (>10 turn) 不会排队跑成串行
     max_workers = min(int(os.environ.get("ADR_LIP_SYNC_MAX_CONCURRENT", "20")), n)
+
+    # PR-A (2026-05-27): 决定哪些 group 走 batch 合并跑.
+    # 条件 (全满足才合并): batching flag 开 / multi-turn group / 全 A-roll (needs_lip_sync) /
+    #   total_dur ≤ 15s / 全 audio_dub 模式 (ADSD audio_dub_experiment)
+    _batch_groups: list[list[int]] = []
+    _batched_idxs: set[int] = set()
+    if ADSD_CONSECUTIVE_SPEAKER_BATCHING and ADSD_ALMIGHTY_AUDIO_DUB_EXPERIMENT:
+        for g in consecutive_groups:
+            if len(g) <= 1:
+                continue
+            total = sum(target_durs[i] for i in g)
+            all_a_roll = all(script[i].get("needs_lip_sync", True) for i in g)
+            if total <= 15.0 and all_a_roll:
+                _batch_groups.append(g)
+                _batched_idxs.update(g)
+        if _batch_groups:
+            saved = sum(len(g) - 1 for g in _batch_groups)
+            tg(f"🚀 PR-A merged_a 启用: {len(_batch_groups)} 个 group 合并跑, 省 {saved} 次 API 调用")
+
     with ThreadPoolExecutor(max_workers=max_workers) as ex:
-        futs = {ex.submit(_lip_sync_one_scene, i, script[i], target_durs[i], aspect): i for i in range(n)}
+        futs: dict = {}
+        # 提交 batch group (1 个 future = N 个 turn)
+        for g in _batch_groups:
+            futs[ex.submit(_lip_sync_one_group, g, script, target_durs, aspect)] = ("group", g)
+        # 提交单 turn (未被 batch 的 turn)
+        for i in range(n):
+            if i in _batched_idxs:
+                continue
+            futs[ex.submit(_lip_sync_one_scene, i, script[i], target_durs[i], aspect)] = ("scene", i)
+
         for fut in as_completed(futs):
-            i = futs[fut]
+            kind, ref = futs[fut]
             try:
-                idx, ok, info = fut.result()
+                if kind == "scene":
+                    idx, ok, info = fut.result()
+                    results[idx] = ok
+                    records.append(info)
+                    if ok:
+                        tg(f"👄 Turn {idx+1}/{n} 口型同步 ✓")
+                    else:
+                        tg(f"⚠️ Turn {idx+1}/{n} 口型同步失败，保留原静态/motion片段")
+                else:  # group
+                    idxs_out, oks, infos = fut.result()
+                    for idx_, ok_, info_ in zip(idxs_out, oks, infos):
+                        results[idx_] = ok_
+                        records.append(info_)
+                        if ok_:
+                            tg(f"👄 Turn {idx_+1}/{n} 口型同步 ✓ (PR-A group)")
+                    if not all(oks):
+                        # PR-A group 失败回退: 把组内失败的 turn 排队走单 turn 路径
+                        fallback_idxs = [i for i, ok_ in zip(idxs_out, oks) if not ok_]
+                        if fallback_idxs:
+                            tg(f"⚠️ PR-A group 部分失败 ({len(fallback_idxs)}/{len(idxs_out)}), 回退到逐 turn")
+                            for fi in fallback_idxs:
+                                idx2, ok2, info2 = _lip_sync_one_scene(fi, script[fi], target_durs[fi], aspect)
+                                results[idx2] = ok2
+                                records.append(info2)
+                                if ok2:
+                                    tg(f"👄 Turn {idx2+1}/{n} 口型同步 ✓ (PR-A fallback)")
+                                else:
+                                    tg(f"⚠️ Turn {idx2+1}/{n} 口型同步失败 (PR-A fallback 后)")
             except Exception as e:
-                idx, ok, info = i, False, {"turn": i + 1, "pass": False, "reason": str(e)}
-            results[idx] = ok
-            records.append(info)
-            if ok:
-                tg(f"👄 Turn {idx+1}/{n} 口型同步 ✓")
-            else:
-                tg(f"⚠️ Turn {idx+1}/{n} 口型同步失败，保留原静态/motion片段")
+                if kind == "scene":
+                    i = ref
+                    results[i] = False
+                    records.append({"turn": i + 1, "pass": False, "reason": str(e)})
+                    tg(f"⚠️ Turn {i+1}/{n} 口型同步异常: {e}")
+                else:
+                    g = ref
+                    log(f"PR-A group {g} exception: {e}, 回退逐 turn")
+                    for fi in g:
+                        idx2, ok2, info2 = _lip_sync_one_scene(fi, script[fi], target_durs[fi], aspect)
+                        results[idx2] = ok2
+                        records.append(info2)
     records.sort(key=lambda x: int(x.get("turn", 0)))
     success_cnt = sum(1 for v in results.values() if v)
     generated_audio_cnt = sum(1 for r in records if r.get("pass") and r.get("video_has_audio") and r.get("generated_audio_from_prompt_dialogue"))
