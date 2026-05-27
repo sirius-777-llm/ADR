@@ -10686,8 +10686,12 @@ def _try_motion_audio_dub_video(idx: int, scene: dict, motion_prompt: str, aspec
         "voice_reference_policy": "use owned, licensed, consented, or otherwise lawful voice references; avoid undisclosed real-person impersonation",
     })
     _append_motion_qa(info)
-    if not ok and timed_out_or_reusable:
-        return True, False
+    # B28 (2026-05-27): audio_dub timeout 不再阻断 fallback.
+    # 之前: timeout return (True, False) → caller 跳过 reference_video/text-to-video fallback
+    #       整片 audio_dub 全 timeout 时 → 纯 Ken Burns 静态片 (观沧海 144159 实测)
+    # 现在: 全部失败都 return (False, False), caller 继续走 fallback 路径出 motion 视频
+    # ⚠️  代价: fallback 路径会覆盖 motion_tasks.json[idx] = 新 task_id, 上游
+    #     audio_dub task 后台真成功时无法 resume (覆盖丢失, +1 次 credits 浪费)
     return ok, ok
 
 
