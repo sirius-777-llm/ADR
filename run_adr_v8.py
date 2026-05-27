@@ -1644,6 +1644,22 @@ def poll_storyboard_task(task_id: str, label: str, max_wait: float) -> dict:
     raise RuntimeError(f"{label} 轮询超时（{max_wait:.0f}s, last_status={last_status or 'unknown'}）")
 
 
+# PR-4 (2026-05-27): LLM 分级映射. 按 tier 选模型, 简单任务降到 Haiku 4.5 省成本.
+# tier_chat 是别名 alias dispatcher, 不破坏 chat() 旧签名 (26 个调用站点零侵入).
+_LLM_TIER = {
+    "producer":  "CLAUDE_4_6_OPUS",          # Tier 1 决策性创意 (制片人, 导演 jiangwen)
+    "creative":  "GEMINI_25_FLASH",          # Tier 2 创意输出 (台词/分镜 prompt 等)
+    "review":    "GEMINI_3_1_FLASH_LITE",    # Tier 3 审稿/规划 (情绪/plan/校验)
+    "data":      "CLAUDE_4_5_HAIKU",         # Tier 4 数据/机械任务 (短文 JSON / 一行 rewrite / id 选择)
+}
+
+
+def tier_chat(tier: str, system: str, user: str, max_tokens: int = 4096, timeout: int = 180) -> str:
+    """PR-4: 按 tier 调用对应模型, 失败时回退到 chat() 直接传 model name."""
+    model = _LLM_TIER.get(tier, "GEMINI_25_FLASH")
+    return chat(model, system, user, max_tokens=max_tokens, timeout=timeout)
+
+
 def chat(model: str, system: str, user: str, max_tokens: int = 4096, timeout: int = 180) -> str:
     """调用 WeryAI Chat Completion，返回回复文本。3 次重试防瞬断/限流/无 choices。
     timeout 默认 180s，对慢推理模型（GPT-5.4 / Claude Opus / DeepSeek-R1）需传更大值如 600s。"""
@@ -3209,7 +3225,7 @@ def _maybe_neutralize_topic(topic: str) -> str:
 
 只输出新 topic 字符串，不要解释/引号/markdown。"""
     try:
-        raw = chat("GEMINI_25_FLASH", "你只输出 1 行新 topic 文本，不加任何解释。", prompt, max_tokens=200, timeout=45)
+        raw = tier_chat("data", "你只输出 1 行新 topic 文本，不加任何解释。", prompt, max_tokens=200, timeout=45)
         new_topic = (raw or "").strip().strip('"').strip("'").splitlines()[0].strip()[:200]
         # 防御: 改完比原还短不到一半 → 失败回退
         if new_topic and len(new_topic) >= max(20, len(topic) // 3):
@@ -8057,7 +8073,7 @@ def _llm_pick_voice_asset_for_ip(voice_gender: str, voice_tone_hint: str) -> str
 
 只输出 1 个 voice_id 字符串，不要解释，不要 markdown。"""
     try:
-        raw = chat("GEMINI_25_FLASH", "你只输出一个 voice_id 字符串。", prompt, max_tokens=80, timeout=30)
+        raw = tier_chat("data", "你只输出一个 voice_id 字符串。", prompt, max_tokens=80, timeout=30)
         vid = raw.strip().strip('"').strip("'").strip()
         valid = {a["voice_id"] for a in candidates}
         if vid in valid:
@@ -15665,7 +15681,7 @@ def _llm_bottom_note(topic: str, script_texts: list) -> str:
         f"只输出注脚本身一行，不加任何解释。"
     )
     try:
-        raw = chat("GEMINI_25_FLASH", "你是中国古典编辑，擅长从典籍节气物象里提炼诗意注脚。", prompt).strip()
+        raw = tier_chat("data", "你是中国古典编辑，擅长从典籍节气物象里提炼诗意注脚。", prompt, max_tokens=200, timeout=45).strip()
         raw = raw.split("\n")[0].strip()
         # 清洗：去掉标点 / 英文 / 特殊字符（保留中点 · 和中文）
         raw = re.sub(r"[《》\"'【】\[\]()（）!?！？#。，、；：—…-]", '', raw)
