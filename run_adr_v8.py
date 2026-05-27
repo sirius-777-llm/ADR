@@ -3993,7 +3993,8 @@ THUMBNAIL_ANCHOR: Air Force One stairs, black leather jacket figure, glowing chi
     culture_guard = _topic_culture_guard(topic_meta)
 
     # B31 (2026-05-27): HADS/VADS 启用 meta_grid 召唤路径时, 提取 visual_subject 给跨 scene 一致性用
-    # 用 _adsd_role_candidates(topic) 第一个角色作 visual_subject (复用 topic_decomposition cache, 不增 LLM cost)
+    # 用 _adsd_role_candidates(topic) 第一个角色作 visual_subject. 通常复用 topic_decomposition cache,
+    # 首次调用 1 次 LLM (Gemini Flash, 800 tokens, 已 cache 跨 run 复用).
     _hads_meta_grid_subject: str | None = None
     if (
         not ADS_DIALOGUE_MODE
@@ -9452,8 +9453,10 @@ def step6_parallel(script: list[dict], topic: str, pregenerated_bgm_path: str | 
         skip_motion_bridge = os.environ.get("ADR_SKIP_MOTION_BRIDGE", "1").strip().lower() not in ("0", "false", "no", "off")
         # 方向 3: 人设符模式下 storyboard_grid 切的 panel 主路径不再用（meta_grid_call variant 用单 grid）
         # 仅 fallback 切片路径需要 → 默认人设符模式跳过 storyboard_grid
+        # B31 (codex Stage 3 High fix): HADS meta_grid 模式仍需要 storyboard_grid 切片 (panel 作 priority 1 ref + meta_grid 作 priority 0 ref).
+        # 只有 ADSD meta_grid 才 skip (走 meta_grid_call variant 单 grid 替代切片).
         skip_storyboard_grid = (
-            meta_grid_active
+            _adsd_meta_grid  # 仅 ADSD meta_grid 路径 skip, HADS 不 skip
             and os.environ.get("ADR_SKIP_STORYBOARD_GRID_WHEN_META", "1").strip().lower() not in ("0", "false", "no", "off")
         )
 
@@ -10617,9 +10620,24 @@ def _try_motion_audio_dub_video(idx: int, scene: dict, motion_prompt: str, aspec
     ]
     try:
         image_urls = [_upload_to_weryai(img_path)]
+        # B31 (2026-05-27): HADS/VADS meta_grid 召唤 - 优先加 meta_grid_url 作 priority 0 ref (跨 scene 视觉一致性)
+        # WERYDANCE almighty 接受 multi-ref; meta_grid 整 grid 提供完整角色 visual coverage
+        meta_grid_url = None
+        if os.environ.get("ADR_HADS_USE_META_GRID", "0").strip().lower() in ("1", "true", "yes", "on"):
+            speaker = (scene.get("speaker") or "").strip()
+            if speaker:
+                mg_path = _character_meta_grid_path(speaker)
+                if mg_path.exists() and mg_path.stat().st_size > 100000:
+                    try:
+                        meta_grid_url = _upload_to_weryai(str(mg_path))
+                        # 插入到 image_urls 头部作 priority 0 ref
+                        image_urls.insert(0, meta_grid_url)
+                        log(f"[motion-audio-dub {idx}] B31 HADS meta_grid 召唤: {speaker} 加 priority 0 ref")
+                    except Exception as mg_e:
+                        log(f"[motion-audio-dub {idx}] B31 meta_grid upload 失败 (跳过): {mg_e}")
         for bridge_path in bridge_paths[:2]:
             image_urls.append(_upload_to_weryai(bridge_path))
-        image_url = image_urls[0]
+        image_url = image_urls[-1] if not meta_grid_url else image_urls[1]  # 主帧 = panel img (非 meta_grid)
         audio_url = _upload_to_weryai(source_audio)
     except Exception as e:
         log(f"[motion-audio-dub {idx}] reference 上传失败，回退 motion: {e}")
@@ -10635,7 +10653,16 @@ def _try_motion_audio_dub_video(idx: int, scene: dict, motion_prompt: str, aspec
 
     strict_voice = bool(MOTION_VOICE_STRICT_LOCK or repair_requested)
     prompt = _motion_audio_dub_prompt(scene, motion_prompt, safe_retry=safe_retry, strict_voice=strict_voice)
-    if len(image_urls) > 1:
+    # B31 (codex Stage 3 Medium fix): meta_grid 占 priority 0 时, bridge_instruction "image 1 = start frame" 会
+    # 把 identity sheet (4×3 grid) 当 motion 起帧, 改成显式标记 grid 作 identity ref 不参与 motion 时序
+    if meta_grid_url:
+        meta_grid_instruction = (
+            " Reference image 1 is a 4×3 character identity grid (NOT a motion frame): "
+            "use it ONLY for face / costume / styling consistency, do NOT replicate the grid layout. "
+            "Generate a single fullframe cinematic shot using image 2 as the main motion keyframe. "
+        )
+        prompt = (meta_grid_instruction + prompt)[:2000]
+    elif len(image_urls) > 1:
         bridge_instruction = (
             " Treat the uploaded images as ordered motion keyframes: image 1 is the start frame, "
             "image 2 is the end/action frame. Create a visible motivated transition between them; "
