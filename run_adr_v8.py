@@ -225,6 +225,22 @@ STORYBOARD_GRID_MULTIREF_MAIN = (
 )
 if STORYBOARD_GRID_MULTIREF_MAIN:
     STORYBOARD_GRID_MULTIREF_MOTION = True  # 主路径必须先生 sidecar
+# B34 (2026-05-27): grid_multiref 升 ADS 主路径灰度入口
+# 大哥洞察: ADS 真正高质路径是整 grid 一次喂 WERYDANCE, 不是 per_scene motion.
+# 启用后: SEGMENTS=True 触发 _apply_grid_multiref_segments 作主时间线, MOTION/MAIN 自动连带 ON.
+# 不达 MIN_PASS_RATIO (0.75) → fallback per_scene motion + audio_dub (B28+B29 已修健壮性).
+GRID_MULTIREF_PRIMARY = (
+    "--grid-multiref-primary" in sys.argv
+    or os.environ.get("ADR_GRID_MULTIREF_PRIMARY", "").strip().lower() in ("1", "true", "yes", "on")
+)
+if GRID_MULTIREF_PRIMARY:
+    STORYBOARD_GRID_MULTIREF_MOTION = True
+    STORYBOARD_GRID_MULTIREF_MAIN = True
+    STORYBOARD_GRID_MULTIREF_SEGMENTS = True
+    # B34: 灰度主路径必须接受 proportional split unsafe (相邻 panel 可能混入边界)
+    # 否则 _apply_grid_multiref_segments L11328 直接 abort, SEGMENTS 不生效.
+    # 用户启用 --grid-multiref-primary 即 opt-in 这个 unsafe 切分.
+    os.environ.setdefault("ADR_UNSAFE_ALLOW_GRID_MULTIREF_PROPORTIONAL_SPLIT", "1")
 PREVIS_PAGE_MOTION = (
     "--with-previs-page-motion" in sys.argv
     or os.environ.get("ADR_PREVIS_PAGE_MOTION", "").strip().lower() in ("1", "true", "yes", "on")
@@ -14010,6 +14026,35 @@ def step65_motion(script: list[dict]):
         seg_qa = _apply_grid_multiref_segments(script, grid_motion_qa)
         _write_storyboard_motion_compare_qa(grid_motion_qa, previs_qa, seg_qa, trailer_qa, character_trailer_qa)
         success_cnt = int((seg_qa or {}).get("success_count") or 0)
+        # B34 (2026-05-27): 灰度数据收集 — 记录 grid_multiref 主路径每次 run 的 pass_ratio / reason
+        # 目的: 收集足够样本评估 MIN_PASS_RATIO 阈值是否合理, 数据达标后改默认 ON (B34.1)
+        # Stage 3 codex 抓 Medium: seg_qa.reason 真实字段名 + 分母用 grid_multiref combined_pass_ratio (group 维度) 不用 n (scene 维度)
+        if GRID_MULTIREF_PRIMARY:
+            scene_ratio = success_cnt / max(n, 1)  # scene 维度通过率 (仅记录, 不作决策)
+            grid_combined_ratio = (grid_motion_qa or {}).get("combined_pass_ratio")  # group 维度 (真实决策维度)
+            seg_reason = (seg_qa or {}).get("reason") or ""
+            log(f"B34 grid_multiref_primary stats: scene_pass={scene_ratio:.2f} ({success_cnt}/{n}) "
+                f"group_combined_pass={grid_combined_ratio} pass={(seg_qa or {}).get('pass')} seg_reason={seg_reason[:80]}")
+            try:
+                (OUTPUT_DIR / "b34_grid_multiref_primary_stats.json").write_text(
+                    json.dumps({
+                        "mode": "b34_grid_multiref_primary_gradient",
+                        "scene_pass_ratio": round(scene_ratio, 3),
+                        "scene_success_count": success_cnt,
+                        "total_scenes": n,
+                        "group_combined_pass_ratio": grid_combined_ratio,
+                        "group_combined_used": (grid_motion_qa or {}).get("combined_groups_used"),
+                        "group_combined_skipped": (grid_motion_qa or {}).get("combined_groups_skipped"),
+                        "pass": bool((seg_qa or {}).get("pass")),
+                        "seg_reason": seg_reason,
+                        "min_pass_ratio_threshold": float(os.environ.get("ADR_GRID_MULTIREF_MAIN_MIN_PASS_RATIO", "0.75")),
+                        "unsafe_proportional_split": os.environ.get("ADR_UNSAFE_ALLOW_GRID_MULTIREF_PROPORTIONAL_SPLIT", ""),
+                        "created_at": datetime.now().isoformat(timespec="seconds"),
+                    }, ensure_ascii=False, indent=2),
+                    encoding="utf-8",
+                )
+            except Exception as _e:
+                log(f"B34 stats 写入失败 (非阻塞): {_e}")
         if (seg_qa or {}).get("pass"):
             tg(f"✅ Grid multi-ref 实验动态化完成：{success_cnt}/{n} 段替换，主时间线 QA 通过")
             return
