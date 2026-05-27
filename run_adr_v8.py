@@ -3992,6 +3992,22 @@ THUMBNAIL_ANCHOR: Air Force One stairs, black leather jacket figure, glowing chi
     neg_tag = topic_meta.get("negative", "")
     culture_guard = _topic_culture_guard(topic_meta)
 
+    # B31 (2026-05-27): HADS/VADS 启用 meta_grid 召唤路径时, 提取 visual_subject 给跨 scene 一致性用
+    # 用 _adsd_role_candidates(topic) 第一个角色作 visual_subject (复用 topic_decomposition cache, 不增 LLM cost)
+    _hads_meta_grid_subject: str | None = None
+    if (
+        not ADS_DIALOGUE_MODE
+        and WITH_MOTION
+        and os.environ.get("ADR_HADS_USE_META_GRID", "0").strip().lower() in ("1", "true", "yes", "on")
+    ):
+        try:
+            _candidates = _adsd_role_candidates(topic)
+            if _candidates:
+                _hads_meta_grid_subject = _candidates[0]
+                log(f"B31 HADS visual_subject: {_hads_meta_grid_subject} (topic={topic[:30]})")
+        except Exception as _e:
+            log(f"B31 HADS visual_subject 提取失败 (跳过): {_e}")
+
     script = []
     emotion_count: dict[str, int] = {}
     for i, line in enumerate(lines):
@@ -4071,6 +4087,11 @@ THUMBNAIL_ANCHOR: Air Force One stairs, black leather jacket figure, glowing chi
             "topic_meta": topic_meta,
             "culture_guard": culture_guard,
         }
+        # B31: HADS/VADS meta_grid 启用时注入 visual_subject + 假 speaker 让 _generate_all_character_meta_grids 识别
+        if _hads_meta_grid_subject:
+            item["speaker"] = _hads_meta_grid_subject
+            item["visual_subject"] = subject[:120] if subject else _hads_meta_grid_subject
+            item["voice_gender"] = "male"  # HADS 默认男声; 实际听感由 voice_asset 决定
         if _script_injected:
             item["injected_script"] = True
             if i < len(_override_timings) and _override_timings[i]:
@@ -9408,10 +9429,18 @@ def step6_parallel(script: list[dict], topic: str, pregenerated_bgm_path: str | 
         completed = {}  # idx -> True
         approval_sent = set()  # 已推过审批的 idx，避免兜底重发
         # 人设符路径生效时跳过 sidecar QA 图（减时间 ROI）
-        meta_grid_active = (
+        # B31 (2026-05-27): 扩 HADS/VADS WITH_MOTION 模式也启用 (env ADR_HADS_USE_META_GRID 灰度)
+        # 修跨 scene 视觉一致性 (观沧海曹操/演讲单 visual subject 题材)
+        _adsd_meta_grid = (
             ADS_DIALOGUE_MODE and ADSD_LIP_SYNC_EXPERIMENT
             and os.environ.get("ADR_USE_CHARACTER_META_GRID", "1").strip().lower() not in ("0", "false", "no", "off")
         )
+        _hads_meta_grid = (
+            not ADS_DIALOGUE_MODE
+            and WITH_MOTION
+            and os.environ.get("ADR_HADS_USE_META_GRID", "0").strip().lower() in ("1", "true", "yes", "on")
+        )
+        meta_grid_active = _adsd_meta_grid or _hads_meta_grid
         # 方向 2: 人设符模式下 character_sheet 由 meta_grid 替代，可跳过
         skip_character_sheet = (
             meta_grid_active
@@ -13961,10 +13990,22 @@ def step65_motion(script: list[dict]):
     else:
         _write_storyboard_motion_compare_qa(grid_motion_qa, previs_qa, None, trailer_qa, character_trailer_qa)
 
+    # B29 (2026-05-27): step65 motion fast-fail
+    # 防 WERYDANCE 上游异常时整 step65 烧 25min (观沧海 144159 实测)
+    # 跟 step66 R2 C++ Smart Abort 同款逻辑, 配合 B28 fallback 都失败时早 kill
+    # 收益 (codex Stage 3 High 提醒): ThreadPoolExecutor 限制, 已启动 task 仍跑完,
+    # fast-fail 实际省: round 2 retry + step65 后续子 path (grid/previs/trailer) + step66.
+    # 仍约 40-60% 总时长节省. 阈值用 int(n*0.4) (floor) 偏激进 fast-fail.
+    fast_fail_threshold_min = max(3, int(len(script) * 0.4))
+    fast_fail_enabled = os.environ.get("ADR_MOTION_FAST_FAIL", "1").strip().lower() not in ("0", "false", "no", "off")
+
     def _run_batch(indices: list[int], round_label: str, safe_retry: bool = False):
-        """跑一批 indices，更新 results。task_id 持久化保证重试时已成功的分镜不会重复烧钱。"""
+        """跑一批 indices，更新 results。task_id 持久化保证重试时已成功的分镜不会重复烧钱。
+        B29: round 1 fail_count >= max(3, 40%) 触发 fast-fail abort 整 step65."""
         if not indices:
             return
+        fail_count = 0
+        completed_count = 0
         with ThreadPoolExecutor(max_workers=min(20, len(indices))) as ex:
             futs = {
                 ex.submit(_motion_one_scene, i, script[i], motion_prompts[i], aspect, safe_retry): i
@@ -13978,12 +14019,41 @@ def step65_motion(script: list[dict]):
                     log(f"[motion {i}] future 异常 ({round_label}): {e}")
                     ok = False
                 results[i] = ok
+                completed_count += 1
                 if ok:
                     tg(f"🎬 分镜 {i+1}/{n} 动态化 ✓ ({round_label})")
-                elif round_label == "round 1":
-                    log(f"[motion {i}] round 1 失败，等待重试")
                 else:
-                    tg(f"⚠️ 分镜 {i+1}/{n} 动态化失败（重试后仍失败，保留静态版）")
+                    fail_count += 1
+                    if round_label == "round 1":
+                        log(f"[motion {i}] round 1 失败，等待重试")
+                    else:
+                        tg(f"⚠️ 分镜 {i+1}/{n} 动态化失败（重试后仍失败，保留静态版）")
+                # B29 fast-fail 检测: round 1 fail_count 超阈值, abort 整 step65
+                # (round 2 是 retry, 不再 fast-fail, 失败仅保留静态)
+                if (
+                    fast_fail_enabled
+                    and round_label == "round 1"
+                    and fail_count >= fast_fail_threshold_min
+                    and completed_count >= fail_count  # 防早期偶发误判
+                    and fail_count / max(completed_count, 1) >= 0.5
+                ):
+                    err = (
+                        f"⛔ B29 Smart Abort step65: {round_label} 失败 {fail_count}/{completed_count} "
+                        f"(>= {fast_fail_threshold_min} 阈值 + ≥50% fail rate)\n"
+                        f"WERYDANCE 上游可能异常 (rate limit / 5xx / poll timeout 雪崩)\n"
+                        f"立即 kill step65 防整片纯 Ken Burns 静态 + 烧 25min credits\n"
+                        f"建议: 等 5-10min WERYDANCE 恢复后重试 (task_id 已存 motion_tasks.json 可 resume)"
+                    )
+                    try:
+                        tg(err)
+                    except Exception:
+                        pass
+                    log(err)
+                    # 取消剩余 future 让 executor 早退
+                    for f in futs:
+                        if not f.done():
+                            f.cancel()
+                    raise RuntimeError(err)
 
     # Round 1：全量并发；已通过 grid multi-ref 主线切片的镜头不重复烧钱。
     initial_indices = [i for i in range(n) if not script[i].get("grid_multiref_segment_mode")]
