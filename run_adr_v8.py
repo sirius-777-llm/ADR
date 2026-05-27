@@ -2236,7 +2236,9 @@ def _parse_adsd_override_turns(raw_lines: list[str], topic: str) -> list[dict]:
         line = str(raw).strip()
         silent_match = SILENT_LINE_RE.match(line)
         if silent_match or line in {"(silent)", "[silent]", "(无)", "空镜"}:
-            visual_hint = (silent_match.group(1) if silent_match else "").strip() if silent_match else ""
+            # B19 (2026-05-27): regex group(1) 在 capture 缺省时返回 None, 必须 or "" 兜底
+            visual_hint = (silent_match.group(1) if silent_match else None) or ""
+            visual_hint = visual_hint.strip()
             speaker = "(silent)"
             text = ""
             voice_gender = "male"
