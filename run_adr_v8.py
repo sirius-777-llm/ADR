@@ -13717,16 +13717,19 @@ def step66_adsd_lip_sync(script: list[dict]):
     #   total_dur ≤ 15s / 全 audio_dub 模式 (ADSD audio_dub_experiment)
     _batch_groups: list[list[int]] = []
     _batched_idxs: set[int] = set()
-    log(f"PR-A debug: batching={ADSD_CONSECUTIVE_SPEAKER_BATCHING} audio_dub={ADSD_ALMIGHTY_AUDIO_DUB_EXPERIMENT} consecutive_groups={len(consecutive_groups) if 'consecutive_groups' in dir() else 'UNDEF'}")
+    _cg_count = len(consecutive_groups) if 'consecutive_groups' in dir() else -1
+    log(f"PR-A debug: batching={ADSD_CONSECUTIVE_SPEAKER_BATCHING} audio_dub={ADSD_ALMIGHTY_AUDIO_DUB_EXPERIMENT} consecutive_groups={_cg_count}")
     if ADSD_CONSECUTIVE_SPEAKER_BATCHING and ADSD_ALMIGHTY_AUDIO_DUB_EXPERIMENT:
-        for g in consecutive_groups:
+        for gi, g in enumerate(consecutive_groups):
             if len(g) <= 1:
                 continue
             total = sum(target_durs[i] for i in g)
             all_a_roll = all(script[i].get("needs_lip_sync", True) for i in g)
+            log(f"PR-A debug group {gi+1}: idxs={g} total={total:.2f} all_a_roll={all_a_roll} fit_15s={total<=15.0}")
             if total <= 15.0 and all_a_roll:
                 _batch_groups.append(g)
                 _batched_idxs.update(g)
+        log(f"PR-A debug: _batch_groups final={_batch_groups} (count={len(_batch_groups)})")
         if _batch_groups:
             saved = sum(len(g) - 1 for g in _batch_groups)
             tg(f"🚀 PR-A merged_a 启用: {len(_batch_groups)} 个 group 合并跑, 省 {saved} 次 API 调用")
@@ -13735,12 +13738,14 @@ def step66_adsd_lip_sync(script: list[dict]):
         futs: dict = {}
         # 提交 batch group (1 个 future = N 个 turn)
         for g in _batch_groups:
+            log(f"PR-A debug: submitting group future for {g}")
             futs[ex.submit(_lip_sync_one_group, g, script, target_durs, aspect)] = ("group", g)
         # 提交单 turn (未被 batch 的 turn)
         for i in range(n):
             if i in _batched_idxs:
                 continue
             futs[ex.submit(_lip_sync_one_scene, i, script[i], target_durs[i], aspect)] = ("scene", i)
+        log(f"PR-A debug: submitted {sum(1 for v in futs.values() if v[0]=='group')} group + {sum(1 for v in futs.values() if v[0]=='scene')} scene futures (total {len(futs)})")
 
         for fut in as_completed(futs):
             kind, ref = futs[fut]

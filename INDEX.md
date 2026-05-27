@@ -1,6 +1,6 @@
 # ADR Code Index
 
-Auto-generated. Source: `run_adr_v8.py` (17357 lines). Regenerate: `python3 tools/generate_index.py`.
+Auto-generated. Source: `run_adr_v8.py` (17362 lines). Regenerate: `python3 tools/generate_index.py`.
 
 ## Sections
 
@@ -10,12 +10,12 @@ Auto-generated. Source: `run_adr_v8.py` (17357 lines). Regenerate: `python3 tool
 - [`第二步：逐句生成音轨（WeryAI Podcast，线程池并发）`](#第二步-逐句生成音轨-weryai-podcast-线程池并发) — L4249-5370 (1122 lines · 20 fn · 0 sub)
 - [`第三步 + 第四步 + 第五步：时间轴计算（Whisper + 同步优先剪辑节奏）`](#第三步---第四步---第五步-时间轴计算-whisper---同步优先剪辑节奏) — L5371-5922 (552 lines · 9 fn · 4 sub)
 - [`第六步：并行生成图片 + BGM + 视频片段`](#第六步-并行生成图片---bgm---视频片段) — L5923-9693 (3771 lines · 82 fn · 6 sub)
-- [`第 6.5 步：动态化（HADS/VADS 默认 ON，--no-motion 关）`](#第-6-5-步-动态化-hads-vads-默认-on---no-motion-关) — L9694-14283 (4590 lines · 103 fn · 5 sub)
-- [`第七步：拼接视频轨`](#第七步-拼接视频轨) — L14284-14515 (232 lines · 1 fn · 0 sub)
-- [`第八步：生成 ASS 字幕`](#第八步-生成-ass-字幕) — L14516-15318 (803 lines · 9 fn · 1 sub)
-- [`第九步：最终合成`](#第九步-最终合成) — L15319-15564 (246 lines · 1 fn · 0 sub)
-- [`第十步：推送 Telegram`](#第十步-推送-telegram) — L15565-17179 (1615 lines · 16 fn · 5 sub)
-- [`主流程`](#主流程) — L17180-17357 (178 lines · 2 fn · 0 sub)
+- [`第 6.5 步：动态化（HADS/VADS 默认 ON，--no-motion 关）`](#第-6-5-步-动态化-hads-vads-默认-on---no-motion-关) — L9694-14288 (4595 lines · 103 fn · 5 sub)
+- [`第七步：拼接视频轨`](#第七步-拼接视频轨) — L14289-14520 (232 lines · 1 fn · 0 sub)
+- [`第八步：生成 ASS 字幕`](#第八步-生成-ass-字幕) — L14521-15323 (803 lines · 9 fn · 1 sub)
+- [`第九步：最终合成`](#第九步-最终合成) — L15324-15569 (246 lines · 1 fn · 0 sub)
+- [`第十步：推送 Telegram`](#第十步-推送-telegram) — L15570-17184 (1615 lines · 16 fn · 5 sub)
+- [`主流程`](#主流程) — L17185-17362 (178 lines · 2 fn · 0 sub)
 
 ---
 
@@ -359,14 +359,14 @@ Range: **L5923 – L9693** (3771 lines)
 ---
 
 ### 第 6.5 步：动态化（HADS/VADS 默认 ON，--no-motion 关）
-Range: **L9694 – L14283** (4590 lines)
+Range: **L9694 – L14288** (4595 lines)
 
 **Sub-sections:**
-- _PR-A (2026-05-27): merged_a 合并跑 helpers_ — L12618-14019 (1402 lines)
-- _pipeline state 持久化：让 tools/rerun_downstream.py 跳过 step1-66 局部重跑下游_ — L14020-14062 (43 lines)
-- _audio_dub retiming：按 seg 真实长度重算 timeline，避免克隆语音被截_ — L14063-14100 (38 lines)
-- _audio_dub voice-clone splice：把 A-roll seg 里的克隆音色拼回主音轨_ — L14101-14238 (138 lines)
-- _silent_b BGM 动态浮起：silent_b 区间 BGM 音量 +40%（让 BGM 接管呼吸位）_ — L14239-14283 (45 lines)
+- _PR-A (2026-05-27): merged_a 合并跑 helpers_ — L12618-14024 (1407 lines)
+- _pipeline state 持久化：让 tools/rerun_downstream.py 跳过 step1-66 局部重跑下游_ — L14025-14067 (43 lines)
+- _audio_dub retiming：按 seg 真实长度重算 timeline，避免克隆语音被截_ — L14068-14105 (38 lines)
+- _audio_dub voice-clone splice：把 A-roll seg 里的克隆音色拼回主音轨_ — L14106-14243 (138 lines)
+- _silent_b BGM 动态浮起：silent_b 区间 BGM 音量 +40%（让 BGM 接管呼吸位）_ — L14244-14288 (45 lines)
 
 **Functions:**
 - `_generate_motion_prompts` — L9697
@@ -465,91 +465,91 @@ Range: **L9694 – L14283** (4590 lines)
 - `_lip_sync_one_group` — L13090
 - `_lip_sync_one_scene` — L13267
 - `step66_adsd_lip_sync` — L13591
-- `step65_motion` — L13910
-- `step65_grid_multiref_motion_qa` — L13992
-- `_sanitize_scene_for_state` — L14021
-- `_save_pipeline_state` — L14040
-- `_retime_after_audio_dub` — L14064
-- `_build_voice_clone_hybrid_audio` — L14102
-- `_build_dynamic_bgm` — L14240
+- `step65_motion` — L13915
+- `step65_grid_multiref_motion_qa` — L13997
+- `_sanitize_scene_for_state` — L14026
+- `_save_pipeline_state` — L14045
+- `_retime_after_audio_dub` — L14069
+- `_build_voice_clone_hybrid_audio` — L14107
+- `_build_dynamic_bgm` — L14245
 
 ---
 
 ### 第七步：拼接视频轨
-Range: **L14284 – L14515** (232 lines)
+Range: **L14289 – L14520** (232 lines)
 
 **Functions:**
-- `step7_concat` — L14285
+- `step7_concat` — L14290
 
 ---
 
 ### 第八步：生成 ASS 字幕
-Range: **L14516 – L15318** (803 lines)
+Range: **L14521 – L15323** (803 lines)
 
 **Sub-sections:**
-- _字幕分段：LLM 智能语义断句_ — L14639-15318 (680 lines)
+- _字幕分段：LLM 智能语义断句_ — L14644-15323 (680 lines)
 
 **Functions:**
-- `_werydance_caption_covered_turns` — L14517
-- `_word_timings_for_subtitle_align` — L14543
-- `_align_segments_via_asr` — L14584
-- `step8_subtitles` — L14627
-- `_read_output_json` — L15039
-- `_qa_file_pass` — L15050
-- `_ass_has_dialogue` — L15057
-- `_write_adsd_delivery_qa` — L15067
-- `_write_bgm_only_qa` — L15207
+- `_werydance_caption_covered_turns` — L14522
+- `_word_timings_for_subtitle_align` — L14548
+- `_align_segments_via_asr` — L14589
+- `step8_subtitles` — L14632
+- `_read_output_json` — L15044
+- `_qa_file_pass` — L15055
+- `_ass_has_dialogue` — L15062
+- `_write_adsd_delivery_qa` — L15072
+- `_write_bgm_only_qa` — L15212
 
 ---
 
 ### 第九步：最终合成
-Range: **L15319 – L15564** (246 lines)
+Range: **L15324 – L15569** (246 lines)
 
 **Functions:**
-- `step9_render` — L15320
+- `step9_render` — L15325
 
 ---
 
 ### 第十步：推送 Telegram
-Range: **L15565 – L17179** (1615 lines)
+Range: **L15570 – L17184** (1615 lines)
 
 **Sub-sections:**
-- _异步封面 + caption（与 step6-9 并发）_ — L16665-16986 (322 lines)
-- _SSL 假阴性防护：见模块级 _tg_probe_send / _tg_probe_delete_ — L16987-16991 (5 lines)
-- _尝试 1：requests（timeout 放大到 600s），前后 probe 跳号检测_ — L16992-17055 (64 lines)
-- _尝试 2：curl fallback（更稳定，不受 httpx/urllib3 限制），同样跳号检测_ — L17056-17101 (46 lines)
-- _尝试 3：小土伯/TG 文件兜底。视频上传链路 SSL 抖动时，压 lite/micro 后用 sendDocument 发文件。_ — L17102-17179 (78 lines)
+- _异步封面 + caption（与 step6-9 并发）_ — L16670-16991 (322 lines)
+- _SSL 假阴性防护：见模块级 _tg_probe_send / _tg_probe_delete_ — L16992-16996 (5 lines)
+- _尝试 1：requests（timeout 放大到 600s），前后 probe 跳号检测_ — L16997-17060 (64 lines)
+- _尝试 2：curl fallback（更稳定，不受 httpx/urllib3 限制），同样跳号检测_ — L17061-17106 (46 lines)
+- _尝试 3：小土伯/TG 文件兜底。视频上传链路 SSL 抖动时，压 lite/micro 后用 sendDocument 发文件。_ — L17107-17184 (78 lines)
 
 **Top-level constants:**
-- `PANTONE_JIEQI` — L15934
-- `PANTONE_FALLBACK` — L15961
-- `FESTIVAL_DATE_TAG` — L16074
+- `PANTONE_JIEQI` — L15939
+- `PANTONE_FALLBACK` — L15966
+- `FESTIVAL_DATE_TAG` — L16079
 
 **Functions:**
-- `_generate_caption` — L15566
-- `_overlay_title_on_cover` — L15804
-- `_prepare_tg_photo` — L15914
-- `_get_pantone_for_date` — L15964
-- `_llm_bottom_note` — L15989
-- `_get_bottom_note` — L16018
-- `_get_date_tag` — L16096
-- `_shrink_to_b64` — L16118
-- `_llm_check_scenes_anomalies` — L16134
-- `_llm_check_cover_unique` — L16187
-- `_llm_check_cover_quality` — L16217
-- `_try_almanac_cover` — L16259
-- `_generate_cover_image` — L16430
-- `_async_kickoff_cover_caption` — L16672
-- `_await_async_cover_caption` — L16702
-- `step10_deliver` — L16726
+- `_generate_caption` — L15571
+- `_overlay_title_on_cover` — L15809
+- `_prepare_tg_photo` — L15919
+- `_get_pantone_for_date` — L15969
+- `_llm_bottom_note` — L15994
+- `_get_bottom_note` — L16023
+- `_get_date_tag` — L16101
+- `_shrink_to_b64` — L16123
+- `_llm_check_scenes_anomalies` — L16139
+- `_llm_check_cover_unique` — L16192
+- `_llm_check_cover_quality` — L16222
+- `_try_almanac_cover` — L16264
+- `_generate_cover_image` — L16435
+- `_async_kickoff_cover_caption` — L16677
+- `_await_async_cover_caption` — L16707
+- `step10_deliver` — L16731
 
 ---
 
 ### 主流程
-Range: **L17180 – L17357** (178 lines)
+Range: **L17185 – L17362** (178 lines)
 
 **Functions:**
-- `_print_execution_plan` — L17181
-- `main` — L17229
+- `_print_execution_plan` — L17186
+- `main` — L17234
 
 ---
