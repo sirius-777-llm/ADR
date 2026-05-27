@@ -13717,6 +13717,7 @@ def step66_adsd_lip_sync(script: list[dict]):
     #   total_dur ≤ 15s / 全 audio_dub 模式 (ADSD audio_dub_experiment)
     _batch_groups: list[list[int]] = []
     _batched_idxs: set[int] = set()
+    log(f"PR-A debug: batching={ADSD_CONSECUTIVE_SPEAKER_BATCHING} audio_dub={ADSD_ALMIGHTY_AUDIO_DUB_EXPERIMENT} consecutive_groups={len(consecutive_groups) if 'consecutive_groups' in dir() else 'UNDEF'}")
     if ADSD_CONSECUTIVE_SPEAKER_BATCHING and ADSD_ALMIGHTY_AUDIO_DUB_EXPERIMENT:
         for g in consecutive_groups:
             if len(g) <= 1:
