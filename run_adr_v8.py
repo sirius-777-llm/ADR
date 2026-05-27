@@ -4577,7 +4577,17 @@ def _text_to_audio_master_voice_timed(script: list[dict], voice_id: int, speed: 
 
 
 def _text_to_audio_master_voice(script: list[dict]) -> str | None:
-    """主路径：用 /generation/text-to-audio TTS，拼接成主音轨。
+    """生成时间轴锚定音轨 + audio_dub 不可用时的 fallback audio.
+
+    ⚠️ 重要 (B27 2026-05-27 文档校正):
+    master_voice.mp3 不是首选听感. ADR 真实 audio 链路:
+      1. ADSD / HADS+WITH_MOTION + voice_asset_audio_dub_experiment 模式下,
+         step66 / step65 WERYDANCE Almighty audio_dub 用 voice_asset 克隆生成
+         embedded audio → step9 用这个 (use_embedded_dialogue_audio=True) 作首选听感
+      2. master_voice.mp3 仅在 audio_dub 不可用 / coverage<阈值 时被 step9 mux 进成片
+      3. master_voice.mp3 主作用是: 锚定每个分镜头时长 (step3 时间轴) +
+         给 _has_audio_stream 探针 + WERYDANCE 失败的 fallback
+
     优先策略：脚本总字符 ≤ 500 时一次性整段送，保留 TTS 引擎自然语义停顿；
     超长则按句号边界 smart-split 成多个 ≤ 500 字符 chunk。
     若 script 携带 override_audio_start/end → 切换 timed 模式，逐句 TTS + 静音补齐到 timecode。
@@ -14102,11 +14112,12 @@ def _retime_after_audio_dub(script: list[dict]) -> int:
     return extended
 
 
-# ── audio_dub voice-clone splice：把 A-roll seg 里的克隆音色拼回主音轨 ─────────
+# ── audio_dub voice-clone splice：把 A-roll seg 里的克隆音色拼回时间轴锚定音轨 ─────────
 def _build_voice_clone_hybrid_audio(script: list[dict], master_voice_path: str) -> str | None:
-    """ADSD audio_dub 模式专用：A-roll seg_N.mp4 里 WERYDANCE 生成的克隆音色
-    会被 step9 默认主音轨 mux 流程覆盖（master_voice = weryai 默认 TTS）。
-    本函数构造混合主音轨：
+    """ADSD audio_dub 模式专用 (B27 2026-05-27 措辞校正):
+    voice_asset clone audio 是首选听感, 但 step9 在 use_embedded=False 时
+    fallback 走 master_voice.mp3 (默认 TTS, 不是克隆音色) 会丢克隆.
+    本函数构造混合音轨, 把克隆音色 splice 进时间轴锚定音轨, 让 fallback 也保留克隆音色:
       - A-roll turn → 抽 seg_N.mp4 的音轨（克隆音色）
       - B-roll turn → 切 master_voice 的对应区间（默认 TTS）
     返回新 mp3 路径，供 step9 替换 voice_path。失败返回 None。
@@ -15335,6 +15346,11 @@ def step9_render(raw_path: str, voice_path: str, bgm_path: str | None, ass_path:
         tg(f"🎵 step9 BGM 正常传入: {bgm_path}")
     if NO_VOICE and not bgm_path:
         raise RuntimeError("ADR/ADS BGM-only 模式要求必须有 BGM；BGM 生成失败，阻断静音成片交付")
+    # B27 (2026-05-27 文档校正): step9 audio source 优先级
+    #   1. use_embedded_dialogue_audio=True → 用 raw_concat 内 WERYDANCE Almighty audio_dub
+    #      生成的 voice_asset 克隆音色 (**首选听感**, ADR 真实 audio 设计)
+    #   2. use_embedded_dialogue_audio=False → 用 master_voice.mp3 (TTS 时间轴锚定音轨, fallback)
+    # ⚠️  早期 ADR 只有 TTS, 代码/文档保留"主音轨"命名, 实际现在 TTS 是 fallback 不是首选.
     use_embedded_dialogue_audio = False
     embedded_audio_mode = ""
     if ADS_DIALOGUE_MODE and ADSD_ALMIGHTY_AUDIO_DUB_EXPERIMENT:
@@ -15350,41 +15366,36 @@ def step9_render(raw_path: str, voice_path: str, bgm_path: str | None, ass_path:
         except Exception as e:
             log(f"Almighty audio-dub embedded audio 检测失败，继续使用主音轨: {e}")
     elif WITH_MOTION and VOICE_ASSET_AUDIO_DUB_EXPERIMENT:
-        # B24 (2026-05-27): HADS/VADS 单旁白模式默认用 master TTS audio
-        # WERYDANCE Almighty audio_dub 跨 turn clone 同 voice_asset 但 stochastic 漂移,
-        # 14 turn 拼起来旁白音色不稳定. master TTS deterministic 跨 turn 稳定, 嘴型 misalign
-        # 旁白空镜不显. env ADR_HADS_USE_EMBEDDED_AUDIO=1 显式 opt-in 旧路径.
-        if os.environ.get("ADR_HADS_USE_EMBEDDED_AUDIO", "").strip().lower() not in ("1", "true", "yes", "on"):
-            log("B24: HADS/VADS 单旁白模式跳过 embedded audio_dub, 强制 master TTS audio (跨 turn 稳定)")
-        else:
-            try:
-                motion_qa = _read_output_json("motion_qa.json")
-                records = motion_qa.get("records") or []
-                generated_count = sum(1 for r in records if r.get("pass") and r.get("video_has_audio") and r.get("generated_audio_from_prompt_dialogue"))
-                expected_count = int(motion_qa.get("total") or len({int(r.get("turn", 0)) for r in records if r.get("turn")}) or len(records) or 0)
-                has_raw_audio = _has_audio_stream(raw_path)
-                coverage = generated_count / max(expected_count, 1)
-                full_ready = generated_count == expected_count and generated_count > 0
-                partial_ready = (
-                    VOICE_ASSET_AUDIO_DUB_PARTIAL_OK
-                    and generated_count > 0
-                    and coverage >= VOICE_ASSET_AUDIO_DUB_MIN_COVERAGE
-                )
-                use_embedded_dialogue_audio = has_raw_audio and (full_ready or partial_ready)
-                if use_embedded_dialogue_audio:
-                    embedded_audio_mode = "motion_voice_asset_audio_dub" if full_ready else f"motion_voice_asset_audio_dub_partial_{generated_count}_of_{expected_count}"
-            except Exception as e:
-                log(f"motion voice-asset audio-dub embedded audio 检测失败，继续使用主音轨: {e}")
+        try:
+            motion_qa = _read_output_json("motion_qa.json")
+            records = motion_qa.get("records") or []
+            generated_count = sum(1 for r in records if r.get("pass") and r.get("video_has_audio") and r.get("generated_audio_from_prompt_dialogue"))
+            expected_count = int(motion_qa.get("total") or len({int(r.get("turn", 0)) for r in records if r.get("turn")}) or len(records) or 0)
+            has_raw_audio = _has_audio_stream(raw_path)
+            coverage = generated_count / max(expected_count, 1)
+            full_ready = generated_count == expected_count and generated_count > 0
+            partial_ready = (
+                VOICE_ASSET_AUDIO_DUB_PARTIAL_OK
+                and generated_count > 0
+                and coverage >= VOICE_ASSET_AUDIO_DUB_MIN_COVERAGE
+            )
+            use_embedded_dialogue_audio = has_raw_audio and (full_ready or partial_ready)
+            if use_embedded_dialogue_audio:
+                embedded_audio_mode = "motion_voice_asset_audio_dub" if full_ready else f"motion_voice_asset_audio_dub_partial_{generated_count}_of_{expected_count}"
+        except Exception as e:
+            log(f"motion voice-asset audio-dub embedded audio 检测失败，继续使用主音轨: {e}")
     render_audio_offset = 0.0 if (ADS_DIALOGUE_MODE and ADSD_LIP_SYNC_EXPERIMENT) else AUDIO_DELAY
     if NO_VOICE:
         sync_note = "BGM-only 模式：无旁白 TTS、无字幕，静音轨仅用于时间轴占位"
         audio_note = "BGM-only ✓"
     elif use_embedded_dialogue_audio:
-        sync_note = f"{embedded_audio_mode or 'audio-dub'} 模式：使用视频段内生成语音，不叠加 TTS 主音轨"
-        audio_note = "WERYDANCE 段内语音 ✓" + (" BGM ✓" if bgm_path else "")
+        # B27: 这是首选路径. voice_asset clone audio 是真实听感来源.
+        sync_note = f"{embedded_audio_mode or 'audio-dub'} 模式：voice_asset 克隆音色 (首选听感)，不叠加 TTS fallback"
+        audio_note = "voice_asset 克隆 ✓" + (" BGM ✓" if bgm_path else "")
     else:
+        # B27: voice_asset clone 不可用 → fallback 走 TTS 时间轴锚定音轨 (不是首选听感)
         sync_note = "口型同步模式：音频不延迟" if render_audio_offset == 0 else "画面 → +{:.1f}s 字幕 → +{:.1f}s 配音".format(SUB_DELAY, render_audio_offset)
-        audio_note = "主音轨 ✓" + (" BGM ✓" if bgm_path else "")
+        audio_note = "TTS fallback (锚定时长, 非首选听感) ✓" + (" BGM ✓" if bgm_path else "")
     ass_dialogue_ready = _ass_has_dialogue(ass_path)
     caption_qa = _read_output_json("werydance_caption_qa.json") if WERYDANCE_CAPTIONS else None
     if NO_VOICE:
@@ -17196,7 +17207,7 @@ def _print_execution_plan() -> None:
     # (模块名, 是否激活, 预估时间 min, 预估 credits, 说明)
     plan: list[tuple[str, bool, str, str, str]] = [
         ("Step1 剧本+视觉规划", True, "1-2", "0", "LLM 链 (Gemini/Claude)"),
-        ("Step2 text-to-audio 主音轨", not NO_VOICE and not ADS_DIALOGUE_MODE, "1-3", "~25", "主路径：text-to-audio per-line；失败降级 Podcast → OpenAI → Edge TTS"),
+        ("Step2 text-to-audio 时间轴锚定音轨", not NO_VOICE and not ADS_DIALOGUE_MODE, "1-3", "~25", "时间轴锚定 + audio_dub 不可用时 fallback (B27 校正: voice_asset 克隆才是首选听感, 走 step66/step65)"),
         ("Step2 BGM-only 静音轨", NO_VOICE, "0.1", "0", "ffmpeg 生成静音占位"),
         ("ADSD 逐句 text-to-audio", ADS_DIALOGUE_MODE, "2-3", "~25", "每 turn 一次 TTS"),
         ("Step6 character_sheet", CHARACTER_TRAILER_MODE or STORYBOARD_GRID_MULTIREF_MAIN or (ADS_DIALOGUE_MODE and ADSD_LIP_SYNC_EXPERIMENT) or (ADS_REPORTER_MODE and not ADS_DIALOGUE_MODE and ADS_CHARACTER_SHEET_REQUESTED), "2-3", "~60", "GPT Image 2 model sheet"),
