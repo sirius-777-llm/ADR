@@ -8183,6 +8183,13 @@ def _character_meta_grid_cache_path(speaker: str) -> Path:
     return _character_meta_grid_cache_dir() / f"{safe}{suffix}.png"
 
 
+def _character_meta_grid_cache_legacy_path(speaker: str) -> Path:
+    """B18 (2026-05-27): B11 前无 suffix 老缓存路径 (默认按横屏处理).
+    旁白/孙悟空/科比/唐僧 等 top usage IP 被 B11 命名迁移漏在 fallback 里."""
+    safe = re.sub(r"[^一-龥A-Za-z0-9]", "", speaker)[:30] or "speaker"
+    return _character_meta_grid_cache_dir() / f"{safe}.png"
+
+
 def _character_meta_grid_path(speaker: str) -> Path:
     """每个 speaker 的人设符 grid 标准路径（当前 OUTPUT_DIR）。"""
     safe = re.sub(r"[^一-龥A-Za-z0-9]", "", speaker)[:20] or "speaker"
@@ -8218,7 +8225,7 @@ def generate_character_meta_grid_gpt_image2(speaker: str, visual_subject: str, v
         if ip.get("visual_subject"):
             visual_subject = ip["visual_subject"]
             log(f"Speaker IP: {speaker} 用 IP visual_subject 覆盖")
-    # 方向 4: 先查跨 run 缓存（voice_assets/character_meta_grids/{speaker}.png）
+    # 方向 4: 先查跨 run 缓存（voice_assets/character_meta_grids/{speaker}{_h|_v}.png）
     cache_path = _character_meta_grid_cache_path(speaker)
     use_cache = os.environ.get("ADR_META_GRID_CACHE", "1").strip().lower() not in ("0", "false", "no", "off")
     if use_cache and cache_path.exists() and cache_path.stat().st_size > 100000:
@@ -8229,6 +8236,20 @@ def generate_character_meta_grid_gpt_image2(speaker: str, visual_subject: str, v
             return str(out_path)
         except Exception as e:
             log(f"meta_grid 缓存复用失败（重新生成）：{e}")
+    # B18 (2026-05-27): B11 前老缓存 (无 _h/_v suffix) fallback - 默认按横屏处理.
+    # 修 旁白/孙悟空/唐僧/科比 等 top usage IP 被 B11 命名迁移漏 → 每 run 重新生成的 bug.
+    if use_cache and not IS_VERTICAL:
+        legacy_path = _character_meta_grid_cache_legacy_path(speaker)
+        if legacy_path.exists() and legacy_path.stat().st_size > 100000:
+            try:
+                from shutil import copyfile
+                copyfile(legacy_path, out_path)
+                # 顺手 migrate 老缓存 → 新版 _h 命名, 下次走主路径
+                copyfile(legacy_path, cache_path)
+                log(f"B18 legacy fallback: meta_grid {speaker} 老缓存复用并 migrate 到 _h 命名")
+                return str(out_path)
+            except Exception as e:
+                log(f"meta_grid legacy fallback 复用失败（重新生成）：{e}")
     subject = visual_subject or "an adult Chinese historical figure"
     # P2: era-aware template，LLM/fallback 决定标签集
     template = _resolve_meta_grid_template(speaker, topic, ip)
