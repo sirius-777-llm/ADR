@@ -13888,30 +13888,27 @@ def step66_adsd_lip_sync(script: list[dict]):
     else:
         tg(f"⚠️ {ADSD_MODE_NAME} WERYDANCE 渲染 QA 未达标：A-roll {a_roll_success}/{a_roll_total}（阈值 80%），可静态/motion兜底成片")
     # R2 阶段 C++ Smart Abort (2026-05-26): A-roll 失败率 > 50% → kill 不出片
-    # codex 审查 fix: 用 A-roll 失败率 (跟 QA pass 同标准), B-roll transient fail 不误 kill
-    # 避免出「9 个 Ken Burns + 3 个真视频」的支离破碎烂片污染 TG
-    if os.environ.get("ADR_SMART_ABORT_HIGH_FAIL", "1").strip().lower() not in ("0", "false", "no", "off"):
-        # 跟 QA pass 同标准：a_roll_total >= 4 且 A-roll 失败率 >= 50%
-        a_roll_fail_rate = (a_roll_total - a_roll_success) / a_roll_total if a_roll_total else 0
-        total_fail_rate = sum(1 for r in records if not r.get("pass")) / len(records) if records else 0
-        # 触发条件: A-roll 严重失败 (>=50%) 或 整体严重失败 (>=60%)
-        should_abort = (
-            (a_roll_total >= 4 and a_roll_fail_rate >= 0.5)
-            or (len(records) >= 8 and total_fail_rate >= 0.6)
+    # B21 (2026-05-27): Ken Burns 兜底没意义, 永远 abort 不留绕过口子.
+    # 跟 QA pass 同标准: a_roll_total >= 4 且 A-roll 失败率 >= 50%
+    a_roll_fail_rate = (a_roll_total - a_roll_success) / a_roll_total if a_roll_total else 0
+    total_fail_rate = sum(1 for r in records if not r.get("pass")) / len(records) if records else 0
+    # 触发条件: A-roll 严重失败 (>=50%) 或 整体严重失败 (>=60%)
+    should_abort = (
+        (a_roll_total >= 4 and a_roll_fail_rate >= 0.5)
+        or (len(records) >= 8 and total_fail_rate >= 0.6)
+    )
+    if should_abort:
+        err = (
+            f"⛔ Smart Abort: A-roll fail {a_roll_total - a_roll_success}/{a_roll_total} ({a_roll_fail_rate*100:.0f}%) "
+            f"+ 总 fail {sum(1 for r in records if not r.get('pass'))}/{len(records)} ({total_fail_rate*100:.0f}%)\n"
+            f"成片大半失败，质量不可看，kill run 节省 step7-10 时间\n"
+            f"建议改题材 (audit hell 主题: 现代名人/品牌)"
         )
-        if should_abort:
-            err = (
-                f"⛔ Smart Abort: A-roll fail {a_roll_total - a_roll_success}/{a_roll_total} ({a_roll_fail_rate*100:.0f}%) "
-                f"+ 总 fail {sum(1 for r in records if not r.get('pass'))}/{len(records)} ({total_fail_rate*100:.0f}%)\n"
-                f"成片大半 Ken Burns 兜底，质量不可看，kill run 节省 step7-10 时间\n"
-                f"建议改题材 (audit hell 主题: 现代名人/品牌)\n"
-                f"或显式 opt-in: env ADR_SMART_ABORT_HIGH_FAIL=0 强制出 Ken Burns 兜底片"
-            )
-            try:
-                tg(err)
-            except Exception:
-                pass
-            raise RuntimeError(err)
+        try:
+            tg(err)
+        except Exception:
+            pass
+        raise RuntimeError(err)
 
 
 def step65_motion(script: list[dict]):
@@ -15353,24 +15350,31 @@ def step9_render(raw_path: str, voice_path: str, bgm_path: str | None, ass_path:
         except Exception as e:
             log(f"Almighty audio-dub embedded audio 检测失败，继续使用主音轨: {e}")
     elif WITH_MOTION and VOICE_ASSET_AUDIO_DUB_EXPERIMENT:
-        try:
-            motion_qa = _read_output_json("motion_qa.json")
-            records = motion_qa.get("records") or []
-            generated_count = sum(1 for r in records if r.get("pass") and r.get("video_has_audio") and r.get("generated_audio_from_prompt_dialogue"))
-            expected_count = int(motion_qa.get("total") or len({int(r.get("turn", 0)) for r in records if r.get("turn")}) or len(records) or 0)
-            has_raw_audio = _has_audio_stream(raw_path)
-            coverage = generated_count / max(expected_count, 1)
-            full_ready = generated_count == expected_count and generated_count > 0
-            partial_ready = (
-                VOICE_ASSET_AUDIO_DUB_PARTIAL_OK
-                and generated_count > 0
-                and coverage >= VOICE_ASSET_AUDIO_DUB_MIN_COVERAGE
-            )
-            use_embedded_dialogue_audio = has_raw_audio and (full_ready or partial_ready)
-            if use_embedded_dialogue_audio:
-                embedded_audio_mode = "motion_voice_asset_audio_dub" if full_ready else f"motion_voice_asset_audio_dub_partial_{generated_count}_of_{expected_count}"
-        except Exception as e:
-            log(f"motion voice-asset audio-dub embedded audio 检测失败，继续使用主音轨: {e}")
+        # B24 (2026-05-27): HADS/VADS 单旁白模式默认用 master TTS audio
+        # WERYDANCE Almighty audio_dub 跨 turn clone 同 voice_asset 但 stochastic 漂移,
+        # 14 turn 拼起来旁白音色不稳定. master TTS deterministic 跨 turn 稳定, 嘴型 misalign
+        # 旁白空镜不显. env ADR_HADS_USE_EMBEDDED_AUDIO=1 显式 opt-in 旧路径.
+        if os.environ.get("ADR_HADS_USE_EMBEDDED_AUDIO", "").strip().lower() not in ("1", "true", "yes", "on"):
+            log("B24: HADS/VADS 单旁白模式跳过 embedded audio_dub, 强制 master TTS audio (跨 turn 稳定)")
+        else:
+            try:
+                motion_qa = _read_output_json("motion_qa.json")
+                records = motion_qa.get("records") or []
+                generated_count = sum(1 for r in records if r.get("pass") and r.get("video_has_audio") and r.get("generated_audio_from_prompt_dialogue"))
+                expected_count = int(motion_qa.get("total") or len({int(r.get("turn", 0)) for r in records if r.get("turn")}) or len(records) or 0)
+                has_raw_audio = _has_audio_stream(raw_path)
+                coverage = generated_count / max(expected_count, 1)
+                full_ready = generated_count == expected_count and generated_count > 0
+                partial_ready = (
+                    VOICE_ASSET_AUDIO_DUB_PARTIAL_OK
+                    and generated_count > 0
+                    and coverage >= VOICE_ASSET_AUDIO_DUB_MIN_COVERAGE
+                )
+                use_embedded_dialogue_audio = has_raw_audio and (full_ready or partial_ready)
+                if use_embedded_dialogue_audio:
+                    embedded_audio_mode = "motion_voice_asset_audio_dub" if full_ready else f"motion_voice_asset_audio_dub_partial_{generated_count}_of_{expected_count}"
+            except Exception as e:
+                log(f"motion voice-asset audio-dub embedded audio 检测失败，继续使用主音轨: {e}")
     render_audio_offset = 0.0 if (ADS_DIALOGUE_MODE and ADSD_LIP_SYNC_EXPERIMENT) else AUDIO_DELAY
     if NO_VOICE:
         sync_note = "BGM-only 模式：无旁白 TTS、无字幕，静音轨仅用于时间轴占位"
