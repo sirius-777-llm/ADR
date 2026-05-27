@@ -970,7 +970,8 @@ ADS_STORYBOARD_FLOW_DEFAULT = (
 if ADS_STORYBOARD_FLOW_DEFAULT:
     STORYBOARD_GRID_MULTIREF_MOTION = True
     STORYBOARD_GRID_MULTIREF_MAIN = True
-    os.environ.setdefault("ADR_STORYBOARD_GRID_MULTIREF_GROUP", "12")
+    # B34.1 (2026-05-27): GROUP 12→4 让每 panel 时长充裕 (3.75s/panel vs 之前 1.4s/panel)
+    os.environ.setdefault("ADR_STORYBOARD_GRID_MULTIREF_GROUP", "4")
     os.environ.setdefault("ADR_GRID_MULTIREF_MAIN_MIN_PASS_RATIO", "0.75")
 
 ADS_RETENTION_MODE = (
@@ -11118,6 +11119,8 @@ def _poll_video_task_download(task_id: str, out_path: Path, label: str, max_iter
 
 
 def _grid_multiref_group_size() -> int:
+    # B34.1 (2026-05-27): 默认 4 (从 12) 让 7 panel 拆 4+3 两组, 每组 panel 充裕时长
+    # 之前 12 让 7 panel 全 1 组 cap 10s = 1.4s/panel 切换太快 (大哥实测反馈缺点 2)
     try:
         raw = int(os.environ.get("ADR_STORYBOARD_GRID_MULTIREF_GROUP", "4"))
     except Exception:
@@ -11126,19 +11129,25 @@ def _grid_multiref_group_size() -> int:
 
 
 def _grid_multiref_duration(group: list[dict]) -> int:
+    # B34.1 (2026-05-27): duration cap 10→15 (WERYDANCE 硬上限), 给每 panel 充裕时长
+    # 配合 group_size=4: 15s / 4 panel ≈ 3.75s/panel (vs 之前 1.4s/panel)
     override = os.environ.get("ADR_STORYBOARD_GRID_MULTIREF_DURATION", "").strip()
     if override:
         try:
-            return max(5, min(10, int(round(float(override)))))
+            return max(5, min(15, int(round(float(override)))))
         except Exception:
             pass
     total = 0.0
     for scene in group:
         try:
-            total += float(scene.get("vid_duration") or scene.get("dur") or 1.25)
+            d = float(scene.get("vid_duration") or scene.get("dur") or 1.25)
+            # Codex Stage 3 High fix: nan/inf 污染 total round 崩, math.isfinite 过滤
+            if not math.isfinite(d) or d <= 0:
+                d = 1.25
+            total += d
         except Exception:
             total += 1.25
-    return max(5, min(10, int(round(total))))
+    return max(5, min(15, int(round(total))))
 
 
 def _grid_multiref_segment_max_stretch() -> float:
