@@ -12231,7 +12231,13 @@ def _generate_grid_multiref_motion_segments(script: list[dict], motion_prompts: 
             duration = _grid_multiref_duration(group)
             prompt = _grid_multiref_prompt(group, scene_indices[0], motion_prompts, has_character_sheet=bool(sheet_url))
             _wait_motion_submit_slot(f"grid multi-ref {group_no}")
-            r = req_post("/generation/almighty-reference-to-video", {
+            # B35 (2026-05-28): 加 voice_asset audio ref 让 LLM 选音色生效 (修大哥反馈"音色不是 LLM 定的")
+            # 之前: generate_audio=false silent video → step9 mux master_voice TTS hardcode 78 女声
+            # 现在: 加 audios=[voice_ref.path] + generate_audio=true → combined 含 LLM 选音色 clone
+            # try/except 包整 submit, 上游 reject combo 自动回退原 silent 路径
+            voice_ref = _select_voice_asset_reference(group[0], mode="motion")
+            audio_url = None
+            payload = {
                 "model": "WERYDANCE_2_0",
                 "images": image_urls,
                 "prompt": prompt,
@@ -12240,12 +12246,50 @@ def _generate_grid_multiref_motion_segments(script: list[dict], motion_prompts: 
                 "resolution": qa["resolution"],
                 "generate_audio": "false",
                 "video_number": 1,
-            }, timeout=30)
-            task_id = r.get("data", {}).get("task_id") or (r.get("data", {}).get("task_ids") or [None])[0]
+            }
+            if voice_ref and voice_ref.get("path") and os.path.exists(voice_ref["path"]):
+                try:
+                    audio_url = _upload_to_weryai(voice_ref["path"])
+                    payload["audios"] = [audio_url]
+                    payload["generate_audio"] = "true"
+                    record["voice_ref_used"] = voice_ref.get("asset_id")
+                    record["audio_url"] = audio_url
+                    log(f"B35 grid_multiref group {group_no} voice_ref: {voice_ref.get('asset_id')}")
+                except Exception as _e:
+                    log(f"B35 voice_ref upload 失败 (回退 silent): {_e}")
+                    payload.pop("audios", None)
+                    payload["generate_audio"] = "false"
+                    record["b35_fallback_reason"] = f"upload_failed:{_e}"
+            # B35 (2026-05-28): 上游 reject combo 自动回退 silent retry
+            # 覆盖 3 种 reject: 200 no task_id / 4xx exception / 5xx exception
+            r = None
+            task_id = None
+            try:
+                r = req_post("/generation/almighty-reference-to-video", payload, timeout=30)
+                task_id = r.get("data", {}).get("task_id") or (r.get("data", {}).get("task_ids") or [None])[0]
+            except Exception as _e:
+                if audio_url:
+                    log(f"B35 grid_multiref group {group_no} combo exception: {_e}, 回退 silent retry")
+                    record["b35_fallback_reason"] = f"combo_exception:{str(_e)[:200]}"
+                    payload.pop("audios", None)
+                    payload["generate_audio"] = "false"
+                    audio_url = None  # 防 inner retry 又 fallback
+                    r = req_post("/generation/almighty-reference-to-video", payload, timeout=30)
+                    task_id = r.get("data", {}).get("task_id") or (r.get("data", {}).get("task_ids") or [None])[0]
+                else:
+                    raise  # 没用 audio_url, 上游异常直接 raise 走外层 except
+            if not task_id and audio_url:
+                log(f"B35 grid_multiref group {group_no} combo reject (no task_id), 回退 silent retry")
+                record["b35_fallback_reason"] = f"combo_no_task_id:{json.dumps(r or {}, ensure_ascii=False)[:200]}"
+                payload.pop("audios", None)
+                payload["generate_audio"] = "false"
+                r = req_post("/generation/almighty-reference-to-video", payload, timeout=30)
+                task_id = r.get("data", {}).get("task_id") or (r.get("data", {}).get("task_ids") or [None])[0]
             record.update({
                 "image_urls": image_urls,
                 "submit_duration": duration,
                 "task_id": task_id,
+                "generate_audio_mode": payload["generate_audio"],
             })
             if not task_id:
                 record.update({"reason": "submit_without_task_id", "response": r})
@@ -15611,7 +15655,10 @@ def step9_render(raw_path: str, voice_path: str, bgm_path: str | None, ass_path:
     fmt_tag = CURRENT_MODE_LABEL
     final_path = str(OUTPUT_DIR / f"ADR_V8_{fmt_tag}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.mp4")
     ass_escaped = ass_path.replace("\\", "/").replace(":", "\\:") if ass_path else ""
-    vf_base = f"scale={VIDEO_W}:{VIDEO_H},setsar=1,setdar={ASPECT_RATIO},tpad=stop_mode=clone:stop_duration=1.5"
+    # B36 (2026-05-28): tail buffer 1.5→2.5s 修大哥反馈"旁白刚说完就没了"
+    # env ADR_TAIL_BUFFER_SEC 可调 (默认 2.5, 0 禁用)
+    _tail_buffer = max(0.0, min(5.0, float(os.environ.get("ADR_TAIL_BUFFER_SEC", "2.5"))))
+    vf_base = f"scale={VIDEO_W}:{VIDEO_H},setsar=1,setdar={ASPECT_RATIO},tpad=stop_mode=clone:stop_duration={_tail_buffer}"
     vf_with_subtitles = f"{vf_base},ass={ass_escaped}" if ass_dialogue_ready else vf_base
 
     # -itsoffset AUDIO_DELAY 延迟音频，画面先出
@@ -15642,7 +15689,7 @@ def step9_render(raw_path: str, voice_path: str, bgm_path: str | None, ass_path:
                 "-i", raw_path,
                 "-i", bgm_path,
                 "-filter_complex",
-                "[0:a]apad=pad_dur=1.5,volume=1.8[va];[1:a]volume=0.35[ba];[va][ba]amix=inputs=2:duration=first:normalize=0:weights=1.0 0.35[aout]",
+                f"[0:a]apad=pad_dur={_tail_buffer},volume=1.8[va];[1:a]volume=0.35[ba];[va][ba]amix=inputs=2:duration=first:normalize=0:weights=1.0 0.35[aout]",
                 "-map", "0:v",
                 "-map", "[aout]",
                 "-vf", vf_with_subtitles,
@@ -15663,7 +15710,7 @@ def step9_render(raw_path: str, voice_path: str, bgm_path: str | None, ass_path:
                 "-itsoffset", offset, "-i", voice_path,
                 "-itsoffset", offset, "-i", bgm_path,
                 "-filter_complex",
-                "[1:a]apad=pad_dur=1.5,volume=2.0[va];[2:a]aloop=loop=-1:size=2147483647,volume=0.4[ba];[va][ba]amix=inputs=2:duration=first:normalize=0:weights=1.0 0.4[aout]",
+                f"[1:a]apad=pad_dur={_tail_buffer},volume=2.0[va];[2:a]aloop=loop=-1:size=2147483647,volume=0.4[ba];[va][ba]amix=inputs=2:duration=first:normalize=0:weights=1.0 0.4[aout]",
                 "-map", "0:v",
                 "-map", "[aout]",
                 "-vf", vf_with_subtitles,
@@ -15678,7 +15725,7 @@ def step9_render(raw_path: str, voice_path: str, bgm_path: str | None, ass_path:
         if use_embedded_dialogue_audio:
             ffmpeg(
                 "-i", raw_path,
-                "-filter_complex", "[0:a]apad=pad_dur=1.5[aout]",
+                "-filter_complex", f"[0:a]apad=pad_dur={_tail_buffer}[aout]",
                 "-map", "0:v",
                 "-map", "[aout]",
                 "-vf", vf_with_subtitles,
@@ -15693,7 +15740,7 @@ def step9_render(raw_path: str, voice_path: str, bgm_path: str | None, ass_path:
             ffmpeg(
                 "-i", raw_path,
                 "-itsoffset", offset, "-i", voice_path,
-                "-filter_complex", "[1:a]apad=pad_dur=1.5[aout]",
+                "-filter_complex", f"[1:a]apad=pad_dur={_tail_buffer}[aout]",
                 "-map", "0:v",
                 "-map", "[aout]",
                 "-vf", vf_with_subtitles,
