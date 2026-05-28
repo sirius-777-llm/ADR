@@ -6829,7 +6829,7 @@ def generate_storyboard_images_gpt_image2(script: list[dict], topic: str) -> boo
         "requested_count": n,
         "batch_size": min(4, int(os.environ.get("ADR_GPT_IMAGE2_STORYBOARD_BATCH", "1"))),
         "batch_poll_timeout_sec": float(os.environ.get("ADR_GPT_IMAGE2_STORYBOARD_POLL_MAX", "240")),
-        "submit_stagger_sec": max(0.0, float(os.environ.get("ADR_GPT_IMAGE2_STORYBOARD_SUBMIT_STAGGER", "12"))),
+        "submit_stagger_sec": max(0.0, float(os.environ.get("ADR_GPT_IMAGE2_STORYBOARD_SUBMIT_STAGGER", "5"))),  # B33: 12→5s
         "poll_workers": max(1, min(20, int(os.environ.get("ADR_GPT_IMAGE2_STORYBOARD_POLL_WORKERS", "20")))),
         "batches": [],
         "downloaded_count": 0,
@@ -8914,7 +8914,7 @@ def generate_storyboard_grid_gpt_image2(script: list[dict], topic: str) -> bool:
     batch_size = max(1, min(16, int(os.environ.get("ADR_GPT_IMAGE2_STORYBOARD_GRID_BATCH", "12"))))
     prompt_limit = _storyboard_grid_prompt_limit()
     poll_max = float(os.environ.get("ADR_GPT_IMAGE2_STORYBOARD_GRID_POLL_MAX", "300"))
-    submit_stagger_sec = max(0.0, float(os.environ.get("ADR_GPT_IMAGE2_STORYBOARD_GRID_SUBMIT_STAGGER", "12")))
+    submit_stagger_sec = max(0.0, float(os.environ.get("ADR_GPT_IMAGE2_STORYBOARD_GRID_SUBMIT_STAGGER", "5")))  # B33: 12→5s
     poll_workers = max(1, min(20, int(os.environ.get("ADR_GPT_IMAGE2_STORYBOARD_GRID_POLL_WORKERS", "20"))))
     qa = {
         "mode": "gpt_image2_storyboard_grid_4k",
