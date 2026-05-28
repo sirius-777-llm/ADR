@@ -4285,6 +4285,23 @@ shot_type/camera_angle/lighting/camera_motion 必须从上述 enum 选, 不能�
     except Exception as e:
         log(f"PR-3b brief.shot_list 写入失败（不影响）：{e}")
 
+    # PR-3c (2026-05-28): 音效师 Agent — _audio_director_design 写 brief.audio.sfx (OiiOii 简化版)
+    # LLM 主案 + 规则兜底 (跟 PR-3b.2 _shot_blueprint_enums 同保底套路)
+    # 不动 mux, 仅设计层数据收集为 PR-3c.1 mux 集成铺路
+    try:
+        brief = _load_brief(topic)
+        if brief.get("agents", {}).get("audio_director", {}).get("status") != "succeeded":
+            sfx_list = _audio_director_design(topic, num_lines, brief)
+            if sfx_list:
+                _brief_claim(
+                    brief, "audio_director", "brief.audio.sfx", sfx_list,
+                    f"音效师 Agent ({len(sfx_list)} SFX, LLM 或规则兜底)"
+                )
+                _save_brief(brief)
+                log(f"PR-3c audio_director 写入 {len(sfx_list)} SFX → brief.audio.sfx")
+    except Exception as e:
+        log(f"PR-3c brief.audio.sfx 写入失败（不影响）：{e}")
+
     # tone 决定情绪→风格查询池
     style_pool = EMOTION_STYLE_BRIGHT if tone == "轻松" else EMOTION_STYLE
 
@@ -7861,6 +7878,155 @@ def _brief_from_topic_decomposition(brief: dict, decomp: dict) -> None:
     # flags
     if "is_action_topic" in decomp:
         _brief_claim(brief, agent, "brief.flags.is_action_topic", bool(decomp.get("is_action_topic")), reason)
+
+
+# PR-3c (2026-05-28): 音效师 Agent — OiiOii 7-Agent 团队的 audio_director
+# 简化版: LLM 主案 + 规则兜底, 写 brief.audio.sfx 设计层 (不动 mux, mux 集成留 PR-3c.1)
+# SFX 类型固定枚举 + intensity 三档 + 相对时点 (hook/middle/payoff)
+
+_SFX_TYPE_ENUM = {
+    "door", "wind", "sword", "laugh", "sea_waves", "footsteps", "ambient",
+    "horse_hoof", "rain", "thunder", "fire_crackle", "metal_clang", "breath",
+    "cloth_snap", "bird_chirp", "crowd_murmur", "silence",
+}
+_SFX_INTENSITY_ENUM = {"low", "mid", "high"}
+_SFX_POSITION_ENUM = {"hook", "middle", "payoff"}
+
+
+def _rule_based_sfx_design(topic: str, num_lines: int, era: str = "", bgm_mood: str = "") -> list[dict]:
+    """规则兜底: 跟 era / bgm_mood 匹配出 3-5 个 SFX (hook/middle/payoff).
+    LLM fail 或 disabled 时 fallback. 跟 _shot_blueprint_enums 同套路保底.
+    """
+    era_l = (era or "").lower()
+    mood_l = (bgm_mood or "")
+    sfx_list = []
+    # hook (开场)
+    if any(k in era_l for k in ("han", "tang", "song", "qing", "ming", "historical", "古")):
+        sfx_list.append({"position": "hook", "trigger_at_sec": 0.0, "sfx_type": "wind",
+                         "intensity": "low", "description": "low rolling wind across ancient landscape",
+                         "duration_hint": 2.5})
+    elif "action" in mood_l or "epic" in mood_l or "激昂" in mood_l:
+        sfx_list.append({"position": "hook", "trigger_at_sec": 0.0, "sfx_type": "metal_clang",
+                         "intensity": "high", "description": "sharp metallic impact opening accent",
+                         "duration_hint": 1.5})
+    else:
+        sfx_list.append({"position": "hook", "trigger_at_sec": 0.0, "sfx_type": "ambient",
+                         "intensity": "low", "description": "soft scene-establishing ambience",
+                         "duration_hint": 2.0})
+    # middle (情绪点, 估算位置 = 30%)
+    mid_t = round(num_lines * 0.4 * 2.5, 1) if num_lines > 0 else 6.0
+    if "悲" in mood_l or "孤" in mood_l or "压抑" in mood_l:
+        sfx_list.append({"position": "middle", "trigger_at_sec": mid_t, "sfx_type": "breath",
+                         "intensity": "mid", "description": "drawn human breath beneath BGM",
+                         "duration_hint": 1.2})
+    elif "战" in mood_l or "epic" in mood_l or "激昂" in mood_l:
+        sfx_list.append({"position": "middle", "trigger_at_sec": mid_t, "sfx_type": "sword",
+                         "intensity": "mid", "description": "single sword draw and slash accent",
+                         "duration_hint": 1.0})
+    else:
+        sfx_list.append({"position": "middle", "trigger_at_sec": mid_t, "sfx_type": "footsteps",
+                         "intensity": "low", "description": "soft footsteps to advance the scene",
+                         "duration_hint": 1.5})
+    # payoff (收尾, 估算位置 = 85%)
+    end_t = round(num_lines * 0.85 * 2.5, 1) if num_lines > 0 else 12.0
+    if "海" in topic or "sea" in topic.lower() or "ocean" in topic.lower():
+        sfx_list.append({"position": "payoff", "trigger_at_sec": end_t, "sfx_type": "sea_waves",
+                         "intensity": "mid", "description": "swelling distant sea waves under final line",
+                         "duration_hint": 3.0})
+    elif any(k in era_l for k in ("modern", "contemporary")):
+        sfx_list.append({"position": "payoff", "trigger_at_sec": end_t, "sfx_type": "crowd_murmur",
+                         "intensity": "low", "description": "soft distant crowd murmur for closing",
+                         "duration_hint": 2.5})
+    else:
+        sfx_list.append({"position": "payoff", "trigger_at_sec": end_t, "sfx_type": "ambient",
+                         "intensity": "low", "description": "quiet ambient tail to let the line breathe",
+                         "duration_hint": 2.5})
+    return sfx_list
+
+
+def _validate_sfx_entry(entry: dict) -> dict | None:
+    """SFX 条目校验 + 限长 + enum 白名单. 非法 → None (丢弃)."""
+    if not isinstance(entry, dict):
+        return None
+    sfx_type = str(entry.get("sfx_type") or "").strip()
+    intensity = str(entry.get("intensity") or "").strip().lower()
+    position = str(entry.get("position") or "").strip().lower()
+    if sfx_type not in _SFX_TYPE_ENUM:
+        return None
+    if intensity not in _SFX_INTENSITY_ENUM:
+        intensity = "mid"
+    if position not in _SFX_POSITION_ENUM:
+        position = "middle"
+    try:
+        # Stage 3 Low fix: NaN/Inf 防御 (math.isfinite)
+        _t = float(entry.get("trigger_at_sec") or 0)
+        trigger = max(0.0, min(120.0, _t)) if math.isfinite(_t) else 0.0
+    except (TypeError, ValueError):
+        trigger = 0.0
+    try:
+        _d = float(entry.get("duration_hint") or 1.5)
+        dur = max(0.3, min(10.0, _d)) if math.isfinite(_d) else 1.5
+    except (TypeError, ValueError):
+        dur = 1.5
+    desc = re.sub(r"\s+", " ", str(entry.get("description") or "")).strip()[:120]
+    # 注入过滤
+    if "\n" in desc or "\t" in desc:
+        desc = ""
+    return {
+        "position": position,
+        "trigger_at_sec": round(trigger, 2),
+        "sfx_type": sfx_type,
+        "intensity": intensity,
+        "description": desc,
+        "duration_hint": round(dur, 2),
+    }
+
+
+def _audio_director_design(topic: str, num_lines: int, brief: dict) -> list[dict]:
+    """PR-3c: 音效师 Agent LLM 设计全片 SFX. 失败 fallback 规则.
+
+    输入: topic + num_lines + brief (era/bgm_mood/characters).
+    输出: 3-7 个 SFX 条目 (校验+白名单+限长后).
+    """
+    era = _brief_get(brief, "brief.metadata.era", "") or ""
+    bgm_mood = _brief_get(brief, "brief.audio.bgm_mood", "") or ""
+    bgm_style = _brief_get(brief, "brief.audio.bgm_style", "") or ""
+    role_candidates = _brief_get(brief, "brief.characters.role_candidates", []) or []
+    # LLM 路径 (Tier 2 Flash)
+    if os.environ.get("ADR_AUDIO_DIRECTOR_LLM", "1").strip().lower() not in ("0", "false", "no", "off"):
+        try:
+            sfx_types_str = " / ".join(sorted(_SFX_TYPE_ENUM))
+            prompt = (
+                f"你是 ADR 纪录片音效师. 为主题「{topic}」({num_lines} 句台词) 设计 3-5 个关键 SFX 音效点.\n"
+                f"era={era}, bgm_style={bgm_style}, bgm_mood={bgm_mood}, 角色={role_candidates}.\n\n"
+                f"分布要求: 1 个 hook (开场 0-3s 内) + 1-2 个 middle (情绪点) + 1 个 payoff (收尾).\n"
+                f"sfx_type 必须从这些选: {sfx_types_str}\n"
+                f"intensity 必须从: low / mid / high\n"
+                f"position 必须从: hook / middle / payoff\n\n"
+                f"严格输出 JSON 数组, 每个对象含: position, trigger_at_sec (估算秒, 0-30), "
+                f"sfx_type, intensity, description (60 词英文 SFX 描述), duration_hint (秒, 0.3-5).\n"
+                f"只输出 JSON 数组, 不加任何说明."
+            )
+            raw = tier_chat("creative", "你只输出严格 JSON 数组.", prompt, max_tokens=800, timeout=45)
+            # Stage 3 Medium fix: 直接 json.loads, 不 __import__ self 反射 (避免顶层副作用)
+            # LLM 可能包 markdown ```json``` → 简单 strip
+            raw_clean = raw.strip()
+            if raw_clean.startswith("```"):
+                raw_clean = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw_clean, flags=re.M).strip()
+            arr = json.loads(raw_clean)
+            if isinstance(arr, list) and arr:
+                # Stage 3 Low fix: 裁剪数量防 LLM 异常长数组 (上限 7)
+                arr = arr[:7]
+                validated = [v for v in (_validate_sfx_entry(e) for e in arr) if v]
+                if validated:
+                    log(f"PR-3c audio_director LLM 输出 {len(arr)} SFX, 校验后 {len(validated)} 条")
+                    return validated
+        except Exception as e:
+            log(f"PR-3c audio_director LLM 失败 fallback 规则: {e}")
+    # 规则兜底
+    rule_sfx = _rule_based_sfx_design(topic, num_lines, era, bgm_mood)
+    log(f"PR-3c audio_director 规则兜底输出 {len(rule_sfx)} SFX (era={era}, mood={bgm_mood})")
+    return rule_sfx
 
 
 def _llm_topic_decomposition(topic: str, use_cache: bool = True) -> dict:
@@ -11797,9 +11963,14 @@ def _grid_multiref_group_size() -> int:
     return max(2, min(12, raw))
 
 
-def _grid_multiref_duration(group: list[dict]) -> int:
-    # B34.1 (2026-05-27): duration cap 10→15 (WERYDANCE 硬上限), 给每 panel 充裕时长
-    # 配合 group_size=4: 15s / 4 panel ≈ 3.75s/panel (vs 之前 1.4s/panel)
+def _grid_multiref_duration(group: list[dict], total_panels: int | None = None, tts_duration_buffered: float | None = None) -> int:
+    """B34.1 cap 10→15 (WERYDANCE 硬上限).
+    B52 (2026-05-28): 加 tts_duration_buffered + total_panels hint, 防 voice clone 评书慢节奏
+    被压成 video 时长 → 末句截断 (224938 实测 18s 总时长压 21-28s 朗读内容). 算法:
+      group_dur = max(scene_sum, group_panels / total_panels × tts_duration_buffered)
+      cap 15s WERYDANCE 硬上限.
+    hint=None 时走 backward compat scene_sum 路径.
+    """
     override = os.environ.get("ADR_STORYBOARD_GRID_MULTIREF_DURATION", "").strip()
     if override:
         try:
@@ -11810,13 +11981,54 @@ def _grid_multiref_duration(group: list[dict]) -> int:
     for scene in group:
         try:
             d = float(scene.get("vid_duration") or scene.get("dur") or 1.25)
-            # Codex Stage 3 High fix: nan/inf 污染 total round 崩, math.isfinite 过滤
             if not math.isfinite(d) or d <= 0:
                 d = 1.25
             total += d
         except Exception:
             total += 1.25
-    return max(5, min(15, int(round(total))))
+    # B52: TTS-aware hint
+    tts_share = 0.0
+    if (
+        tts_duration_buffered is not None
+        and math.isfinite(tts_duration_buffered)
+        and tts_duration_buffered > 0
+        and total_panels is not None
+        and total_panels > 0
+        and len(group) > 0
+    ):
+        tts_share = tts_duration_buffered * (len(group) / total_panels)
+    effective = max(total, tts_share)
+    return max(5, min(15, int(round(effective))))
+
+
+def _grid_multiref_tts_buffer_factor() -> float:
+    """B52: 评书慢节奏 buffer (default 1.3, 1.0-2.0).
+    voice clone (慕神纪/易中天/许知远 等) 节奏比 TTS 78 慢, video 容器需要更大.
+    Stage 3 Low2 fix: env=nan/inf isfinite 防御回 default 1.3.
+    """
+    try:
+        raw = float(os.environ.get("ADR_GRID_MULTIREF_TTS_BUFFER", "1.3"))
+        if not math.isfinite(raw):
+            raw = 1.3
+    except (TypeError, ValueError):
+        raw = 1.3
+    return max(1.0, min(2.0, raw))
+
+
+def _grid_multiref_tts_duration_buffered() -> float:
+    """B52: 读 OUTPUT_DIR/master_voice.mp3 ffprobe, × buffer 因子. 失败返回 0 走 backward compat.
+    """
+    try:
+        voice_path = OUTPUT_DIR / "master_voice.mp3"
+        if not voice_path.exists() or voice_path.stat().st_size < 1000:
+            return 0.0
+        d = ffprobe_duration(str(voice_path))
+        if not math.isfinite(d) or d <= 0:
+            return 0.0
+        return d * _grid_multiref_tts_buffer_factor()
+    except Exception as e:
+        log(f"B52 _grid_multiref_tts_duration_buffered 失败: {e}, fallback 0 走 backward compat")
+        return 0.0
 
 
 def _grid_multiref_segment_max_stretch() -> float:
@@ -12836,6 +13048,20 @@ def _generate_grid_multiref_motion_segments(script: list[dict], motion_prompts: 
         for i, scene in enumerate(script)
         if scene.get("storyboard_grid_mode") and scene.get("img_path") and os.path.exists(scene.get("img_path"))
     ]
+    # B52 (2026-05-28): 算 TTS-aware buffered duration hint 让每 group 容器够大
+    # voice clone 评书慢节奏被 video 截 → 末句被裁 (224938 实测)
+    # Stage 3 Medium fix: total_panels 排除被 skip 的尾组 (len<2 跳过, 不分 TTS share)
+    _b52_tts_buffered = _grid_multiref_tts_duration_buffered()
+    _b52_group_size = _grid_multiref_group_size()
+    _b52_total_panels = sum(
+        min(_b52_group_size, len(refs) - s)
+        for s in range(0, len(refs), _b52_group_size)
+        if min(_b52_group_size, len(refs) - s) >= 2
+    )
+    if _b52_total_panels <= 0:
+        _b52_total_panels = len(refs)  # fallback 防 0 除零
+    if _b52_tts_buffered > 0:
+        log(f"B52 grid_multiref TTS-aware: master_voice × {_grid_multiref_tts_buffer_factor()} = {_b52_tts_buffered:.1f}s 分配 {_b52_total_panels} panel")
     qa = {
         "mode": "storyboard_grid_clean_refs_to_werydance_multiref",
         "enabled": True,
@@ -12845,6 +13071,7 @@ def _generate_grid_multiref_motion_segments(script: list[dict], motion_prompts: 
         "resolution": os.environ.get("ADR_STORYBOARD_GRID_MULTIREF_RESOLUTION", "720p"),
         "group_size": _grid_multiref_group_size(),
         "total_refs": len(refs),
+        "tts_duration_buffered": round(_b52_tts_buffered, 2) if _b52_tts_buffered > 0 else None,
         "records": [],
         "policy": "main_path_when_STORYBOARD_GRID_MULTIREF_MAIN_else_sidecar_qa",
         "manual_visual_checks_required": [
@@ -12914,7 +13141,7 @@ def _generate_grid_multiref_motion_segments(script: list[dict], motion_prompts: 
                 _write_grid_multiref_motion_qa(qa)
                 continue
             image_urls = ([sheet_url] if sheet_url else []) + [_upload_to_weryai(scene["img_path"]) for scene in group]
-            duration = _grid_multiref_duration(group)
+            duration = _grid_multiref_duration(group, total_panels=_b52_total_panels, tts_duration_buffered=_b52_tts_buffered)
             prompt = _grid_multiref_prompt(group, scene_indices[0], motion_prompts, has_character_sheet=bool(sheet_url))
             _wait_motion_submit_slot(f"grid multi-ref {group_no}")
             # B35 (2026-05-28): 加 voice_asset audio ref 让 LLM 选音色生效 (修大哥反馈"音色不是 LLM 定的")
