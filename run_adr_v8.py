@@ -1460,6 +1460,33 @@ def _is_rate_limited_response(resp: dict) -> bool:
     )
 
 
+# B44 (2026-05-28): LLM 429 quota 识别 — 跟 image rate limit (1001) 区分.
+# Flash Lite 单 run 多次触发 'Resource has been exhausted (e.g. check quota)' status=429
+# (观沧海 4 run 实测). 通用 3s/6s 退避救不了 quota, 需要 30s/60s 退避 (attempt 0/1 sleep, attempt 2 不 sleep).
+try:
+    _LLM_RATE_LIMIT_BACKOFF = max(1.0, float(os.environ.get("ADR_LLM_RATE_LIMIT_BACKOFF", "30")))
+except (ValueError, TypeError):
+    _LLM_RATE_LIMIT_BACKOFF = 30.0
+
+
+def _is_llm_rate_limited_error(exc: Exception | str) -> bool:
+    """识别 Gemini / Claude / GPT 等 LLM 429 quota 错误.
+    跟 image _is_rate_limited_error (1001 WeryAI rate limit) 区分: LLM 是 status=429 + quota exhausted.
+    """
+    text = str(exc).lower()
+    return (
+        "resource has been exhausted" in text
+        or "check quota" in text
+        or '"status": 429' in text
+        or "'status': 429" in text
+        or "status_code=429" in text
+        or "rate limit exceeded" in text  # OpenAI/Anthropic 风格
+        or "too many requests" in text
+        or "tpm" in text  # tokens per minute
+        or "rpm exceeded" in text  # requests per minute
+    )
+
+
 # GPT_IMAGE_2 画质修正后缀（实测能有效消除颗粒感/脏感）
 # 大哥 2026-05-20 给的固定 suffix，避免逐处 prompt 都改
 GPT_IMAGE2_QUALITY_SUFFIX = (
@@ -1726,7 +1753,11 @@ def tier_chat(tier: str, system: str, user: str, max_tokens: int = 4096, timeout
 
 def chat(model: str, system: str, user: str, max_tokens: int = 4096, timeout: int = 180) -> str:
     """调用 WeryAI Chat Completion，返回回复文本。3 次重试防瞬断/限流/无 choices。
-    timeout 默认 180s，对慢推理模型（GPT-5.4 / Claude Opus / DeepSeek-R1）需传更大值如 600s。"""
+    timeout 默认 180s，对慢推理模型（GPT-5.4 / Claude Opus / DeepSeek-R1）需传更大值如 600s。
+
+    B44 (2026-05-28): 识别 429 quota 用 _LLM_RATE_LIMIT_BACKOFF 30s/60s/120s 退避
+    (vs 通用 3s/6s 线性). Flash Lite quota 实测每 run 多次触发, 通用退避救不了.
+    """
     payload = {
         "model": model,
         "messages": [
@@ -1738,17 +1769,28 @@ def chat(model: str, system: str, user: str, max_tokens: int = 4096, timeout: in
     }
     last_err = None
     for attempt in range(3):
+        is_quota_err = False
         try:
             resp = req_post("/chat/completions", payload, timeout=timeout)
             if isinstance(resp, dict) and resp.get("choices"):
                 return resp["choices"][0]["message"]["content"].strip()
-            last_err = f"响应无 choices: {json.dumps(resp, ensure_ascii=False)[:200]}"
-            log(f"[chat/{model}] 尝试 {attempt+1}/3 响应异常: {last_err}")
+            # B44: 在 truncate 前先 check 完整 resp 防 quota 关键字被切掉漏判 (Medium fix)
+            full_resp_text = json.dumps(resp, ensure_ascii=False) if isinstance(resp, dict) else str(resp)
+            is_quota_err = _is_llm_rate_limited_error(full_resp_text)
+            last_err = f"响应无 choices: {full_resp_text[:200]}"
+            log(f"[chat/{model}] 尝试 {attempt+1}/3 响应异常: {last_err}" + (" [B44 429]" if is_quota_err else ""))
         except Exception as e:
             last_err = f"{type(e).__name__}: {e}"
-            log(f"[chat/{model}] 尝试 {attempt+1}/3 异常: {last_err}")
+            is_quota_err = _is_llm_rate_limited_error(e)
+            log(f"[chat/{model}] 尝试 {attempt+1}/3 异常: {last_err}" + (" [B44 429]" if is_quota_err else ""))
         if attempt < 2:
-            time.sleep(3 * (attempt + 1))  # 退避 3s / 6s
+            # B44: 429 quota 用长退避 30/60/120s, 普通瞬断仍 3s/6s
+            if is_quota_err:
+                wait_s = _LLM_RATE_LIMIT_BACKOFF * (2 ** attempt)  # 30/60/120s
+                log(f"[chat/{model}] B44 429 quota 退避 {wait_s:.0f}s")
+            else:
+                wait_s = 3 * (attempt + 1)
+            time.sleep(wait_s)
     raise RuntimeError(f"chat({model}) 3 次重试全失败: {last_err}")
 
 
