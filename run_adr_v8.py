@@ -6651,7 +6651,9 @@ def generate_motion_bridge_refs_gpt_image2(script: list[dict], topic: str) -> di
     max_refs = max(0, int(os.environ.get("ADR_MOTION_BRIDGE_REFS_MAX", "12")))
     poll_max = float(os.environ.get("ADR_MOTION_BRIDGE_REFS_POLL_MAX", "240"))
     energy_min = float(os.environ.get("ADR_MOTION_BRIDGE_REFS_MIN_ENERGY", "0.6"))
-    submit_stagger_sec = max(0.0, float(os.environ.get("ADR_MOTION_BRIDGE_REFS_SUBMIT_STAGGER", "12")))
+    # B33 (2026-05-28): stagger 12→5s. IMAGE_RATE_LIMIT_BACKOFF 已 cover 429 触发后退避
+    # 12s 预防性 stagger 跟 retry 退避两层冗余; 5s 维持基础节流, 429 时 retry 自动升 15/30/45s
+    submit_stagger_sec = max(0.0, float(os.environ.get("ADR_MOTION_BRIDGE_REFS_SUBMIT_STAGGER", "5")))
     poll_workers = max(1, min(20, int(os.environ.get("ADR_MOTION_BRIDGE_REFS_POLL_WORKERS", "20"))))
     candidates = [
         (i, scene)
@@ -12427,17 +12429,28 @@ def _grid_multiref_concat_paths(paths: list[str]) -> str | None:
         for p in paths:
             f.write(f"file '{p}'\n")
     # 统一 fps + 编码再 concat，避免不同组帧率/码率差异导致 concat demuxer 拒绝
+    # B40 (2026-05-28): 之前用 -an 丢 audio (B35 前 grid_multiref silent 无所谓).
+    # B35 ship 后 group 视频含 voice_asset clone audio (易中天评书), -an 丢 audio 让
+    # combined.mp4 silent → step9 检测无 audio → fallback master TTS hardcode 78 女声
+    # → 听感跟 LLM 选的完全无关. 修: 统一 aac 48k mono 重编码保留 audio.
+    # 跟 step65 audio_dub 同 codec 让 step9 _has_audio_stream 检测通过.
     normalized: list[str] = []
     for i, p in enumerate(paths):
         np_path = str(OUTPUT_DIR / f"grid_multiref_norm_{i:02d}.mp4")
-        ffmpeg(
+        # 检测 src 是否含 audio (group 可能 silent fallback 时无 audio)
+        has_audio = _has_audio_stream(p)
+        ffmpeg_args = [
             "-i", p,
             "-vf", "fps=24",
             "-c:v", "libx264", "-crf", "20", "-preset", "medium",
-            "-an",
-            np_path,
-            timeout=180,
-        )
+        ]
+        if has_audio:
+            # 重编码 aac 48k mono 让所有 normalized 文件 audio 一致, concat demuxer 接受
+            ffmpeg_args.extend(["-c:a", "aac", "-b:a", "128k", "-ar", "48000", "-ac", "1"])
+        else:
+            ffmpeg_args.append("-an")
+        ffmpeg_args.append(np_path)
+        ffmpeg(*ffmpeg_args, timeout=180)
         normalized.append(np_path)
     norm_list = OUTPUT_DIR / "grid_multiref_concat_norm.txt"
     with open(norm_list, "w", encoding="utf-8") as f:
@@ -16942,25 +16955,69 @@ _ASYNC_COVER_RESULT: dict = {"started": False, "done": False}
 
 def _async_kickoff_cover_caption(topic: str, script: list[dict]) -> None:
     """step1 完成后立即调用。在后台线程内顺序跑 caption LLM + 封面图生成。
-    step10_deliver 时 _await_async_cover_caption() 取结果，省去串行 200+s 等封面。"""
+    step10_deliver 时 _await_async_cover_caption() 取结果，省去串行 200+s 等封面。
+
+    B39 (2026-05-28): cover_image submit fail (status=6001 / exception / 返回 None) 加 retry
+    2 次 退避 15s/30s. 实际 worst case 视 _generate_cover_image 内部 WeryAI submit timeout
+    (~90-180s/次, 6001 工作流异常即时返回 ~5s), 大多数场景 retry 总耗时 30-120s 在异步窗口
+    内. step10 _await 超时设 600s 兜底. 全部失败落 last_error 让 step10 inline fallback.
+    预留 job_status/retry_count/last_error 字段供 B30 DubResult 状态机重构.
+    caption 单独跑一次 fail 则 fallback (topic/topic[:8]/[]) 避免 step10 len(None) crash.
+    """
     def _worker():
+        # B39: caption 单独 try, 一次成功即缓存; cover_image 失败才 retry
+        max_attempts = 3  # 1 次初次 + 2 次 retry
+        backoffs = [15.0, 30.0]
+        last_error: str | None = None
+
+        # caption 阶段: 失败用兜底, 不阻 cover retry (step10 需要 caption 字段非 None)
         try:
             caption, short_title, hashtags = _generate_caption(topic, script)
-            with _ASYNC_COVER_LOCK:
-                _ASYNC_COVER_RESULT["caption"] = caption
-                _ASYNC_COVER_RESULT["short_title"] = short_title
-                _ASYNC_COVER_RESULT["hashtags"] = hashtags
-                _ASYNC_COVER_RESULT["caption_done_ts"] = time.time()
-            cover_path = _generate_cover_image(topic, short_title, script)
-            with _ASYNC_COVER_LOCK:
-                _ASYNC_COVER_RESULT["cover_path"] = cover_path
-                _ASYNC_COVER_RESULT["done"] = True
-                _ASYNC_COVER_RESULT["cover_done_ts"] = time.time()
         except Exception as e:
+            log(f"B39 _generate_caption 失败用兜底: {type(e).__name__}: {e}")
+            caption = topic
+            short_title = topic[:8]
+            hashtags = []
+        with _ASYNC_COVER_LOCK:
+            _ASYNC_COVER_RESULT["caption"] = caption
+            _ASYNC_COVER_RESULT["short_title"] = short_title
+            _ASYNC_COVER_RESULT["hashtags"] = hashtags
+            _ASYNC_COVER_RESULT["caption_done_ts"] = time.time()
+
+        for attempt in range(max_attempts):
+            # Medium: step10 _await 超时已置 aborted, 跳过后续 retry 防竞态写同名 cover.jpg
             with _ASYNC_COVER_LOCK:
-                _ASYNC_COVER_RESULT["error"] = str(e)
-                _ASYNC_COVER_RESULT["done"] = True
-            log(f"异步封面+caption worker 异常: {type(e).__name__}: {e}")
+                if _ASYNC_COVER_RESULT.get("aborted"):
+                    log(f"B39 worker 检测到 aborted, 终止 retry (step10 已 inline fallback)")
+                    return
+            try:
+                cover_path = _generate_cover_image(topic, short_title, script)
+                if not cover_path:
+                    raise RuntimeError("_generate_cover_image returned None")
+                with _ASYNC_COVER_LOCK:
+                    _ASYNC_COVER_RESULT["cover_path"] = cover_path
+                    _ASYNC_COVER_RESULT["done"] = True
+                    _ASYNC_COVER_RESULT["cover_done_ts"] = time.time()
+                    _ASYNC_COVER_RESULT["job_status"] = "succeeded"
+                    _ASYNC_COVER_RESULT["retry_count"] = attempt
+                    _ASYNC_COVER_RESULT["last_error"] = None
+                if attempt > 0:
+                    log(f"B39 异步封面 retry attempt={attempt} 成功")
+                return
+            except Exception as e:
+                last_error = f"{type(e).__name__}: {e}"
+                log(f"B39 异步封面 worker attempt={attempt+1}/{max_attempts} 失败: {last_error}")
+                if attempt < max_attempts - 1:
+                    backoff = backoffs[attempt]
+                    log(f"B39 退避 {backoff:.0f}s 后重试")
+                    time.sleep(backoff)
+        # 全部 retry 失败, 落 done=True 让 step10 inline fallback
+        with _ASYNC_COVER_LOCK:
+            _ASYNC_COVER_RESULT["done"] = True
+            _ASYNC_COVER_RESULT["job_status"] = "failed"
+            _ASYNC_COVER_RESULT["retry_count"] = max_attempts - 1
+            _ASYNC_COVER_RESULT["last_error"] = last_error
+        log(f"B39 异步封面 worker 3 次 retry 全部失败, 最终错误: {last_error}")
     with _ASYNC_COVER_LOCK:
         if _ASYNC_COVER_RESULT.get("started"):
             return
@@ -16990,7 +17047,10 @@ def _await_async_cover_caption(timeout_seconds: float = 600.0) -> tuple | None:
                     _ASYNC_COVER_RESULT.get("cover_path"),
                 )
         time.sleep(1)
-    log("step10 等异步 worker 超时，回退内联生成")
+    # B39: 超时置 aborted, 防 worker retry 继续写同名 cover.jpg 跟 inline fallback 竞态
+    with _ASYNC_COVER_LOCK:
+        _ASYNC_COVER_RESULT["aborted"] = True
+    log("step10 等异步 worker 超时，置 aborted 防竞态，回退内联生成")
     return None
 
 
@@ -17551,6 +17611,13 @@ def main():
         else:
             t = time.time(); script = step345_timeline(script, voice_path);   timings["时间轴计算"] = time.time() - t
         t = time.time(); bgm_path   = step6_parallel(script, topic, bgm_path if NO_VOICE else None); timings["图片+BGM 并发"] = time.time() - t
+        # B41 (2026-05-28): step6 后无条件 save pipeline_state，让 HADS 也支持
+        # tools/rerun_downstream.py 局部重跑下游（之前只 ADSD 分支存 → HADS 100% 不可 resume）.
+        # ADSD 走完 step66 后还会再 save 一次（含 audio_dub vid_path），覆盖此版本.
+        try:
+            _save_pipeline_state(script, voice_path, bgm_path, topic)
+        except Exception as e:
+            log(f"pipeline_state.json 保存失败（不影响主流程）：{e}")
         if ADS_DIALOGUE_MODE and ADSD_LIP_SYNC_EXPERIMENT:
             t = time.time(); step66_adsd_lip_sync(script);                    timings["ADSD 口型同步"] = time.time() - t
             # 保存 pipeline state 供 tools/rerun_downstream.py 局部重跑下游
