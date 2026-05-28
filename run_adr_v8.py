@@ -14576,29 +14576,57 @@ def step7_concat(script: list[dict]) -> str:
                         (s.get("audio_start", 0) + s.get("vid_duration", s.get("dur", 0))) for s in script
                     ) + 0.5
                 pad_dur = max(0.0, target_dur - src_dur)
+                # B40.2 (2026-05-28): 保留 voice_asset clone audio (B35 ship 后 combined 含 audio).
+                # pad>0.2: video 循环, audio 不循环 (双 -i + -map 分流, apad 静音补尾防 voice 重复).
+                # pad<=0.2: 直拷, audio 重编码 aac 让 concat/mux 兼容. 之前 -an 显式 strip 是 B35
+                # 前 silent 时代遗留, 现在阻断 use_embedded 链路 (104140 实测).
+                combined_has_audio = _has_audio_stream(str(combined_path))
                 if pad_dur > 0.2:
                     loops_est = int(target_dur / src_dur) + 1
-                    ffmpeg(
-                        "-stream_loop", "-1",
-                        "-i", str(combined_path),
-                        "-t", f"{target_dur:.3f}",
-                        "-vf", "fps=24",
-                        "-c:v", "libx264", "-crf", "20", "-preset", "medium",
-                        "-an",
-                        raw_path,
-                        timeout=300,
-                    )
-                    tg(f"🎬 step7 grid_multiref_main: combined ({src_dur:.1f}s) 循环 ~{loops_est}× 填到 {target_dur:.1f}s @24fps CFR")
+                    if combined_has_audio:
+                        ffmpeg(
+                            "-stream_loop", "-1", "-i", str(combined_path),
+                            "-i", str(combined_path),
+                            "-map", "0:v", "-map", "1:a",
+                            "-t", f"{target_dur:.3f}",
+                            "-vf", "fps=24",
+                            "-af", f"apad=pad_dur={pad_dur:.3f}",
+                            "-c:v", "libx264", "-crf", "20", "-preset", "medium",
+                            "-c:a", "aac", "-b:a", "128k", "-ar", "48000", "-ac", "1",
+                            raw_path,
+                            timeout=300,
+                        )
+                    else:
+                        ffmpeg(
+                            "-stream_loop", "-1", "-i", str(combined_path),
+                            "-t", f"{target_dur:.3f}",
+                            "-vf", "fps=24",
+                            "-c:v", "libx264", "-crf", "20", "-preset", "medium",
+                            "-an",
+                            raw_path,
+                            timeout=300,
+                        )
+                    tg(f"🎬 step7 grid_multiref_main: combined ({src_dur:.1f}s) 循环 ~{loops_est}× 填到 {target_dur:.1f}s @24fps CFR (audio={'kept' if combined_has_audio else 'none'})")
                 else:
-                    ffmpeg(
-                        "-i", str(combined_path),
-                        "-vf", "fps=24",
-                        "-c:v", "libx264", "-crf", "20", "-preset", "medium",
-                        "-an",
-                        raw_path,
-                        timeout=180,
-                    )
-                    tg(f"🎬 step7 grid_multiref_main: combined ({src_dur:.1f}s) 直作 raw 视频 (CFR 24fps)")
+                    if combined_has_audio:
+                        ffmpeg(
+                            "-i", str(combined_path),
+                            "-vf", "fps=24",
+                            "-c:v", "libx264", "-crf", "20", "-preset", "medium",
+                            "-c:a", "aac", "-b:a", "128k", "-ar", "48000", "-ac", "1",
+                            raw_path,
+                            timeout=180,
+                        )
+                    else:
+                        ffmpeg(
+                            "-i", str(combined_path),
+                            "-vf", "fps=24",
+                            "-c:v", "libx264", "-crf", "20", "-preset", "medium",
+                            "-an",
+                            raw_path,
+                            timeout=180,
+                        )
+                    tg(f"🎬 step7 grid_multiref_main: combined ({src_dur:.1f}s) 直作 raw 视频 (CFR 24fps, audio={'kept' if combined_has_audio else 'none'})")
                 log(f"step7 STORYBOARD_GRID_MULTIREF_MAIN: raw_concat <- grid_multiref_combined (target={target_dur:.2f}s, pad={pad_dur:.2f}s)")
                 return raw_path
             except Exception as e:
