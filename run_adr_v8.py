@@ -4302,6 +4302,24 @@ shot_type/camera_angle/lighting/camera_motion 必须从上述 enum 选, 不能�
     except Exception as e:
         log(f"PR-3c brief.audio.sfx 写入失败（不影响）：{e}")
 
+    # PR-3d (2026-05-29): 美术指导 Agent — _art_director_design 写 brief.visual.* (规则版)
+    # 复用 DIRECTOR_STYLE_ROUTES.palette/anchor + era 推 costume/props/grain.
+    # Phase 1 仅 brief 写入, 不动 storyboard_grid/character_sheet prompt 注入 (留 PR-3d.1).
+    try:
+        brief = _load_brief(topic)
+        if brief.get("agents", {}).get("art_director", {}).get("status") != "succeeded":
+            art_design = _art_director_design(topic, brief)
+            if art_design:
+                for field_key, value in art_design.items():
+                    _brief_claim(
+                        brief, "art_director", f"brief.visual.{field_key}", value,
+                        f"美术指导 Agent 规则推断 ({field_key})"
+                    )
+                _save_brief(brief)
+                log(f"PR-3d art_director 写入 {len(art_design)} 字段 → brief.visual.*")
+    except Exception as e:
+        log(f"PR-3d brief.visual 写入失败（不影响）：{e}")
+
     # tone 决定情绪→风格查询池
     style_pool = EMOTION_STYLE_BRIGHT if tone == "轻松" else EMOTION_STYLE
 
@@ -8027,6 +8045,160 @@ def _audio_director_design(topic: str, num_lines: int, brief: dict) -> list[dict
     rule_sfx = _rule_based_sfx_design(topic, num_lines, era, bgm_mood)
     log(f"PR-3c audio_director 规则兜底输出 {len(rule_sfx)} SFX (era={era}, mood={bgm_mood})")
     return rule_sfx
+
+
+# PR-3d (2026-05-29): 美术指导 Agent — OiiOii 7-Agent 团队第 4 个
+# Codex Stage 1 共识规则版 (30min): 复用 DIRECTOR_STYLE_ROUTES.palette/anchor + era 推 costume/props/grain.
+# 不调 LLM (Tier 1 Opus 慢 + quota 紧), 规则推断已能覆盖 7 大 director route × 多 era 组合.
+# 写 brief.visual.{palette/props/costume/grain_level/style_anchor}. PR-3a 字段已预留.
+# Phase 2 (PR-3d.1) 长期: storyboard_grid prompt 注入 style_anchor + character_sheet prompt 注入 costume + cultural_qa 校验 palette
+
+_GRAIN_LEVEL_ENUM = {"clean", "light_grain", "medium_grain", "heavy_grain"}
+
+
+def _hex_color_validate(c: str) -> str:
+    """校验 hex 颜色, 格式必须 #RRGGBB. 非法返回空."""
+    s = str(c or "").strip()
+    if not s.startswith("#") or len(s) != 7:
+        return ""
+    try:
+        int(s[1:], 16)
+        return s.upper()
+    except ValueError:
+        return ""
+
+
+def _rule_based_art_design(topic: str, era: str, director_route: str) -> dict:
+    """规则推断 art_director 输出. 复用 DIRECTOR_STYLE_ROUTES + era 关键词路由.
+
+    输出 dict 含: palette (5 hex 颜色 list) / props / costume / grain_level / style_anchor.
+    """
+    route = (director_route or "modern_documentary").strip().lower()
+    route_data = DIRECTOR_STYLE_ROUTES.get(route, DIRECTOR_STYLE_ROUTES["modern_documentary"])
+    era_l = (era or "").lower()
+
+    # palette: 按 route 规则给 5 hex (跟 DIRECTOR_STYLE_ROUTES.palette 文字描述对应)
+    palette_map = {
+        "intimate_wuxia":     ["#F4EBD9", "#1A1A1A", "#3A5F3D", "#C49A6C", "#E8A547"],  # cream/ink/jade/amber
+        "imax_war_epic":      ["#E89248", "#D04A1E", "#2C3E66", "#F4D9A0", "#1A1A1A"],  # sun/cool blue/ember
+        "saturated_folk":     ["#C8161D", "#E8C547", "#2B4178", "#F4EBD9", "#1A1A1A"],  # red/gold/indigo
+        "slow_poetic":        ["#C49A6C", "#7A5B3E", "#3D2914", "#F4EBD9", "#1A1A1A"],  # warm amber/umber/ink
+        "gritty_kinetic":     ["#1A1A1A", "#C8161D", "#E8C547", "#3A5F3D", "#2196F3"],  # high contrast team
+        "classical_realism":  ["#7A5B3E", "#3D2914", "#F4EBD9", "#1A1A1A", "#C49A6C"],  # sepia/charcoal
+        "modern_documentary": ["#6B7280", "#2C3E66", "#E8DDC1", "#1A1A1A", "#F4EBD9"],  # neutral cool
+    }
+    palette = palette_map.get(route, palette_map["modern_documentary"])
+
+    # costume: era 关键词路由
+    if any(k in era_l for k in ("han", "tang", "song", "ming", "qing", "ancient", "historical", "古")):
+        costume = "period-accurate Chinese historical hanfu / armor / scholar robes with era-specific accessories (jade pendant, silk sash, iron helmet, brocade collar); avoid modern fabric, no zippers, no synthetic dyes, no Western tailoring"
+    elif any(k in era_l for k in ("modern_athlete", "nba", "athletic", "sport")):
+        costume = "modern athletic uniform with team colors and brand identity, performance fabric, sneakers, sweat-darkened fabric texture; avoid period clothing, no formal suits"
+    elif any(k in era_l for k in ("modern_corporate", "business", "corporate", "office")):
+        costume = "contemporary business attire (suit, blouse, lanyard, modest accessories) with era-appropriate cut and brand-neutral neutral palette; avoid period clothing, no military uniform"
+    elif "future" in era_l or "tech" in era_l:
+        costume = "near-future tech-forward minimalist clothing with subtle smart-fabric textures and modular details; avoid period historical garments, no fantasy costume"
+    else:
+        costume = "contemporary natural realistic clothing matching the scene tone, no costume drama, no fantasy fabric"
+
+    # props: 跟 era 走 (Stage 4 fix: 加 historical 关键词跟 costume check 对齐)
+    if any(k in era_l for k in ("han", "tang", "song", "ming", "qing", "ancient", "historical", "古")):
+        props = {
+            "primary": ["bronze sword", "silk banner", "scroll painting", "tea cup", "wooden chest"],
+            "secondary": ["bamboo lantern", "horse saddle", "iron helmet", "jade pendant", "calligraphy brush"],
+            "avoid": ["plastic", "neon sign", "smartphone", "modern clothing", "western architecture"],
+        }
+    elif any(k in era_l for k in ("modern_athlete", "nba")):
+        props = {
+            "primary": ["basketball", "athletic shoes", "team jersey", "stadium lights", "scoreboard"],
+            "secondary": ["referee whistle", "court floor", "fan banner", "trophy", "water bottle"],
+            "avoid": ["historical weapon", "period clothing", "candle", "scroll", "ancient architecture"],
+        }
+    elif any(k in era_l for k in ("modern_corporate", "business")):
+        props = {
+            "primary": ["laptop", "office chair", "documents", "name badge", "coffee cup"],
+            "secondary": ["whiteboard", "phone", "potted plant", "elevator", "skyscraper window"],
+            "avoid": ["historical weapon", "period costume", "horse", "scroll", "ancient relic"],
+        }
+    else:
+        props = {
+            "primary": [], "secondary": [], "avoid": [],
+        }
+
+    # grain_level: 按 route 推
+    grain_map = {
+        "intimate_wuxia":     "light_grain",
+        "imax_war_epic":      "medium_grain",
+        "saturated_folk":     "clean",
+        "slow_poetic":        "light_grain",
+        "gritty_kinetic":     "heavy_grain",
+        "classical_realism":  "medium_grain",
+        "modern_documentary": "light_grain",
+    }
+    grain_level = grain_map.get(route, "light_grain")
+
+    # style_anchor: 复用 route.anchor (已在 DIRECTOR_STYLE_ROUTES 写好 80+ 词描述)
+    style_anchor = route_data.get("anchor", "")
+
+    return {
+        "palette": palette,
+        "props": props,
+        "costume": costume,
+        "grain_level": grain_level,
+        "style_anchor": style_anchor,
+    }
+
+
+def _validate_art_design(design: dict) -> dict | None:
+    """校验 art_director 输出. 非法 → 删字段, 全空 → None."""
+    if not isinstance(design, dict):
+        return None
+    out = {}
+    # palette: 5 hex list
+    palette_raw = design.get("palette") or []
+    if isinstance(palette_raw, list):
+        validated_palette = [c for c in (_hex_color_validate(c) for c in palette_raw) if c]
+        if validated_palette:
+            out["palette"] = validated_palette[:5]  # cap 5
+    # costume: str 限长 300 + newline 已 normalize
+    costume = re.sub(r"\s+", " ", str(design.get("costume") or "")).strip()[:300]
+    if costume:
+        out["costume"] = costume
+    # props: dict, 每类 cap 10 项 60 char/项. Stage 3 Low1 fix: 全空 sublist 不写入 props
+    props = design.get("props")
+    if isinstance(props, dict):
+        validated_props = {}
+        for k in ("primary", "secondary", "avoid"):
+            arr = props.get(k) or []
+            if isinstance(arr, list):
+                filtered = [str(x).strip()[:60] for x in arr[:10] if str(x).strip()]
+                if filtered:
+                    validated_props[k] = filtered
+        if validated_props:
+            out["props"] = validated_props
+    # grain_level: enum
+    grain = str(design.get("grain_level") or "").strip().lower()
+    if grain in _GRAIN_LEVEL_ENUM:
+        out["grain_level"] = grain
+    # style_anchor: str 限长 400
+    style_anchor = re.sub(r"\s+", " ", str(design.get("style_anchor") or "")).strip()[:400]
+    if style_anchor:
+        out["style_anchor"] = style_anchor
+    return out or None
+
+
+def _art_director_design(topic: str, brief: dict) -> dict | None:
+    """PR-3d: 美术指导 Agent. 规则版 (Codex Stage 1 共识).
+    输入 brief 已有 metadata.era + visual.director_route (PR-3a topic_decomposition 写入).
+    输出 brief.visual.{palette/props/costume/grain_level/style_anchor}.
+    """
+    era = _brief_get(brief, "brief.metadata.era", "") or ""
+    director_route = _brief_get(brief, "brief.visual.director_route", "") or ""
+    raw = _rule_based_art_design(topic, era, director_route)
+    validated = _validate_art_design(raw)
+    if validated:
+        log(f"PR-3d art_director: route={director_route} era={era} 输出 {len(validated)} 字段 (palette={len(validated.get('palette') or [])} hex)")
+    return validated
 
 
 def _llm_topic_decomposition(topic: str, use_cache: bool = True) -> dict:
