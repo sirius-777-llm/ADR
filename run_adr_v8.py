@@ -7393,6 +7393,250 @@ def _save_topic_decomposition_cache(topic: str, data: dict) -> None:
     p.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
+# ──────────────────────────────────────────────────────────────────────────
+# PR-3a (2026-05-28): creative_brief.json — 制片中台 (OiiOii 7-Agent 升级地基)
+# ──────────────────────────────────────────────────────────────────────────
+# Codex Stage 2 共识融合方案: 独立 schema 不绑死 topic_decomp 旧字段语义, 第一阶段
+# 用 mapper 把 topic_decomp → brief 新字段, 后续 PR-3b/c/d 填 shot_list/visual/audio.
+#
+# Schema: voice_assets/briefs/{topic_safe}.json (跨 run 复用, 跟 topic_cache 不同目录)
+# 字段:
+#   schema/topic/created_at/_brief_version
+#   agents: {agent_name: {status, claimed_at, fields[], reason}}
+#   brief:
+#     metadata: {era, culture, audit_risk_score, is_action_topic}
+#     audio: {bgm_style, bgm_instruments[], bgm_mood, sfx[]}  -- PR-3c sfx
+#     visual: {director_style, director_route, cover_art_direction, palette, props, costume, grain_level, style_anchor}  -- PR-3d 后 4 字段
+#     characters: {role_candidates[], speaker_ips[]}  -- PR-3a 写入 role_candidates
+#     scenes: []  -- PR-3b scenes
+#     shot_list: []  -- PR-3b
+#     pacing: {acts[], cuts[]}  -- PR-3e
+#     flags: {is_action_topic}
+#   history: [{agent, field, ts, reason}]
+#
+# Helper:
+#   _brief_path(topic) / _load_brief(topic) / _save_brief(brief) atomic
+#   _brief_claim(brief, agent, field_path, value, reason) -- 写字段 + audit
+#   _brief_agent_status(brief, agent, status, reason)
+#   _brief_get(brief, field_path, default) -- get nested by dotted path
+#   _brief_from_topic_decomposition(topic, decomp) -- PR-3a mapper
+
+_BRIEF_SCHEMA_VERSION = 1
+
+
+def _briefs_dir() -> Path:
+    p = Path(__file__).resolve().parent / "voice_assets" / "briefs"
+    p.mkdir(parents=True, exist_ok=True)
+    return p
+
+
+def _brief_path(topic: str) -> Path:
+    safe = re.sub(r"[^一-龥A-Za-z0-9_]", "", topic)[:60] or "topic"
+    return _briefs_dir() / f"{safe}.json"
+
+
+def _empty_brief(topic: str) -> dict:
+    """新建空 brief 骨架. agent_status 全 pending, brief 字段 None/空."""
+    return {
+        "schema": "adr_creative_brief_v1",
+        "_brief_version": _BRIEF_SCHEMA_VERSION,
+        "topic": topic,
+        "created_at": datetime.now().isoformat(timespec="seconds"),
+        "updated_at": datetime.now().isoformat(timespec="seconds"),
+        "agents": {
+            "topic_decomposer": {"status": "pending", "claimed_at": None, "fields": [], "reason": ""},
+            "art_director": {"status": "pending", "claimed_at": None, "fields": [], "reason": ""},
+            "audio_director": {"status": "pending", "claimed_at": None, "fields": [], "reason": ""},
+            "shot_director": {"status": "pending", "claimed_at": None, "fields": [], "reason": ""},
+            "character_designer": {"status": "pending", "claimed_at": None, "fields": [], "reason": ""},
+        },
+        "brief": {
+            "metadata": {"era": None, "culture": None, "audit_risk_score": None},
+            "audio": {"bgm_style": None, "bgm_instruments": [], "bgm_mood": None, "sfx": []},
+            "visual": {
+                "director_style": None,
+                "director_route": None,
+                "cover_art_direction": None,
+                "palette": None,
+                "props": None,
+                "costume": None,
+                "grain_level": None,
+                "style_anchor": None,
+            },
+            "characters": {"role_candidates": [], "speaker_ips": []},
+            "scenes": [],
+            "shot_list": [],
+            "pacing": {"acts": [], "cuts": []},
+            "flags": {"is_action_topic": False},
+        },
+        "history": [],
+    }
+
+
+def _load_brief(topic: str) -> dict:
+    """读 brief, 不存在或破损则返回空骨架."""
+    p = _brief_path(topic)
+    if not p.exists():
+        return _empty_brief(topic)
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+        if not isinstance(data, dict) or data.get("schema") != "adr_creative_brief_v1":
+            log(f"brief schema 不匹配, 重建: {p}")
+            return _empty_brief(topic)
+        # 老 brief 缺新字段时 merge 空骨架 (向前兼容)
+        empty = _empty_brief(topic)
+        for k in empty:
+            if k not in data:
+                data[k] = empty[k]
+        # 同步 created_at 不变, updated_at 留原值
+        return data
+    except Exception as e:
+        log(f"brief 读取失败 ({p}): {e}, 重建空 brief")
+        return _empty_brief(topic)
+
+
+def _save_brief(brief: dict) -> None:
+    """写 brief, atomic (tmp + rename)."""
+    if not isinstance(brief, dict) or not brief.get("topic"):
+        log("_save_brief: brief 无 topic, 跳过")
+        return
+    brief["updated_at"] = datetime.now().isoformat(timespec="seconds")
+    p = _brief_path(brief["topic"])
+    tmp = p.with_suffix(".json.tmp")
+    try:
+        tmp.write_text(json.dumps(brief, ensure_ascii=False, indent=2), encoding="utf-8")
+        tmp.replace(p)
+    except Exception as e:
+        log(f"_save_brief 失败 {p}: {e}")
+        try:
+            tmp.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+
+def _brief_get(brief: dict, field_path: str, default=None):
+    """读 nested 字段 by dotted path. e.g. 'brief.audio.bgm_style'.
+    返回 default 如果路径不存在 or 中间节点不是 dict.
+    """
+    cur = brief
+    for seg in field_path.split("."):
+        if not isinstance(cur, dict) or seg not in cur:
+            return default
+        cur = cur[seg]
+    return cur
+
+
+def _brief_set(brief: dict, field_path: str, value) -> bool:
+    """写 nested 字段 by dotted path. 自动建中间 dict. 返回是否成功."""
+    cur = brief
+    segs = field_path.split(".")
+    for seg in segs[:-1]:
+        if not isinstance(cur, dict):
+            return False
+        if seg not in cur or not isinstance(cur[seg], dict):
+            cur[seg] = {}
+        cur = cur[seg]
+    if not isinstance(cur, dict):
+        return False
+    cur[segs[-1]] = value
+    return True
+
+
+def _brief_claim(brief: dict, agent: str, field_path: str, value, reason: str = "") -> bool:
+    """Agent 声明对 field 的写入. 写值 + 更新 agents.{agent} + 追加 history.
+
+    冲突策略: 如果 field 已有非 None 值且 agent 不同, log warn 但允许覆盖 (audit 留痕).
+    field_path 必须以 'brief.' 开头才会写入 brief sub-tree.
+    返回是否成功.
+    """
+    if not isinstance(brief, dict) or not agent or not field_path:
+        return False
+    if not field_path.startswith("brief."):
+        log(f"_brief_claim: field_path {field_path} 必须 'brief.' 开头")
+        return False
+    old_value = _brief_get(brief, field_path)
+    # 冲突检测: 老值非 None/非空 list/非空 dict 且 agent 跟历史不同
+    history = brief.get("history") or []
+    prev_owner = None
+    for h in reversed(history):
+        if h.get("field") == field_path:
+            prev_owner = h.get("agent")
+            break
+    if old_value not in (None, [], {}) and prev_owner and prev_owner != agent:
+        log(f"_brief_claim conflict: {field_path} 之前由 {prev_owner} 写入 ({old_value!r:.80}), 现 {agent} 覆盖")
+    if not _brief_set(brief, field_path, value):
+        return False
+    agents = brief.setdefault("agents", {})
+    agent_rec = agents.setdefault(agent, {"status": "pending", "claimed_at": None, "fields": [], "reason": ""})
+    agent_rec["status"] = "succeeded"
+    agent_rec["claimed_at"] = datetime.now().isoformat(timespec="seconds")
+    fields = agent_rec.setdefault("fields", [])
+    if field_path not in fields:
+        fields.append(field_path)
+    if reason:
+        agent_rec["reason"] = reason
+    history.append({
+        "agent": agent,
+        "field": field_path,
+        "ts": datetime.now().isoformat(timespec="seconds"),
+        "reason": reason or "",
+    })
+    brief["history"] = history
+    return True
+
+
+def _brief_agent_status(brief: dict, agent: str, status: str, reason: str = "") -> None:
+    """更新 agent 状态. status: pending/running/succeeded/failed/skipped."""
+    if not isinstance(brief, dict) or not agent:
+        return
+    agents = brief.setdefault("agents", {})
+    agent_rec = agents.setdefault(agent, {"status": "pending", "claimed_at": None, "fields": [], "reason": ""})
+    agent_rec["status"] = status
+    if reason:
+        agent_rec["reason"] = reason
+    if status in ("succeeded", "failed", "skipped"):
+        agent_rec["claimed_at"] = agent_rec.get("claimed_at") or datetime.now().isoformat(timespec="seconds")
+
+
+def _brief_from_topic_decomposition(brief: dict, decomp: dict) -> None:
+    """PR-3a mapper: topic_decomposition 字段 → brief 新结构.
+    把 LLM 已推断的 era/culture/bgm_*/role_candidates/director_*/cover_art_direction/
+    is_action_topic/audit_risk_score 写入 brief, 标 topic_decomposer succeeded.
+    幂等: 重复调用不会重复 history (因为 field_path 相同, 仍 audit).
+    """
+    if not isinstance(brief, dict) or not isinstance(decomp, dict) or not decomp:
+        return
+    agent = "topic_decomposer"
+    reason = "step1 LLM topic_decomposition"
+    # metadata
+    if decomp.get("era"):
+        _brief_claim(brief, agent, "brief.metadata.era", decomp["era"], reason)
+    if decomp.get("culture"):
+        _brief_claim(brief, agent, "brief.metadata.culture", decomp["culture"], reason)
+    if decomp.get("audit_risk_score") is not None:
+        _brief_claim(brief, agent, "brief.metadata.audit_risk_score", decomp["audit_risk_score"], reason)
+    # audio (PR-3c 后 sfx 字段由 audio_director 填)
+    if decomp.get("bgm_style_label"):
+        _brief_claim(brief, agent, "brief.audio.bgm_style", decomp["bgm_style_label"], reason)
+    if decomp.get("bgm_instruments"):
+        _brief_claim(brief, agent, "brief.audio.bgm_instruments", decomp["bgm_instruments"], reason)
+    if decomp.get("bgm_mood"):
+        _brief_claim(brief, agent, "brief.audio.bgm_mood", decomp["bgm_mood"], reason)
+    # visual (PR-3d 后 palette/props/costume 由 art_director 填)
+    if decomp.get("director_style"):
+        _brief_claim(brief, agent, "brief.visual.director_style", decomp["director_style"], reason)
+    if decomp.get("director_style_route"):
+        _brief_claim(brief, agent, "brief.visual.director_route", decomp["director_style_route"], reason)
+    if decomp.get("cover_art_direction"):
+        _brief_claim(brief, agent, "brief.visual.cover_art_direction", decomp["cover_art_direction"], reason)
+    # characters role_candidates (PR-3a 写入, PR-3d 后可被 character_designer 覆盖扩展)
+    if decomp.get("role_candidates"):
+        _brief_claim(brief, agent, "brief.characters.role_candidates", decomp["role_candidates"], reason)
+    # flags
+    if "is_action_topic" in decomp:
+        _brief_claim(brief, agent, "brief.flags.is_action_topic", bool(decomp.get("is_action_topic")), reason)
+
+
 def _llm_topic_decomposition(topic: str, use_cache: bool = True) -> dict:
     """LLM 一次推断 topic 的多个判断字段，缓存跨 run 复用。
 
@@ -7481,6 +7725,14 @@ def _llm_topic_decomposition(topic: str, use_cache: bool = True) -> dict:
             _save_topic_decomposition_cache(topic, result)
         except Exception as e:
             log(f"topic_decomposition cache 写入失败（不影响）：{e}")
+        # PR-3a: 把 topic_decomp 字段 mapper 到 creative_brief.json (制片中台地基)
+        try:
+            brief = _load_brief(topic)
+            _brief_from_topic_decomposition(brief, result)
+            _save_brief(brief)
+            log(f"PR-3a brief 已更新: topic_decomposer 写入 {len(brief.get('agents', {}).get('topic_decomposer', {}).get('fields') or [])} 字段")
+        except Exception as e:
+            log(f"PR-3a brief 写入失败（不影响主流程）：{e}")
         return result
     except Exception as e:
         log(f"topic_decomposition LLM 异常（走 fallback）：{e}")
