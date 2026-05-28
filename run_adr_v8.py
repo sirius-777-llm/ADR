@@ -1664,11 +1664,14 @@ def poll_storyboard_task(task_id: str, label: str, max_wait: float) -> dict:
 # PR-4 (2026-05-27): LLM 分级映射. 按 tier 选模型, 简单任务降到便宜模型省成本.
 # tier_chat 是别名 alias dispatcher, 不破坏 chat() 旧签名 (26 个调用站点零侵入).
 # 2026-05-27 hotfix: data tier 从 CLAUDE_4_5_HAIKU (WeryAI 不支持) 改 GEMINI_3_1_FLASH_LITE (gateway 已验证 work).
+# B43 (2026-05-28): review tier Flash Lite → Flash 2.5. Flash Lite 429 quota 严重 (观沧海 101437
+# run L16289 注脚 quota exhausted), review tier 量小迁出减少 Lite 压力. 真正治本是 B44 chat() 429
+# 智能退避 (Codex Stage 2 共识). WeryAI 不支持 Haiku, data tier 暂保持 Flash Lite 等 B44 兜底.
 _LLM_TIER = {
     "producer":  "CLAUDE_4_6_OPUS",          # Tier 1 决策性创意 (制片人, 导演 jiangwen)
     "creative":  "GEMINI_25_FLASH",          # Tier 2 创意输出 (台词/分镜 prompt 等)
-    "review":    "GEMINI_3_1_FLASH_LITE",    # Tier 3 审稿/规划 (情绪/plan/校验)
-    "data":      "GEMINI_3_1_FLASH_LITE",    # Tier 4 数据/机械任务 (短文 JSON / 一行 rewrite / id 选择)
+    "review":    "GEMINI_25_FLASH",          # Tier 3 审稿/规划 — B43 从 Flash Lite 迁出减压
+    "data":      "GEMINI_3_1_FLASH_LITE",    # Tier 4 数据/机械任务 (短文 JSON / 一行 rewrite / id 选择) — 待 B44 兜底
 }
 
 
@@ -3082,7 +3085,7 @@ def _adsd_immersion_qa_rewrite_turns(topic: str, turns: list[dict], role_candida
 4. 如果某个 speaker/shot 会破坏沉浸感，请替换为更贴合时代现场的人物，但不要改台词含义。
 5. 输出严格 JSON：{{"pass": true/false, "replacements": {{"原speaker":"新speaker"}}, "reasons": ["..."]}}
 """
-        raw = chat("GEMINI_3_1_FLASH_LITE", "你只输出严格 JSON 对象。", prompt, max_tokens=900, timeout=90)
+        raw = tier_chat("review", "你只输出严格 JSON 对象。", prompt, max_tokens=900, timeout=90)  # B43: 走 review tier (Flash 2.5)
         obj = _extract_json_object(raw)
         replacements = obj.get("replacements") if isinstance(obj, dict) else None
         if not isinstance(replacements, dict) or not replacements:
@@ -15612,11 +15615,31 @@ def step9_render(raw_path: str, voice_path: str, bgm_path: str | None, ass_path:
     # ⚠️  早期 ADR 只有 TTS, 代码/文档保留"主音轨"命名, 实际现在 TTS 是 fallback 不是首选.
     use_embedded_dialogue_audio = False
     embedded_audio_mode = ""
-    if ADS_DIALOGUE_MODE and ADSD_ALMIGHTY_AUDIO_DUB_EXPERIMENT:
+    # B40.1 (2026-05-28): grid_multiref 主路径优先检测. B40 修了 _grid_multiref_concat_paths
+    # 保留 audio, 但 step9 use_embedded 检测从不知 grid_multiref 路径存在, 只看 motion_qa.json
+    # (per-scene) → None.get crash → fallback master TTS 女声. B40/B35/B25 整链路 audio 浪费.
+    # 修: 优先检测 grid_multiref_motion_qa.json (pass=True + raw_path 有 audio + 至少 1 group
+    # generate_audio_mode='true') → use_embedded=True. 走在 ADSD lip_sync / per-scene motion 检测前.
+    grid_multi_qa = _read_output_json("grid_multiref_motion_qa.json")
+    if (
+        isinstance(grid_multi_qa, dict)
+        and grid_multi_qa.get("pass")
+        and _has_audio_stream(raw_path)
+    ):
+        records = grid_multi_qa.get("records") or []
+        audio_groups = sum(
+            1 for r in records
+            if isinstance(r, dict) and r.get("pass") and str(r.get("generate_audio_mode") or "").lower() in ("true", "1", "yes")
+        )
+        if audio_groups > 0:
+            use_embedded_dialogue_audio = True
+            embedded_audio_mode = f"grid_multiref_audio_dub_{audio_groups}_groups"
+            log(f"B40.1 use_embedded=True: grid_multiref {audio_groups} group 含 voice_asset clone audio")
+    if not use_embedded_dialogue_audio and ADS_DIALOGUE_MODE and ADSD_ALMIGHTY_AUDIO_DUB_EXPERIMENT:
         try:
-            lip_qa = _read_output_json("lip_sync_qa.json")
+            lip_qa = _read_output_json("lip_sync_qa.json") or {}
             records = lip_qa.get("records") or []
-            generated_count = sum(1 for r in records if r.get("pass") and r.get("video_has_audio") and r.get("generated_audio_from_prompt_dialogue"))
+            generated_count = sum(1 for r in records if isinstance(r, dict) and r.get("pass") and r.get("video_has_audio") and r.get("generated_audio_from_prompt_dialogue"))
             has_raw_audio = _has_audio_stream(raw_path)
             expected_count = int(lip_qa.get("total") or len(records) or 0)
             use_embedded_dialogue_audio = has_raw_audio and generated_count == expected_count and generated_count > 0
@@ -15624,9 +15647,9 @@ def step9_render(raw_path: str, voice_path: str, bgm_path: str | None, ass_path:
                 embedded_audio_mode = "adsd_almighty_audio_dub"
         except Exception as e:
             log(f"Almighty audio-dub embedded audio 检测失败，继续使用主音轨: {e}")
-    elif WITH_MOTION and VOICE_ASSET_AUDIO_DUB_EXPERIMENT:
+    elif not use_embedded_dialogue_audio and WITH_MOTION and VOICE_ASSET_AUDIO_DUB_EXPERIMENT:
         try:
-            motion_qa = _read_output_json("motion_qa.json")
+            motion_qa = _read_output_json("motion_qa.json") or {}
             records = motion_qa.get("records") or []
             generated_count = sum(1 for r in records if r.get("pass") and r.get("video_has_audio") and r.get("generated_audio_from_prompt_dialogue"))
             expected_count = int(motion_qa.get("total") or len({int(r.get("turn", 0)) for r in records if r.get("turn")}) or len(records) or 0)
