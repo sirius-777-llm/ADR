@@ -880,6 +880,49 @@ def _podcast_id_to_voice_asset(podcast_id: str) -> str:
 
 DEFAULT_FEMALE_VOICE_ASSET = os.environ.get("ADR_DEFAULT_FEMALE_VOICE_ASSET", ADSD_DEFAULT_FEMALE_VOICE_ASSET)
 DEFAULT_VOICE_ASSET = os.environ.get("ADR_DEFAULT_VOICE_ASSET", "").strip()
+
+
+# B50 (2026-05-28): ADS 单旁白 voice_asset 选择三级 resolver
+# 大哥反馈"没有曹操的角色音色" — speaker IP 自带的 voice_asset_id 完全没用上.
+# 三级优先: speaker IP voice_asset > podcast mapping > gender fallback.
+# 通用 speaker (旁白/narrator/host) 跳过 IP 走 podcast (避免 '旁白' IP 无音色误覆盖).
+_GENERIC_NARRATOR_NAMES = {"旁白", "解说", "解说员", "narrator", "Narrator", "host", "Host", "讲述人", "讲述者", "主持人"}
+
+
+def _resolve_voice_asset_for_ads_speaker(speaker: str, podcast_id: str) -> tuple[str, str]:
+    """ADS 单旁白模式 voice_asset 三级解析. 返回 (asset_id, reason).
+
+    优先级:
+      1. speaker IP voice_asset_id (库内存在 + speech-safe + speaker 非通用旁白名)
+      2. podcast_id mapping (_podcast_id_to_voice_asset, 已含 forbidden flag 防御)
+      3. gender/default fallback (调用方处理)
+
+    reason 形如 'speaker_ip:曹操' / 'podcast_mapping:pingshu-...' / 'fallback'.
+    """
+    speaker_clean = (speaker or "").strip()
+    if speaker_clean and speaker_clean not in _GENERIC_NARRATOR_NAMES:
+        try:
+            ip = _match_speaker_ip(speaker_clean)
+            if ip:
+                ip_asset_id = (ip.get("voice_asset_id") or "").strip()
+                if ip_asset_id:
+                    data = _load_voice_assets()
+                    # Medium guard: voice_assets.json 可能含 "assets": null, 加 or [] 防 NoneType iter
+                    by_id = {a.get("voice_id"): a for a in (data.get("assets") or []) if a.get("voice_id")}
+                    asset = by_id.get(ip_asset_id)
+                    if asset and _voice_asset_is_speech_safe(asset):
+                        return ip_asset_id, f"speaker_ip:{speaker_clean}"
+                    elif asset:
+                        log(f"B50 IP {speaker_clean} voice_asset {ip_asset_id} 含 forbidden flag, 跳过走 podcast")
+                    else:
+                        log(f"B50 IP {speaker_clean} voice_asset {ip_asset_id} 不在音色库, 跳过走 podcast")
+        except Exception as e:
+            log(f"B50 _resolve_voice_asset_for_ads_speaker exception: {e}, 跳过 IP 走 podcast")
+    # 二级: podcast mapping
+    podcast_asset = _podcast_id_to_voice_asset(podcast_id)
+    if podcast_asset:
+        return podcast_asset, f"podcast_mapping:{podcast_id}"
+    return "", "fallback"
 VOICE_ASSET_AUDIO_DUB_EXPERIMENT = (
     not ADS_DIALOGUE_MODE
     and not NO_VOICE
@@ -4250,13 +4293,17 @@ THUMBNAIL_ANCHOR: Air Force One stairs, black leather jacket figure, glowing chi
     # codex 审查 fix: ADSD 模式 scene 可能从 dialogue_meta 带 voice_asset_id (line 3932)
     # ADS 单旁白模式应该 force override, 不能 setdefault 漏掉已有 voice_asset_id 的 scene
     # 仅在 ADS 模式 (非 ADSD) 下 force lock
-    ads_voice_asset_id = _podcast_id_to_voice_asset(picked_id)
+    # B50 (2026-05-28): 三级 resolver. speaker IP voice_asset 优先于 podcast mapping
+    # (修大哥反馈'没有曹操音色'). speaker 取 script[0].speaker, 通用'旁白'名跳 IP 走 podcast.
+    first_speaker = (script[0].get("speaker") if script else "") or ""
+    ads_voice_asset_id, voice_reason = _resolve_voice_asset_for_ads_speaker(first_speaker, picked_id)
     if ads_voice_asset_id and not ADS_DIALOGUE_MODE:
         for s in script:
             s["voice_asset_id"] = ads_voice_asset_id  # force override
-        log(f"B10 ADS voice lock: picked_id={picked_id} → voice_asset={ads_voice_asset_id} 全片 {len(script)} scene 锁定 (force)")
+        log(f"B10 ADS voice lock: speaker={first_speaker} picked={picked_id} → voice_asset={ads_voice_asset_id} reason={voice_reason} 全片 {len(script)} scene 锁定 (force)")
         try:
-            tg(f"🔒 ADS 单旁白锁定 voice_asset: {ads_voice_asset_id} (全片 {len(script)} scene)")
+            badge = "🎭" if voice_reason.startswith("speaker_ip") else "🔒"
+            tg(f"{badge} ADS 单旁白 voice_asset: {ads_voice_asset_id} (来源 {voice_reason}, 全片 {len(script)} scene)")
         except Exception:
             pass
 
@@ -11201,16 +11248,23 @@ def _grid_multiref_prompt(
     has_character_sheet: bool = False,
 ) -> str:
     lines = []
+    narration_lines: list[str] = []  # B49: 收集 group 内真台词嵌入 prompt 让 voice clone 说真台词
     action_mode = False
     for offset, scene in enumerate(group):
         idx = start_idx + offset
-        # B34.2 (2026-05-27): 精算 prompt cap 2000 (WeryAI doc 限制), 4 panel × ~245 + style 300 + char_rule 250 + prefix 150 = ~1680
-        visual = _short_board_text(scene.get("prompt") or scene.get("text"), 80)
-        motion = _short_board_text(motion_prompts[idx] if idx < len(motion_prompts) else "", 120)
+        # B49 (2026-05-28): visual 80→50, motion 120→80 给台词指令腾 space (prompt cap 2000)
+        # 之前 _grid_multiref_prompt 漏嵌入台词 → almighty generate_audio=true 自由发挥说跟字幕无关内容
+        # 仿 _motion_audio_dub_prompt L10569 'speaking exactly this line' 嵌入真台词
+        visual = _short_board_text(scene.get("prompt") or scene.get("text"), 50)
+        motion = _short_board_text(motion_prompts[idx] if idx < len(motion_prompts) else "", 80)
         if _is_action_scene(scene.get("text", ""), scene.get("prompt", "")):
             action_mode = True
         # B34.2: 每 panel line 强调 distinct (Shot N + 简短标签)
         lines.append(f"{offset + 1}. Shot {idx + 1}: {visual} | Cam: {motion}")
+        # B49: 收集真台词 (scene.text 是真原文 e.g. "东临碣石，以观沧海。")
+        narr = re.sub(r"\s+", " ", str(scene.get("text") or "")).strip()
+        if narr:
+            narration_lines.append(narr[:80])
     if action_mode:
         style = (
             "Create one coherent high-energy cinematic action video that treats the uploaded references as a "
@@ -11236,11 +11290,21 @@ def _grid_multiref_prompt(
         "All remaining uploaded images are the sequential shot/key-pose references. "
         if has_character_sheet else ""
     )
+    # B49 (2026-05-28): 台词嵌入指令 — voice clone 必须说真台词跟字幕同步
+    # almighty generate_audio=true 默认自由发挥, 必须显式指令 'speaking exactly these lines'
+    narration_block = ""
+    if narration_lines:
+        joined = "」「".join(narration_lines)
+        narration_block = (
+            f" Generate clear Mandarin narration speaking exactly these lines in order and nothing else: 「{joined}」. "
+            "Match each shot's beat to its corresponding line; do not invent or substitute text."
+        )
     return (
         "Use the uploaded clean storyboard reference images as a sequential shot plan. "
         f"{character_rule}"
         "Each shot reference image is one shot or key action pose, in the same order as the shot references array. "
-        f"{style} "
+        f"{style}"
+        f"{narration_block} "
         "Do not render the storyboard grid, panel borders, shot numbers, labels, captions, subtitles, arrows, "
         "director notes, UI text, watermarks, logos, or any burned-in text. "
         f"Shot plan: {' '.join(lines)}"
