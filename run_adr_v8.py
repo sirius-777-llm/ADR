@@ -2029,6 +2029,85 @@ def build_1919_global_cover_prompt(short_title: str) -> str:
     )
 
 
+# PR-3b.2 (2026-05-28): jiangwen LLM 漏 5 enum 字段时 (223716 实测 7/7 漏), Python 按位置
+# 硬分配 enum 模板. 跟 build_shot_blueprint 长描述同位置策略, 保证镜头节奏有 cinema 化分布
+# 而不是全 default extreme close-up + static.
+def _shot_blueprint_enums(i: int, n: int) -> dict:
+    """按分镜号位置硬分配 5 enum (shot_type/camera_angle/lighting/camera_motion/visual_motif).
+    所有值都在 _PR3B1_*_ENUM 白名单内, 保证下游 _validate_enum_field 直接通过.
+
+    Stage 3 Low fix: i==n-1 优先于 i==1, 让短片 (n=2) 末镜走收尾 extreme wide shot.
+    """
+    if n <= 0:
+        return {}
+    pos = i / max(n - 1, 1) if n > 1 else 0.0
+    # Stage 3 Low fix: 收尾优先 (n=2 时 i=1=末镜应当 extreme wide, 不是 i=1 钩子模板)
+    if i == n - 1 and n >= 2:
+        return {
+            "shot_type": "extreme wide shot",
+            "camera_angle": "bird's-eye aerial",
+            "lighting": "silhouette backlit",
+            "camera_motion": "pull-back reveal",
+            "visual_motif": "sunset glow",
+        }
+    if i == 0:
+        return {
+            "shot_type": "extreme close-up",
+            "camera_angle": "low-angle heroic",
+            "lighting": "hard shadow key light",
+            "camera_motion": "slow push-in",
+            "visual_motif": "trembling hand",
+        }
+    if i == 1:
+        return {
+            "shot_type": "extreme close-up",
+            "camera_angle": "profile side view",
+            "lighting": "rim light from behind",
+            "camera_motion": "rack focus",
+            "visual_motif": "eye reflection",
+        }
+    if i == n - 1:
+        return {
+            "shot_type": "extreme wide shot",
+            "camera_angle": "bird's-eye aerial",
+            "lighting": "silhouette backlit",
+            "camera_motion": "pull-back reveal",
+            "visual_motif": "sunset glow",
+        }
+    if pos < 0.3:
+        return {
+            "shot_type": "medium shot",
+            "camera_angle": "low-angle heroic",
+            "lighting": "silhouette backlit",
+            "camera_motion": "dolly right",
+            "visual_motif": "dust motes",
+        }
+    if pos < 0.5:
+        return {
+            "shot_type": "wide shot",
+            "camera_angle": "Dutch angle unstable",
+            "lighting": "chiaroscuro single-key",
+            "camera_motion": "crane down",
+            "visual_motif": "smoke and embers",
+        }
+    if pos < 0.7:
+        return {
+            "shot_type": "over-the-shoulder",
+            "camera_angle": "profile side view",
+            "lighting": "rembrandt triangle",
+            "camera_motion": "handheld shake",
+            "visual_motif": "candle flame",
+        }
+    # pos < 0.85 (default 中后段)
+    return {
+        "shot_type": "medium shot",
+        "camera_angle": "low-angle heroic",
+        "lighting": "golden hour sidelight",
+        "camera_motion": "crane up",
+        "visual_motif": "flapping banner",
+    }
+
+
 def build_shot_blueprint(n: int) -> list[str]:
     """按分镜号硬生成电影级镜头模板（景别+机位+光影+母题）。
     Python 层直接拼到每句 prompt 前，绕过 LLM 对镜头语法的软性遵从。"""
@@ -3956,6 +4035,12 @@ THUMBNAIL_ANCHOR: Air Force One stairs, black leather jacket figure, glowing chi
     "prompt": "英文提示词 (必须含 scene_anchor + 所有 5 enum 词 verbatim)"}},
   ...
 ]
+
+⚠️ PR-3b.2 强约束 (2026-05-28, 修 223716 Opus 7/7 漏字段):
+**每个对象必须独立填写全部 8 字段 (emotion / scene_anchor / shot_type / camera_angle /
+lighting / camera_motion / visual_motif / prompt). 不允许只塞 prompt 长文本而漏其他独立字段.
+shot_type/camera_angle/lighting/camera_motion 必须从上述 enum 选, 不能写解释或自由词.**
+
 只输出 JSON，不加任何说明文字。"""
 
     # 姜文导演用 Claude 4.6 Opus（顶级推理 + 多约束遵守）
@@ -4148,22 +4233,31 @@ THUMBNAIL_ANCHOR: Air Force One stairs, black leather jacket figure, glowing chi
 
     try:
         shot_list = []
-        llm_missing_fields = 0  # LLM 完全没输出 enum 字段
+        llm_missing_fields = 0  # LLM 完全没输出任何 enum 字段
         invalid_enums = 0       # LLM 输出了但 enum 非法
+        blueprint_fallback_count = 0  # PR-3b.2: 至少 1 field 走 blueprint 的 shot 数
+        # PR-3b.2 Stage 3 High+Medium fix: blueprint enums 始终作 default (不管 LLM 是否输出),
+        # per-field 检测每个字段是否合法/漏, 缺则用 bp_enum 该字段填. 这样 LLM 部分填部分漏时
+        # 漏的字段也走 blueprint 而不是塌成 'extreme close-up + static'.
         for i, v in enumerate(visuals[:num_lines]):
             if not isinstance(v, dict):
                 continue
-            # 检测 LLM 是否输出 (key 存在且非空) — Medium fix
-            llm_provided = any(
-                str(v.get(k) or "").strip() for k in
-                ("shot_type", "camera_angle", "lighting", "camera_motion")
+            llm_provided_count = sum(
+                1 for k in ("shot_type", "camera_angle", "lighting", "camera_motion")
+                if str(v.get(k) or "").strip()
             )
-            if not llm_provided:
+            if llm_provided_count == 0:
                 llm_missing_fields += 1
-            shot_type, fb1 = _validate_enum(v.get("shot_type"), _SHOT_TYPE_ENUM, "extreme close-up")
-            camera_angle, fb2 = _validate_enum(v.get("camera_angle"), _CAMERA_ANGLE_ENUM, "eye-level")
-            lighting, fb3 = _validate_enum(v.get("lighting"), _LIGHTING_ENUM, "soft natural ambient")
-            camera_motion, fb4 = _validate_enum(v.get("camera_motion"), _CAMERA_MOTION_ENUM, "static")
+            bp_enum = _shot_blueprint_enums(i, num_lines)  # 始终算, 当 default
+            shot_type, fb1 = _validate_enum(v.get("shot_type"), _SHOT_TYPE_ENUM, bp_enum.get("shot_type", "extreme close-up"))
+            camera_angle, fb2 = _validate_enum(v.get("camera_angle"), _CAMERA_ANGLE_ENUM, bp_enum.get("camera_angle", "eye-level"))
+            lighting, fb3 = _validate_enum(v.get("lighting"), _LIGHTING_ENUM, bp_enum.get("lighting", "soft natural ambient"))
+            camera_motion, fb4 = _validate_enum(v.get("camera_motion"), _CAMERA_MOTION_ENUM, bp_enum.get("camera_motion", "static"))
+            # blueprint_fallback_count: 至少 1 字段走 bp (LLM 缺/非法)
+            shot_used_bp = any((fb1, fb2, fb3, fb4))
+            if shot_used_bp:
+                blueprint_fallback_count += 1
+            visual_motif = str(v.get("visual_motif") or "").strip()[:80] or bp_enum.get("visual_motif", "")
             # invalid_enums 计: LLM 输出非空但不在 enum 中
             for raw, fb in (("shot_type", fb1), ("camera_angle", fb2), ("lighting", fb3), ("camera_motion", fb4)):
                 if fb and str(v.get(raw) or "").strip():
@@ -4174,11 +4268,11 @@ THUMBNAIL_ANCHOR: Air Force One stairs, black leather jacket figure, glowing chi
                 "camera_angle": camera_angle,
                 "lighting": lighting,
                 "camera_motion": camera_motion,
-                "visual_motif": str(v.get("visual_motif") or "").strip()[:80],
+                "visual_motif": visual_motif,
                 "scene_anchor": str(v.get("scene_anchor") or "").strip(),
                 "emotion": str(v.get("emotion") or "").strip(),
             })
-        log(f"PR-3b shot_list: {len(shot_list)} shots, LLM 漏字段 {llm_missing_fields}, enum 非法 {invalid_enums}")
+        log(f"PR-3b shot_list: {len(shot_list)} shots, LLM 全漏 {llm_missing_fields}, enum 非法 {invalid_enums}, blueprint fallback (≥1 field) {blueprint_fallback_count}")
         if shot_list:
             brief = _load_brief(topic)
             # Stage 3 Low fix: shot_director 已 succeeded 跳过 (跨 run 防 history 膨胀)
@@ -4297,6 +4391,9 @@ THUMBNAIL_ANCHOR: Air Force One stairs, black leather jacket figure, glowing chi
                 voice_gender=dialogue_meta.get("voice_gender") or _dlg_gender,
             )
             log(f"动作 panel 替换 prompt: turn {i+1} 「{dialogue_meta.get('text','')[:30]}...」 → 武侠 combat panel")
+        # PR-3b.1 (2026-05-28): scene 注入结构化分镜 enum (PR-3b ship 后 LLM 已输出, 之前丢弃没传到下游)
+        # _v 来自 visuals[i], 5 enum 字段已在 PR-3b Stage 3 enum 校验 + default fallback.
+        _v = visuals[i] if i < len(visuals) and isinstance(visuals[i], dict) else {}
         item = {
             "text": line,
             "emotion": emotion,
@@ -4305,6 +4402,13 @@ THUMBNAIL_ANCHOR: Air Force One stairs, black leather jacket figure, glowing chi
             "tone": tone,
             "topic_meta": topic_meta,
             "culture_guard": culture_guard,
+            # PR-3b.1: 结构化分镜 enum 字段 (从 visuals 透传给 step6/65 prompt builder)
+            "shot_type": str(_v.get("shot_type") or "").strip(),
+            "camera_angle": str(_v.get("camera_angle") or "").strip(),
+            "lighting": str(_v.get("lighting") or "").strip(),
+            "camera_motion": str(_v.get("camera_motion") or "").strip(),
+            "visual_motif": str(_v.get("visual_motif") or "").strip(),
+            "scene_anchor": str(_v.get("scene_anchor") or "").strip(),
         }
         # B31: HADS/VADS meta_grid 启用时注入 visual_subject + 假 speaker 让 _generate_all_character_meta_grids 识别
         if _hads_meta_grid_subject:
@@ -7196,7 +7300,27 @@ def _storyboard_grid_prompt(batch_script: list[dict], start: int, total: int, to
         prompt = re.sub(r"\s+", " ", str(scene.get("prompt") or scene.get("text") or "")).strip()
         text = re.sub(r"\s+", " ", str(scene.get("text") or "")).strip()
         action = _motion_action_block(scene, motion_limit)
-        lines.append(f"{local_i:02d}. Visual: {prompt[:visual_limit]}\n    Beat: {text[:beat_limit]}\n    Motion: {action}")
+        # PR-3b.1 (2026-05-28): 注入结构化分镜 5 enum (PR-3b jiangwen 已输出, 此前丢失)
+        # Stage 3 Medium fix: enum 字段白名单校验防注入. visual_motif 不在 enum (1-3 词自定义), 仅限长+控字符过滤
+        shot_tags = []
+        for tag_key, label, enum_set in (
+            ("shot_type", "Shot", _PR3B1_SHOT_TYPE_ENUM),
+            ("camera_angle", "Angle", _PR3B1_CAMERA_ANGLE_ENUM),
+            ("lighting", "Light", _PR3B1_LIGHTING_ENUM),
+            ("camera_motion", "Cam", _PR3B1_CAMERA_MOTION_ENUM),
+        ):
+            val = _validate_enum_field(scene.get(tag_key), enum_set, "")
+            if val:
+                shot_tags.append(f"{label}: {val}")
+        # visual_motif 1-3 词自定义, 限长 40 + 控字符过滤 (无 enum)
+        _motif_raw = str(scene.get("visual_motif") or "").strip()[:40]
+        if _motif_raw and "\n" not in _motif_raw and "\t" not in _motif_raw:
+            shot_tags.append(f"Motif: {_motif_raw}")
+        shot_line = (" | ".join(shot_tags)) if shot_tags else ""
+        panel_block = f"{local_i:02d}. Visual: {prompt[:visual_limit]}\n    Beat: {text[:beat_limit]}\n    Motion: {action}"
+        if shot_line:
+            panel_block += f"\n    Cinema: {shot_line}"
+        lines.append(panel_block)
     count = len(batch_script)
     culture_guard = _topic_culture_guard(batch_script[0].get("topic_meta", {}) if batch_script else {})
     # 阶段 3 (2026-05-21): 注入 LLM 推断的 director_style + era 让 storyboard 题材-aware
@@ -10708,6 +10832,43 @@ def _motion_poll_and_download(idx: int, task_id: str, vid_path: str, target_dur:
     return False
 
 
+# PR-3b.1 (2026-05-28): module-level enum 集合 + 校验 helper (Stage 3 Medium fix)
+# 跟 PR-3b step1 内的 _SHOT_TYPE_ENUM 等同步, 防 scene 字段透传 raw LLM 输出 (含注入式/非法值)
+_PR3B1_SHOT_TYPE_ENUM = {
+    "extreme close-up", "close-up", "medium shot", "wide shot",
+    "extreme wide shot", "insert shot", "over-the-shoulder",
+}
+_PR3B1_CAMERA_ANGLE_ENUM = {
+    "low-angle heroic", "high-angle oppressive", "Dutch angle unstable",
+    "bird's-eye aerial", "worm's-eye", "POV first-person",
+    "profile side view", "eye-level",
+}
+_PR3B1_LIGHTING_ENUM = {
+    "silhouette backlit", "rim light from behind", "chiaroscuro single-key",
+    "hard shadow key light", "rembrandt triangle", "low-key film noir",
+    "golden hour sidelight", "overhead harsh top-light", "soft natural ambient",
+}
+_PR3B1_CAMERA_MOTION_ENUM = {
+    "static", "slow push-in", "pull-back reveal", "dolly right", "dolly left",
+    "crane up", "crane down", "whip pan", "orbit", "handheld shake", "rack focus",
+}
+
+
+def _validate_enum_field(value: object, enum_set: set, default: str, max_len: int = 60) -> str:
+    """PR-3b.1 Stage 3 Medium fix: scene 字段校验 + 限长 + 注入式过滤.
+    raw LLM 输出非 enum 中 → 返回 default. 含 newline/control char 也算非法.
+    """
+    v = str(value or "").strip()
+    if not v or len(v) > max_len:
+        return default
+    # 过滤 newline / control / injection
+    if "\n" in v or "\r" in v or "\t" in v:
+        return default
+    if v in enum_set:
+        return v
+    return default
+
+
 def _build_motion_video_prompt(scene: dict, motion_prompt: str, safe_retry: bool = False) -> str:
     action_block = _motion_action_block(scene, 520)
     if ADS_DIALOGUE_MODE:
@@ -10733,9 +10894,29 @@ def _build_motion_video_prompt(scene: dict, motion_prompt: str, safe_retry: bool
             "Avoid branded style references, artist names, movie-title references, copyrighted characters, modern devices, subtitles, logos, watermarks."
         )
     scene_prompt = scene.get("prompt", "")
+    # PR-3b.1 (2026-05-28): HADS 路径优先用 scene.camera_motion (PR-3b 结构化分镜 enum),
+    # 落地为具体 "Camera motion: slow push-in" 等精确指令, 不再依赖 LLM 自由文本 motion_prompts.
+    # Stage 3 Medium fix: scene 字段加白名单校验 + 限长 (raw LLM 输出可能含注入式/非法值)
+    # Stage 3 Low2 fix: scene.camera_motion == 'static' 时不覆盖 motion_prompt (static 不如自由文本丰富)
+    _validated_motion = _validate_enum_field(scene.get("camera_motion"), _PR3B1_CAMERA_MOTION_ENUM, "")
+    if _validated_motion and _validated_motion != "static":
+        effective_motion = _validated_motion
+    else:
+        effective_motion = motion_prompt or _validated_motion or "static"
+    # 追加 PR-3b.1 其他 3 enum 当 cinema 标签 (shot_type/camera_angle/lighting) 让 WERYDANCE 看见
+    cinema_tags = []
+    for tag_key, label, enum_set in (
+        ("shot_type", "shot", _PR3B1_SHOT_TYPE_ENUM),
+        ("camera_angle", "angle", _PR3B1_CAMERA_ANGLE_ENUM),
+        ("lighting", "lighting", _PR3B1_LIGHTING_ENUM),
+    ):
+        val = _validate_enum_field(scene.get(tag_key), enum_set, "")
+        if val:
+            cinema_tags.append(f"{label}: {val}")
+    cinema_tail = (". Cinema: " + " | ".join(cinema_tags)) if cinema_tags else ""
     if scene_prompt:
-        return f"{scene_prompt}. {action_block}. Camera motion: {motion_prompt}"
-    return f"{action_block}. Camera motion: {motion_prompt}" if action_block else motion_prompt
+        return f"{scene_prompt}. {action_block}. Camera motion: {effective_motion}{cinema_tail}"
+    return f"{action_block}. Camera motion: {effective_motion}{cinema_tail}" if action_block else f"{effective_motion}{cinema_tail}"
 
 
 def _short_board_text(value: object, limit: int = 170) -> str:
