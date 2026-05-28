@@ -837,7 +837,7 @@ _PODCAST_TO_VOICE_ASSET_MAP = {
     "CN-Man-Beijing-V2": "external_luo_xiang_xyma_001",    # 原野 → 罗翔
     "gushijingling-720c0ae5": "external_xu_zhiyuan_xyma_001",  # 故事精灵 → 许知远
     "suzhe-45bbbe54": "external_xu_zhiyuan_xyma_001",      # 苏哲 → 许知远 (知性)
-    "pingshu-c7c18f5a": "external_liang_wendao_yt_001",    # 评书 → 梁文道 (古风讲述)
+    "pingshu-c7c18f5a": "external_yi_zhongtian_yt_001",    # B25 (2026-05-28): 评书 → 易中天 (评书腔+历史讲述, 比之前梁文道更贴评书风)
 }
 
 # B10 防回归: 自动禁用的 quality_flags (歌声/音乐污染不适合说话克隆)
@@ -3840,9 +3840,18 @@ THUMBNAIL_ANCHOR: Air Force One stairs, black leather jacket figure, glowing chi
   - {'★ 黄历反 cliché：严禁"翻黄历的老者/老头/白须长袍老人"刻板形象出现在任何一张图里。默认无人（物件派）；允许人物的板块必须多样化（织女/医者/书生/农夫/神像/现代家庭），不得重复老者。英文 prompt 里可加 negative 指令 "no elderly man reading almanac, no white-bearded old scholar in robe"' if almanac_data else ''}
   - 最后一张图必须是{'明亮温馨的收尾场景（如孩子们的笑脸、阳光洒满场景、竖起大拇指、举手欢呼等），充满希望与祝福' if tone == '轻松' else '温馨收尾调性（如福字、红灯笼、家庭团圆、祝福场景）'}，与结尾祝语呼应
 
+★ B37 (2026-05-28) 题材具象场景: 每句台词必须对应一个**具体场景**, 不要 generic 风格
+为每句标 `scene_anchor` (8-15 词英文具象场景描述, 例:
+  · 「东临碣石以观沧海」→ "rocky carved cliff at the edge of dark sea, low tide foam, vast horizon"
+  · 「秋风萧瑟洪波涌起」→ "autumn wind whipping bare branches, crashing waves against shore rocks"
+  · 「日月之行若出其中」→ "sun rising from the sea horizon, golden light path across rippling water"
+  · 现代抽象题材 → 写具象物件场景 (办公室落日窗景 / 地铁人流 / 实验室仪器特写 等), 而非"businessman thinking" generic
+), 然后 `prompt` 字段必须**显式嵌入 scene_anchor** (verbatim 或 paraphrase).
+古装/历史题材 scene_anchor 必须忠于原文意象 (碣石/山岛/秋风/星汉/沧海), 不是模板化"ancient Chinese scene".
+
 输出格式（严格 JSON 数组，{num_lines} 个元素）：
 [
-  {{"emotion": "情绪标签", "prompt": "英文提示词"}},
+  {{"emotion": "情绪标签", "scene_anchor": "8-15 词英文具象场景", "prompt": "英文提示词 (必须含 scene_anchor)"}},
   ...
 ]
 只输出 JSON，不加任何说明文字。"""
@@ -3989,6 +3998,28 @@ THUMBNAIL_ANCHOR: Air Force One stairs, black leather jacket figure, glowing chi
         _anchored_count += 1
     if _anchored_count:
         log(f"B14 anchor 兜底: {_anchored_count}/{num_lines} scene 末尾 append core terms")
+
+    # B37 (2026-05-28) scene_anchor 兜底: visuals 内 LLM 输出的 scene_anchor 字段,
+    # 检查 prompt 是否含 scene_anchor 关键词, 缺则 append. 修大哥反馈"画面没还原题材具体场景".
+    _scene_anchor_count = 0
+    for i, v in enumerate(visuals[:num_lines]):
+        if not isinstance(v, dict):
+            continue
+        scene_anchor = str(v.get("scene_anchor") or "").strip()
+        if not scene_anchor:
+            continue
+        cur_prompt = str(v.get("prompt") or "")
+        cur_lower = cur_prompt.lower()
+        # 检测 scene_anchor 前 3 个关键词是否进 prompt (粗判)
+        anchor_tokens = [t for t in re.split(r"[\s,/\-]+", scene_anchor) if len(t) >= 4][:5]
+        matched = sum(1 for t in anchor_tokens if t.lower() in cur_lower)
+        if matched >= max(1, len(anchor_tokens) // 2):
+            continue
+        # scene_anchor 没充分嵌入 prompt → append 兜底
+        v["prompt"] = cur_prompt + f", scene anchor: {scene_anchor}"
+        _scene_anchor_count += 1
+    if _scene_anchor_count:
+        log(f"B37 scene_anchor 兜底: {_scene_anchor_count}/{num_lines} scene 末尾 append scene_anchor")
 
     # tone 决定情绪→风格查询池
     style_pool = EMOTION_STYLE_BRIGHT if tone == "轻松" else EMOTION_STYLE
