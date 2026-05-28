@@ -12336,10 +12336,40 @@ def _generate_grid_multiref_motion_segments(script: list[dict], motion_prompts: 
             record["pass"] = ok
             if ok or record.get("reason") == "task_failed":
                 _remove_grid_multiref_task(group_key)
+            # B40.3 (2026-05-28): transient fail 自动 retry 一次. 114735 实测 group 2 poll #91 task_failed
+            # 整链路 abort, raw_concat 无 audio fallback master TTS 女声. WERYDANCE 上游 stochastic fail
+            # 60s 退避后 retry submit+poll 复用同 payload 大概率过. 跟 B26 audio_dub fail rate 同思路.
+            # B40.3: submit_without_task_id 早在 L12330 continue 不会到这, 不放 transient
+            # (Medium: resumed 分支也走 continue 不进 retry, kill 重启场景罕见, 留 backlog)
+            _TRANSIENT_REASONS = ("task_failed", "task_timeout", "poll_timeout")
+            if not ok and record.get("reason") in _TRANSIENT_REASONS and not record.get("b40_3_retried"):
+                record["b40_3_retried"] = True
+                log(f"B40.3 group {group_no} {record.get('reason')}, 60s 后 retry 一次 (复用 payload)")
+                tg(f"🔁 B40.3 Grid multi-ref {record['scene_start']}-{record['scene_end']} retry (60s 后)")
+                time.sleep(60)
+                try:
+                    r2 = req_post("/generation/almighty-reference-to-video", payload, timeout=30)
+                    task_id2 = r2.get("data", {}).get("task_id") or (r2.get("data", {}).get("task_ids") or [None])[0]
+                    if task_id2:
+                        record["task_id"] = task_id2
+                        record["b40_3_retry_task_id"] = task_id2
+                        _save_grid_multiref_task(group_key, task_id2)
+                        ok, info = _poll_video_task_download(task_id2, out_path, f"grid multi-ref {group_no} retry")
+                        # info 含新 reason/path/duration 覆盖
+                        record.update(info)
+                        record["pass"] = ok
+                        if ok or record.get("reason") == "task_failed":
+                            _remove_grid_multiref_task(group_key)
+                    else:
+                        log(f"B40.3 group {group_no} retry submit no task_id, response={json.dumps(r2 or {}, ensure_ascii=False)[:200]}")
+                        record["b40_3_retry_reason"] = "retry_no_task_id"
+                except Exception as e2:
+                    log(f"B40.3 group {group_no} retry exception: {e2}")
+                    record["b40_3_retry_reason"] = f"retry_exception:{str(e2)[:200]}"
             if ok:
-                tg(f"🧪 Grid multi-ref {record['scene_start']}-{record['scene_end']} ✓")
+                tg(f"🧪 Grid multi-ref {record['scene_start']}-{record['scene_end']} ✓" + (" (retry)" if record.get("b40_3_retried") else ""))
             else:
-                tg(f"⚠️ Grid multi-ref {record['scene_start']}-{record['scene_end']} 失败：{record.get('reason')}")
+                tg(f"⚠️ Grid multi-ref {record['scene_start']}-{record['scene_end']} 失败：{record.get('reason')}" + (" [retry 仍 fail]" if record.get("b40_3_retried") else ""))
         except Exception as e:
             record.update({"pass": False, "reason": str(e)})
             tg(f"⚠️ Grid multi-ref {record['scene_start']}-{record['scene_end']} 异常：{str(e)[:120]}")
