@@ -3937,9 +3937,23 @@ THUMBNAIL_ANCHOR: Air Force One stairs, black leather jacket figure, glowing chi
 ), 然后 `prompt` 字段必须**显式嵌入 scene_anchor** (verbatim 或 paraphrase).
 古装/历史题材 scene_anchor 必须忠于原文意象 (碣石/山岛/秋风/星汉/沧海), 不是模板化"ancient Chinese scene".
 
+★ PR-3b (2026-05-28) 结构化分镜 schema: 每句多输出 5 个 enum 字段, 直击「镜头语言初级青涩」反馈.
+所有字段必须严格从下列 enum 中选 (不能自创), prompt 必须 verbatim 嵌入这些 enum 词:
+
+- `shot_type`: extreme close-up | close-up | medium shot | wide shot | extreme wide shot | insert shot | over-the-shoulder
+- `camera_angle`: low-angle heroic | high-angle oppressive | Dutch angle unstable | bird's-eye aerial | worm's-eye | POV first-person | profile side view | eye-level
+- `lighting`: silhouette backlit | rim light from behind | chiaroscuro single-key | hard shadow key light | rembrandt triangle | low-key film noir | golden hour sidelight | overhead harsh top-light | soft natural ambient
+- `camera_motion`: static | slow push-in | pull-back reveal | dolly right | dolly left | crane up | crane down | whip pan | orbit | handheld shake | rack focus
+- `visual_motif`: 1-3 词强烈物件 (flapping banner / smoke and embers / pouring rain / single blood drop / trembling hand / eye reflection / candle flame / mirror reflection / window shadow / dust motes / sunrise glow / autumn leaves 等, 也可按 scene_anchor 自创具象物件 1-3 词)
+
+★ 前 2 句（钩子）shot_type 必须 extreme close-up + 强烈物件 motif. 末 1-2 句（金句）必须 extreme wide shot + silhouette against sky/sunset. 中段混合使用其他.
+
 输出格式（严格 JSON 数组，{num_lines} 个元素）：
 [
-  {{"emotion": "情绪标签", "scene_anchor": "8-15 词英文具象场景", "prompt": "英文提示词 (必须含 scene_anchor)"}},
+  {{"emotion": "情绪标签", "scene_anchor": "8-15 词英文具象场景",
+    "shot_type": "<enum>", "camera_angle": "<enum>", "lighting": "<enum>",
+    "camera_motion": "<enum>", "visual_motif": "1-3 词物件",
+    "prompt": "英文提示词 (必须含 scene_anchor + 所有 5 enum 词 verbatim)"}},
   ...
 ]
 只输出 JSON，不加任何说明文字。"""
@@ -4108,6 +4122,74 @@ THUMBNAIL_ANCHOR: Air Force One stairs, black leather jacket figure, glowing chi
         _scene_anchor_count += 1
     if _scene_anchor_count:
         log(f"B37 scene_anchor 兜底: {_scene_anchor_count}/{num_lines} scene 末尾 append scene_anchor")
+
+    # PR-3b (2026-05-28): 结构化分镜 schema → brief.shot_list
+    # LLM 输出 5 enum 字段 (shot_type/camera_angle/lighting/camera_motion/visual_motif),
+    # Stage 3 High fix: enum 白名单校验, 非法值 → default + audit fallback_count.
+    # Stage 3 Medium fix: defaults_used 按 LLM 是否输出该字段统计, 不是 value 是否等 default.
+    _SHOT_TYPE_ENUM = {"extreme close-up", "close-up", "medium shot", "wide shot",
+                       "extreme wide shot", "insert shot", "over-the-shoulder"}
+    _CAMERA_ANGLE_ENUM = {"low-angle heroic", "high-angle oppressive", "Dutch angle unstable",
+                          "bird's-eye aerial", "worm's-eye", "POV first-person",
+                          "profile side view", "eye-level"}
+    _LIGHTING_ENUM = {"silhouette backlit", "rim light from behind", "chiaroscuro single-key",
+                      "hard shadow key light", "rembrandt triangle", "low-key film noir",
+                      "golden hour sidelight", "overhead harsh top-light", "soft natural ambient"}
+    _CAMERA_MOTION_ENUM = {"static", "slow push-in", "pull-back reveal", "dolly right",
+                           "dolly left", "crane up", "crane down", "whip pan", "orbit",
+                           "handheld shake", "rack focus"}
+
+    def _validate_enum(value: str, enum_set: set, default: str) -> tuple[str, bool]:
+        """返回 (validated_value, is_fallback). 非法/空 → default."""
+        v = str(value or "").strip()
+        if v in enum_set:
+            return v, False
+        return default, True
+
+    try:
+        shot_list = []
+        llm_missing_fields = 0  # LLM 完全没输出 enum 字段
+        invalid_enums = 0       # LLM 输出了但 enum 非法
+        for i, v in enumerate(visuals[:num_lines]):
+            if not isinstance(v, dict):
+                continue
+            # 检测 LLM 是否输出 (key 存在且非空) — Medium fix
+            llm_provided = any(
+                str(v.get(k) or "").strip() for k in
+                ("shot_type", "camera_angle", "lighting", "camera_motion")
+            )
+            if not llm_provided:
+                llm_missing_fields += 1
+            shot_type, fb1 = _validate_enum(v.get("shot_type"), _SHOT_TYPE_ENUM, "extreme close-up")
+            camera_angle, fb2 = _validate_enum(v.get("camera_angle"), _CAMERA_ANGLE_ENUM, "eye-level")
+            lighting, fb3 = _validate_enum(v.get("lighting"), _LIGHTING_ENUM, "soft natural ambient")
+            camera_motion, fb4 = _validate_enum(v.get("camera_motion"), _CAMERA_MOTION_ENUM, "static")
+            # invalid_enums 计: LLM 输出非空但不在 enum 中
+            for raw, fb in (("shot_type", fb1), ("camera_angle", fb2), ("lighting", fb3), ("camera_motion", fb4)):
+                if fb and str(v.get(raw) or "").strip():
+                    invalid_enums += 1
+            shot_list.append({
+                "turn_idx": i + 1,
+                "shot_type": shot_type,
+                "camera_angle": camera_angle,
+                "lighting": lighting,
+                "camera_motion": camera_motion,
+                "visual_motif": str(v.get("visual_motif") or "").strip()[:80],
+                "scene_anchor": str(v.get("scene_anchor") or "").strip(),
+                "emotion": str(v.get("emotion") or "").strip(),
+            })
+        log(f"PR-3b shot_list: {len(shot_list)} shots, LLM 漏字段 {llm_missing_fields}, enum 非法 {invalid_enums}")
+        if shot_list:
+            brief = _load_brief(topic)
+            # Stage 3 Low fix: shot_director 已 succeeded 跳过 (跨 run 防 history 膨胀)
+            if brief.get("agents", {}).get("shot_director", {}).get("status") != "succeeded":
+                _brief_claim(
+                    brief, "shot_director", "brief.shot_list", shot_list,
+                    f"jiangwen LLM 结构化分镜 (missing={llm_missing_fields} invalid={invalid_enums})"
+                )
+                _save_brief(brief)
+    except Exception as e:
+        log(f"PR-3b brief.shot_list 写入失败（不影响）：{e}")
 
     # tone 决定情绪→风格查询池
     style_pool = EMOTION_STYLE_BRIGHT if tone == "轻松" else EMOTION_STYLE
@@ -7473,8 +7555,24 @@ def _empty_brief(topic: str) -> dict:
     }
 
 
+def _deep_merge_brief_skeleton(data: dict, skeleton: dict) -> dict:
+    """老 brief 缺新字段 deep merge 补齐 (PR-3a Stage 3 Medium2 fix).
+    skeleton 提供 nested 默认值, data 已有的字段不动. nested dict 递归 merge.
+    """
+    if not isinstance(data, dict) or not isinstance(skeleton, dict):
+        return data
+    for k, v in skeleton.items():
+        if k not in data:
+            data[k] = v
+        elif isinstance(v, dict) and isinstance(data[k], dict):
+            _deep_merge_brief_skeleton(data[k], v)
+    return data
+
+
 def _load_brief(topic: str) -> dict:
-    """读 brief, 不存在或破损则返回空骨架."""
+    """读 brief, 不存在/破损/topic 不匹配则返回空骨架.
+    PR-3a Stage 3 High fix: 校验 data.topic == topic 防 safe name 碰撞串档.
+    """
     p = _brief_path(topic)
     if not p.exists():
         return _empty_brief(topic)
@@ -7483,12 +7581,12 @@ def _load_brief(topic: str) -> dict:
         if not isinstance(data, dict) or data.get("schema") != "adr_creative_brief_v1":
             log(f"brief schema 不匹配, 重建: {p}")
             return _empty_brief(topic)
-        # 老 brief 缺新字段时 merge 空骨架 (向前兼容)
-        empty = _empty_brief(topic)
-        for k in empty:
-            if k not in data:
-                data[k] = empty[k]
-        # 同步 created_at 不变, updated_at 留原值
+        # High fix: topic safe 截断/剥字符可能碰撞, 校验 topic 一致
+        if data.get("topic") != topic:
+            log(f"brief topic 不匹配 (file={data.get('topic')!r} req={topic!r}), 重建避免串档")
+            return _empty_brief(topic)
+        # Medium 2 fix: deep merge 补齐 nested 字段 (老 brief 可能缺 agents 子字段或 brief 子树)
+        _deep_merge_brief_skeleton(data, _empty_brief(topic))
         return data
     except Exception as e:
         log(f"brief 读取失败 ({p}): {e}, 重建空 brief")
@@ -7602,10 +7700,14 @@ def _brief_from_topic_decomposition(brief: dict, decomp: dict) -> None:
     """PR-3a mapper: topic_decomposition 字段 → brief 新结构.
     把 LLM 已推断的 era/culture/bgm_*/role_candidates/director_*/cover_art_direction/
     is_action_topic/audit_risk_score 写入 brief, 标 topic_decomposer succeeded.
-    幂等: 重复调用不会重复 history (因为 field_path 相同, 仍 audit).
+
+    Stage 4 fix 幂等: agent 已 succeeded 跳过 (helper 级幂等, 防 history 膨胀).
+    上层调用方仍可用 _brief_agent_status reset 后强制重跑.
     """
     if not isinstance(brief, dict) or not isinstance(decomp, dict) or not decomp:
         return
+    if brief.get("agents", {}).get("topic_decomposer", {}).get("status") == "succeeded":
+        return  # 幂等: 已 succeeded 不重复写 history
     agent = "topic_decomposer"
     reason = "step1 LLM topic_decomposition"
     # metadata
@@ -7657,6 +7759,15 @@ def _llm_topic_decomposition(topic: str, use_cache: bool = True) -> dict:
         cached = _load_topic_decomposition_cache(topic)
         if cached and isinstance(cached, dict) and cached.get("era"):
             log(f"topic_decomposition: {topic} 从 cache 复用 era={cached.get('era')}")
+            # PR-3a Stage 3 Medium1 fix: cache 命中也回填 brief, 老 topic 新 run 才有中台文件
+            try:
+                brief = _load_brief(topic)
+                # 仅当 topic_decomposer 尚未 claim 才 mapper (幂等防 history 重复)
+                if brief.get("agents", {}).get("topic_decomposer", {}).get("status") != "succeeded":
+                    _brief_from_topic_decomposition(brief, cached)
+                    _save_brief(brief)
+            except Exception as e:
+                log(f"PR-3a cache→brief 回填失败（不影响）：{e}")
             return cached
     if os.environ.get("ADR_TOPIC_DECOMPOSITION_LLM", "1").strip().lower() in ("0", "false", "no", "off"):
         return {}
