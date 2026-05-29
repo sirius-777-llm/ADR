@@ -3600,10 +3600,12 @@ def step1_script(topic: str) -> list[dict]:
 
     plan_prompt = f"""主题：{topic}{almanac_summary}
 
-请判断这个主题适合多少个分镜（每个分镜 = 一句台词），范围 6~18 个
-• 信息量大的主题（如老黄历、人物传记）需要更多分镜
-• 信息量小的主题（如单一历史事件）可以少一些
+请判断这个主题适合多少个分镜（每个分镜 = 一句台词），范围 6~30 个
+• 信息量大的主题（如老黄历、人物传记、长古文/诗词）需要更多分镜（20-30）
+• 信息量小的主题（如单一历史事件、短诗）可以少一些（6-12）
+• 中等信息量主题取 14-20 之间
 • 每个分镜应承载一个独立的信息点或叙事段落
+• 每个分镜目标台词时长 5-7 秒（WERYDANCE 硬限单段 4-15s）
 
 请输出 JSON 格式：{{"count": 数字, "reason": "一句话理由"}}
 只输出 JSON，不加任何其他内容。"""
@@ -3616,10 +3618,12 @@ def step1_script(topic: str) -> list[dict]:
             fence = re.search(r'```(?:\w*)\s*\n?([\s\S]*?)```', plan_raw)
             plan_clean = fence.group(1).strip() if fence else plan_raw.strip()
             plan = json.loads(re.search(r'\{[\s\S]+\}', plan_clean).group())
-            num_lines = max(6, min(18, int(plan["count"])))
+            # B68 (2026-05-30): 18→30 cap 抬升, 配合 B69 chunk concat 达 4-5min 长视频目标
+            num_lines = max(6, min(30, int(plan["count"])))
             log(f"LLM 规划分镜数：{num_lines}（理由：{plan.get('reason', '')}）")
         except:
-            num_lines = 18 if almanac_data else 9
+            # B68: fallback 抬升 — almanac 24 (后面被强制覆盖 22), 非 almanac 9→12 (配 cap 30 中间保守值)
+            num_lines = 24 if almanac_data else 12
             log(f"LLM 规划失败，使用默认分镜数：{num_lines}")
 
     current_year = __import__("datetime").datetime.now().year
@@ -7228,7 +7232,8 @@ def generate_storyboard_images_gpt_image2(script: list[dict], topic: str) -> boo
     n = len(script)
     if n <= 0:
         return False
-    max_n = int(os.environ.get("ADR_GPT_IMAGE2_STORYBOARD_MAX", "24"))
+    # B68 (2026-05-30): 24→36 配合 scene cap 30 + 余量, env 仍可覆盖
+    max_n = int(os.environ.get("ADR_GPT_IMAGE2_STORYBOARD_MAX", "36"))
     if n > max_n:
         log(f"GPT Image 2 storyboard 跳过：分镜数 {n} 超过上限 {max_n}")
         return False
@@ -10040,7 +10045,8 @@ def generate_storyboard_grid_gpt_image2(script: list[dict], topic: str) -> bool:
     n = len(script)
     if n <= 0:
         return False
-    max_n = int(os.environ.get("ADR_GPT_IMAGE2_STORYBOARD_GRID_MAX", "32"))
+    # B68 (2026-05-30): 32→48 配合 scene cap 30 + 余量, env 仍可覆盖
+    max_n = int(os.environ.get("ADR_GPT_IMAGE2_STORYBOARD_GRID_MAX", "48"))
     if n > max_n:
         log(f"GPT Image 2 storyboard grid 跳过：分镜数 {n} 超过上限 {max_n}")
         return False
@@ -10588,7 +10594,56 @@ def generate_bgm(topic: str, tone: str = "中性") -> str | None:
     return None
 
 
+# ── B68 (2026-05-30) WERYDANCE 段长合规 gate ────────────────────────────────
+# cap 18→30 后, LLM 偶发会给个别 scene dur > 15 或 < 4 (WERYDANCE [4, 15] 硬限).
+# Codex Stage 1 推荐: fail-fast clamp 不自动拆合 (拆合 PT 2-3h 留 B68.2 长期).
+# 调用点: step6_parallel + step65_motion + step66_adsd_lip_sync 入口.
+_B68_DUR_AUDIT_PATH = Path(__file__).resolve().parent / "voice_assets" / "b68_dur_clamps.jsonl"
+_b68_dur_audit_lock = threading.Lock()
+
+
+def _b68_clamp_scene_durations_to_werydance_bounds(script: list[dict], origin: str) -> int:
+    """遍历 script[*].dur, clamp 到 WERYDANCE 硬限 [4, 15], 返回 clamp 次数.
+    fail-fast: 不拆合 scene (B68.2 长期), 只截断到边界 + audit 留底.
+    """
+    if not script:
+        return 0
+    clamps: list[dict] = []
+    for i, scene in enumerate(script):
+        try:
+            dur = float(scene.get("dur") or scene.get("duration") or 0)
+        except (TypeError, ValueError):
+            continue
+        # Codex Medium fix: NaN 不命中 > / < 比较, 会穿透 clamp 进 weryai. 用 isfinite 拦下.
+        if not math.isfinite(dur) or dur <= 0:
+            continue  # 未定型 / NaN / inf, 跳过 (下游 weryai 收到 None/0 走自己的 default)
+        if dur > 15.0:
+            scene["dur"] = 15.0
+            clamps.append({"i": i, "from": dur, "to": 15.0, "bound": "upper"})
+        elif dur < 4.0:
+            scene["dur"] = 4.0
+            clamps.append({"i": i, "from": dur, "to": 4.0, "bound": "lower"})
+    if clamps:
+        log(f"[B68] WERYDANCE 段长 clamp: {len(clamps)} scene 越界 (origin={origin})")
+        for c in clamps:
+            log(f"  scene[{c['i']}] dur {c['from']:.2f} → {c['to']} ({c['bound']})")
+        try:
+            with _b68_dur_audit_lock:
+                _B68_DUR_AUDIT_PATH.parent.mkdir(parents=True, exist_ok=True)
+                with open(_B68_DUR_AUDIT_PATH, "a", encoding="utf-8") as fh:
+                    fh.write(json.dumps({
+                        "ts": time.time(),
+                        "origin": origin,
+                        "total_scenes": len(script),
+                        "clamps": clamps,
+                    }, ensure_ascii=False) + "\n")
+        except Exception as e:
+            log(f"[B68] audit 写入失败: {e}")
+    return len(clamps)
+
+
 def step6_parallel(script: list[dict], topic: str, pregenerated_bgm_path: str | None = None) -> str | None:
+    _b68_clamp_scene_durations_to_werydance_bounds(script, origin="step6_parallel")
     _ensure_motion_action_plan(script)
     _write_motion_action_plan_qa(script)
     n = len(script)
@@ -12115,7 +12170,8 @@ def _motion_one_scene(idx: int, scene: dict, motion_prompt: str, aspect_ratio: s
     # WERYDANCE 支持 5-10s；字段名统一用 vid_duration（step345_timeline 里的 key）
     _raw_dur = scene.get("vid_duration") or scene.get("dur") or 5
     target_dur = float(_raw_dur)
-    dur = int(round(max(5, min(10, _raw_dur))))
+    # B68 (2026-05-30) Codex High fix: 上限 10→15 让长段不被截短 (WERYDANCE 硬限 [4,15], 下限 5 保护 status=1002)
+    dur = int(round(max(5, min(15, _raw_dur))))
 
     # ★ 持久化：检查这个 scene 是否有未完成的历史 task_id，有则先查状态，避免重复提交烧钱
     existing_tasks = _load_motion_tasks()
@@ -12911,7 +12967,8 @@ def _previs_page_duration(group: list[dict]) -> int:
     override = os.environ.get("ADR_PREVIS_PAGE_DURATION", "").strip()
     if override:
         try:
-            return max(5, min(10, int(round(float(override)))))
+            # B68 (2026-05-30): 上限 10→15 配合 WERYDANCE 硬限 [4,15]
+            return max(5, min(15, int(round(float(override)))))
         except Exception:
             pass
     return _grid_multiref_duration(group)
@@ -13008,14 +13065,16 @@ def _character_trailer_shot_duration(scene: dict) -> int:
     override = os.environ.get("ADR_CHARACTER_TRAILER_SHOT_DURATION", "").strip()
     if override:
         try:
-            return max(5, min(10, int(round(float(override)))))
+            # B68 (2026-05-30): 上限 10→15 配合 WERYDANCE 硬限 [4,15]
+            return max(5, min(15, int(round(float(override)))))
         except Exception:
             pass
     try:
         raw = float(scene.get("vid_duration") or scene.get("dur") or 5)
     except Exception:
         raw = 5
-    return max(5, min(10, int(round(raw))))
+    # B68 (2026-05-30): 上限 10→15
+    return max(5, min(15, int(round(raw))))
 
 
 def _character_trailer_prompt(scene: dict, idx: int, motion_prompt: str) -> str:
@@ -15231,6 +15290,7 @@ def step66_adsd_lip_sync(script: list[dict]):
     """Experimental ADSD real lip-sync path using Werydance Almighty Reference."""
     if not (ADS_DIALOGUE_MODE and ADSD_LIP_SYNC_EXPERIMENT):
         return
+    _b68_clamp_scene_durations_to_werydance_bounds(script, origin="step66_adsd_lip_sync")
     n = len(script)
     aspect = "9:16" if IS_VERTICAL else "16:9"
     mode_note = "audio-dub 音色直配" if ADSD_ALMIGHTY_AUDIO_DUB_EXPERIMENT else "静音口型同步"
@@ -15573,6 +15633,7 @@ def step66_adsd_lip_sync(script: list[dict]):
 
 def step65_motion(script: list[dict]):
     """把静态 seg_N.mp4 替换为 WERYDANCE_2_0 动态版本（并发 + 单轮内失败自动重试 1 次）"""
+    _b68_clamp_scene_durations_to_werydance_bounds(script, origin="step65_motion")
     _ensure_motion_action_plan(script)
     _write_motion_action_plan_qa(script)
     n = len(script)
