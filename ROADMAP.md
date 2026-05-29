@@ -88,6 +88,19 @@ Last updated: 2026-05-30
 
 ## ⏳ Planned (按优先级)
 
+### 🎬 长视频突破 4-5 min (2026-05-30 议定 · 当前单 run ~90s 是甜点上限)
+
+> **背景**: 大哥反馈"现在视频不到 90 秒，希望进化到 4-5 分钟"。诊断 4 重收紧瓶颈：(1) LLM 规划分镜数 `max(6, min(18, n))` 硬上限 18 scene × 平均 5-7s ≈ 90-126s；(2) GPT_IMAGE2 storyboard panel 24 / grid 32 上限超过即跳过，质量塌；(3) WERYDANCE 每 turn 一次 lip-sync 18 turn ≈ 18min 渲染，扩到 30 turn → 30+min + gateway 504 风险指数上升；(4) TG sendVideo 50MB 单文件硬限，4-5min 1080p 必爆。
+> **路径**: B68 单 run 撑到 ~3min (18→30 scene) + B69 B66 多 chunk 自动 concat 拼到 5-6min + B70 TG 上传降级链 (sendDocument 2GB fallback)。三者组合可在不彻底改架构前提下达到目标。
+
+| 项目 | 工程量 | ROI | 状态 | 备注 |
+|------|--------|-----|------|------|
+| **B68 单 run scene cap 24-30 + 两段式 LLM 规划** | 4-6h | ★★★ P0 | planned | 把 `max(6, min(18, n))` 调到 `max(6, min(30, n))`, 单 run 撑到 2.5-3.5min (24-30 scene × 5-7s). 副作用 mitigation: (1) LLM 规划改两段式 — 先 outline 生成 6 段大纲, 每段 detail 4-5 scene, 防 30 分镜一次性叙事头重脚轻; (2) `ADR_GPT_IMAGE2_STORYBOARD_MAX` 24→36, `_GRID_MAX` 32→48 配套抬升; (3) gateway 504 风险: WERYDANCE 调用加 batched submit (并发上限 6, 现有节流 2.5s 保留) + 失败 turn 单独 retry 不重跑全 run; (4) Stage 4 实测 24/27/30 三档对比叙事质量, 拐点回落. 配 CCP 4 阶段全过 |
+| **B69 B66 长文 chunk 自动衔接 (生产级)** | 6-8h | ★★★ P0 | planned | 当前 B66 MVP 是裸 chunk 多 run + ffmpeg concat, 4-5 chunk concat 后 chunk 间叙事/视觉/听感全断. 进化方向: (1) chunk 间共享 character_meta_grid (cross-chunk reuse, voice_assets/character_meta_grids/ 跨 run 已有缓存); (2) BGM continuation — chunk 2-N 复用 chunk 1 BGM 同 tone + crossfade 1.5s; (3) 字幕重编号 — chunk N 起始 sub_id = sum(chunk[0..N-1].sub_count), 时间轴 offset = sum(chunk[0..N-1].duration); (4) parallel chunk run — 4 chunk 并发跑 (现在串行 1-2h 太慢, 并发 30-40min); (5) chunk_size 自适应 — LLM 估每句 TTS 时长, 9 句→动态 6-12 句; (6) chunk 间叙事衔接 prompt — chunk N 开场 LLM 给"承上"提示词. 配 CCP 4 阶段全过 |
+| **B70 TG 上传降级链 (sendDocument 2GB fallback)** | 2-3h | ★★ P1 | planned | 4-5min 1080p MP4 ≈ 60-120MB, TG bot API sendVideo 50MB 硬限必失败. 实现: (1) step10 deliver 加 file size probe; (2) > 48MB 自动降级 sendDocument (file 2GB 上限, 但 TG 端不直接预览, 用户点开下载); (3) 或自动分段 — ffmpeg 切 2-3 段每段 < 48MB 顺序 sendVideo + caption "1/3"/"2/3"/"3/3"; (4) env `ADR_TG_OVERSIZE_POLICY` = `document` / `split` / `external` (external = 传 r2/s3 拿外链推 TG 消息). 配 CCP 4 阶段全过 |
+| B68.1 单 run 30 scene 实测对比 | 1h | ★★ | planned (blockedBy B68) | B68 ship 后跑 3 题材 (诗词/历史/科普) × 18/24/30 三档, 对比叙事完整性 / 视觉一致性 / 总耗时, 决定 default cap. 写 voice_assets/long_video_benchmark.json |
+| B69.1 B66 chunk 并发上限调优 | 30min | ★ | planned (blockedBy B69) | parallel chunk run 并发数 (2/3/4) 对比 weryai gateway 504 率与总耗时, 找拐点 |
+
 ### 角色库扩展
 
 | 项目 | 工程量 | ROI | 状态 | 备注 |
