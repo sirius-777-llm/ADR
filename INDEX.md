@@ -1,6 +1,6 @@
 # ADR Code Index
 
-Auto-generated. Source: `run_adr_v8.py` (19344 lines). Regenerate: `python3 tools/generate_index.py`.
+Auto-generated. Source: `run_adr_v8.py` (19537 lines). Regenerate: `python3 tools/generate_index.py`.
 
 ## Sections
 
@@ -14,8 +14,8 @@ Auto-generated. Source: `run_adr_v8.py` (19344 lines). Regenerate: `python3 tool
 - [`第七步：拼接视频轨`](#第七步-拼接视频轨) — L16019-16278 (260 lines · 1 fn · 0 sub)
 - [`第八步：生成 ASS 字幕`](#第八步-生成-ass-字幕) — L16279-17212 (934 lines · 10 fn · 1 sub)
 - [`第九步：最终合成`](#第九步-最终合成) — L17213-17497 (285 lines · 1 fn · 0 sub)
-- [`第十步：推送 Telegram`](#第十步-推送-telegram) — L17498-19159 (1662 lines · 16 fn · 5 sub)
-- [`主流程`](#主流程) — L19160-19344 (185 lines · 2 fn · 0 sub)
+- [`第十步：推送 Telegram`](#第十步-推送-telegram) — L17498-19352 (1855 lines · 19 fn · 6 sub)
+- [`主流程`](#主流程) — L19353-19537 (185 lines · 2 fn · 0 sub)
 
 ---
 
@@ -555,14 +555,15 @@ Range: **L17213 – L17497** (285 lines)
 ---
 
 ### 第十步：推送 Telegram
-Range: **L17498 – L19159** (1662 lines)
+Range: **L17498 – L19352** (1855 lines)
 
 **Sub-sections:**
-- _异步封面 + caption（与 step6-9 并发）_ — L18598-18966 (369 lines)
-- _SSL 假阴性防护：见模块级 _tg_probe_send / _tg_probe_delete_ — L18967-18971 (5 lines)
-- _尝试 1：requests（timeout 放大到 600s），前后 probe 跳号检测_ — L18972-19035 (64 lines)
-- _尝试 2：curl fallback（更稳定，不受 httpx/urllib3 限制），同样跳号检测_ — L19036-19081 (46 lines)
-- _尝试 3：小土伯/TG 文件兜底。视频上传链路 SSL 抖动时，压 lite/micro 后用 sendDocument 发文件。_ — L19082-19159 (78 lines)
+- _异步封面 + caption（与 step6-9 并发）_ — L18598-18705 (108 lines)
+- _B70 (2026-05-30) TG oversize policy helpers_ — L18706-19159 (454 lines)
+- _SSL 假阴性防护：见模块级 _tg_probe_send / _tg_probe_delete_ — L19160-19164 (5 lines)
+- _尝试 1：requests（timeout 放大到 600s），前后 probe 跳号检测_ — L19165-19228 (64 lines)
+- _尝试 2：curl fallback（更稳定，不受 httpx/urllib3 限制），同样跳号检测_ — L19229-19274 (46 lines)
+- _尝试 3：小土伯/TG 文件兜底。视频上传链路 SSL 抖动时，压 lite/micro 后用 sendDocument 发文件。_ — L19275-19352 (78 lines)
 
 **Top-level constants:**
 - `PANTONE_JIEQI` — L17867
@@ -585,15 +586,18 @@ Range: **L17498 – L19159** (1662 lines)
 - `_generate_cover_image` — L18363
 - `_async_kickoff_cover_caption` — L18605
 - `_await_async_cover_caption` — L18679
-- `step10_deliver` — L18706
+- `_b70_env_float` — L18709
+- `_b70_split_and_deliver` — L18724
+- `_b70_send_document_first` — L18824
+- `step10_deliver` — L18861
 
 ---
 
 ### 主流程
-Range: **L19160 – L19344** (185 lines)
+Range: **L19353 – L19537** (185 lines)
 
 **Functions:**
-- `_print_execution_plan` — L19161
-- `main` — L19209
+- `_print_execution_plan` — L19354
+- `main` — L19402
 
 ---

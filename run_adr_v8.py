@@ -18703,6 +18703,161 @@ def _await_async_cover_caption(timeout_seconds: float = 600.0) -> tuple | None:
     return None
 
 
+# ── B70 (2026-05-30) TG oversize policy helpers ─────────────────────────────
+# 长视频 (4-5min 1080p, 60-120MB) 上传策略, 由 ADR_TG_OVERSIZE_POLICY 选择.
+# 入口 step10_deliver size 判断点分派, 任一策略失败回退 compress (现状默认路径).
+def _b70_env_float(key: str, default: float, lo: float, hi: float) -> float:
+    """Codex Medium fix: env 值非法/0/负数/NaN 回 default, clamp 到 [lo, hi]."""
+    try:
+        v = float(os.environ.get(key, str(default)))
+        if not math.isfinite(v) or v <= 0:
+            return default
+        return max(lo, min(hi, v))
+    except (ValueError, TypeError):
+        return default
+
+
+_B70_TG_SIZE_LIMIT_MB = _b70_env_float("ADR_B70_TG_SIZE_LIMIT_MB", 48.0, 10.0, 49.0)
+_B70_TG_DOC_SIZE_LIMIT_MB = _b70_env_float("ADR_B70_TG_DOC_SIZE_LIMIT_MB", 1900.0, 100.0, 1999.0)  # bot API doc 2GB, 留 buffer
+
+
+def _b70_split_and_deliver(src_path: str, base_caption: str) -> bool:
+    """split 策略: 按时长切 N 段每段 < 48MB, 顺序 sendVideo + caption '(i/N)'.
+    保留 1080p 原画质. 全部段成功返回 True, 任一段失败 False (调用方回退 compress).
+    """
+    try:
+        total_dur = ffprobe_duration(src_path)
+        size_mb = os.path.getsize(src_path) / (1024 * 1024)
+        if total_dur <= 0 or size_mb <= 0:
+            log(f"[B70 split] 无效 duration/size: dur={total_dur} size={size_mb}MB")
+            return False
+        # N = ceil(size_mb / limit) + safety, 每段长度均分
+        import math
+        n_parts = max(2, int(math.ceil(size_mb / _B70_TG_SIZE_LIMIT_MB)))
+        seg_dur = total_dur / n_parts
+        log(f"[B70 split] {size_mb:.1f}MB / {total_dur:.1f}s → 切 {n_parts} 段, 每段 ~{seg_dur:.1f}s")
+        tg(f"🎬 [B70] 切 {n_parts} 段上传保 1080p 原画质 (每段 ~{seg_dur:.1f}s)")
+
+        seg_paths: list[str] = []
+        for i in range(n_parts):
+            start = i * seg_dur
+            seg_path = src_path.rsplit(".", 1)[0] + f"_split_{i+1:02d}of{n_parts:02d}.mp4"
+            try:
+                # -c copy 无重编码, 保画质 + 极快; -ss 在 -i 前 = seek 关键帧前
+                ffmpeg("-ss", f"{start:.3f}", "-i", src_path, "-t", f"{seg_dur:.3f}",
+                       "-c", "copy", "-movflags", "+faststart", seg_path, timeout=120)
+                seg_sz = os.path.getsize(seg_path) / (1024 * 1024)
+                if seg_sz > _B70_TG_SIZE_LIMIT_MB:
+                    log(f"[B70 split] seg {i+1} 切完仍 {seg_sz:.1f}MB > {_B70_TG_SIZE_LIMIT_MB}MB, abort")
+                    return False
+                seg_paths.append(seg_path)
+                log(f"[B70 split] seg {i+1}/{n_parts}: {seg_sz:.1f}MB → {seg_path}")
+            except Exception as e:
+                log(f"[B70 split] seg {i+1} 切失败: {e}")
+                return False
+
+        # 顺序上传每段 (用 curl, 不重新走 SSL probe 路径以免污染)
+        # Codex High fix: 记录已发段 message_id, 失败时撤回防残片污染频道
+        send_url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendVideo"
+        delete_url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/deleteMessage"
+        import subprocess as _sp
+        sent_message_ids: list[int] = []
+        for i, seg_path in enumerate(seg_paths, start=1):
+            seg_caption = f"{base_caption} ({i}/{n_parts})"
+            seg_ok = False
+            seg_msg_id: int | None = None
+            for attempt in range(2):
+                try:
+                    curl_cmd = [
+                        "curl", "-sS", "--max-time", "600", "--connect-timeout", "30",
+                        "-X", "POST", send_url,
+                        "-F", f"chat_id={TG_CHAT_ID}",
+                        "-F", f"caption={seg_caption}",
+                        "-F", "supports_streaming=true",
+                        "-F", f"video=@{seg_path}",
+                    ]
+                    r = _sp.run(curl_cmd, capture_output=True, text=True, timeout=660)
+                    if r.returncode == 0 and '"ok":true' in r.stdout:
+                        try:
+                            seg_msg_id = int(json.loads(r.stdout)["result"]["message_id"])
+                        except Exception:
+                            seg_msg_id = None
+                        seg_ok = True
+                        log(f"[B70 split] seg {i}/{n_parts} 上传成功（第 {attempt+1} 次, msg_id={seg_msg_id}）")
+                        break
+                    log(f"[B70 split] seg {i}/{n_parts} 第 {attempt+1} 次失败: rc={r.returncode} stdout={r.stdout[:160]}")
+                except Exception as e:
+                    log(f"[B70 split] seg {i}/{n_parts} 第 {attempt+1} 次异常: {type(e).__name__}: {e}")
+                if attempt < 1:
+                    time.sleep(5)
+            if not seg_ok:
+                # Codex High fix: 撤回已发段防残片污染频道
+                log(f"[B70 split] seg {i}/{n_parts} 重试耗尽, 撤回前 {len(sent_message_ids)} 个已发段")
+                deleted = 0
+                for mid in sent_message_ids:
+                    try:
+                        r_del = _sp.run([
+                            "curl", "-sS", "--max-time", "30", "-X", "POST", delete_url,
+                            "-F", f"chat_id={TG_CHAT_ID}", "-F", f"message_id={mid}",
+                        ], capture_output=True, text=True, timeout=40)
+                        if r_del.returncode == 0 and '"ok":true' in r_del.stdout:
+                            deleted += 1
+                    except Exception as e:
+                        log(f"[B70 split] deleteMessage {mid} 异常: {e}")
+                log(f"[B70 split] 撤回完成 {deleted}/{len(sent_message_ids)} 段")
+                if deleted == len(sent_message_ids):
+                    # 全撤干净, 调用方可安全 fallback compress
+                    return False
+                # 撤不干净 → fail-loud 标记 (调用方读 _b70_split_partial_failure 决定不 fallback)
+                tg(f"⚠️ [B70 split] 已发 {len(sent_message_ids)} 段中 {len(sent_message_ids)-deleted} 段未能撤回, 频道存在残片, 跳过 compress 回退以免重复")
+                globals()["_b70_split_partial_failure"] = True
+                return False
+            if seg_msg_id is not None:
+                sent_message_ids.append(seg_msg_id)
+        tg(f"✅ [B70 split] {n_parts} 段全部上传成功 (保 1080p)")
+        return True
+    except Exception as e:
+        log(f"[B70 split] 异常: {type(e).__name__}: {e}")
+        return False
+
+
+def _b70_send_document_first(src_path: str, base_caption: str) -> bool:
+    """document_first 策略: 原片直接 sendDocument (保 100% 画质, 但 TG 端要点开下载).
+    成功返回 True, 失败 False (调用方回退 compress).
+    """
+    try:
+        size_mb = os.path.getsize(src_path) / (1024 * 1024)
+        if size_mb > _B70_TG_DOC_SIZE_LIMIT_MB:
+            log(f"[B70 doc_first] {size_mb:.1f}MB > {_B70_TG_DOC_SIZE_LIMIT_MB}MB doc 上限, abort")
+            return False
+        tg(f"📄 [B70] 原片 {size_mb:.1f}MB → sendDocument 保 100% 画质")
+        doc_url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendDocument"
+        import subprocess as _sp
+        for attempt in range(3):
+            try:
+                curl_cmd = [
+                    "curl", "--ipv4", "--http1.1", "--tlsv1.2", "-sS",
+                    "--connect-timeout", "30", "--max-time", "1800",  # 大文件留 30min
+                    "-X", "POST", doc_url,
+                    "-F", f"chat_id={TG_CHAT_ID}",
+                    "-F", f"caption={base_caption} · 原画质 1080p",
+                    "-F", f"document=@{src_path}",
+                ]
+                r = _sp.run(curl_cmd, capture_output=True, text=True, timeout=1860)
+                if r.returncode == 0 and '"ok":true' in r.stdout:
+                    log(f"[B70 doc_first] 上传成功（第 {attempt+1} 次）")
+                    return True
+                log(f"[B70 doc_first] 第 {attempt+1} 次失败: rc={r.returncode} stdout={r.stdout[:160]} stderr={r.stderr[:160]}")
+            except Exception as e:
+                log(f"[B70 doc_first] 第 {attempt+1} 次异常: {type(e).__name__}: {e}")
+            if attempt < 2:
+                time.sleep(10)
+        return False
+    except Exception as e:
+        log(f"[B70 doc_first] 异常: {type(e).__name__}: {e}")
+        return False
+
+
 def step10_deliver(final_path: str, topic: str, script: list[dict]):
     if NO_VOICE:
         bgm_qa = _write_bgm_only_qa(final_path, script)
@@ -18937,10 +19092,49 @@ def step10_deliver(final_path: str, topic: str, script: list[dict]):
             log(f"兜底封面准备失败: {e}")
 
     # 4. 上传视频（先 requests，失败 fallback curl）
-    # ★ 自动压缩兜底：Telegram Bot API sendVideo 限 50MB；超 48MB 自动 ffmpeg 重编码一份 lite 版
+    # ★ B70 (2026-05-30) oversize policy router: 4-5min 1080p 出片 60-120MB 必爆 sendVideo 50MB 硬限
+    #   env ADR_TG_OVERSIZE_POLICY ∈ {compress, split, document_first}, default compress (现状)
+    #     compress       : ffmpeg crf 28 lite 重编码 (体积优先, 画质降级)
+    #     split          : ffmpeg 按时长切 N 段保 1080p (画质优先, 多段推送 "1/N")
+    #     document_first : 直接 sendDocument 原片 (画质 100% 保留, 但 TG 端要点开下载)
+    #   任一策略失败 → 自动回退 compress, 不破坏现有 fallback 链
+    # B70 fix: split/document_first 需要 short_caption, 必须提前到 router 之前定义
+    delivery_tag = ADSD_MODE_NAME if ADS_DIALOGUE_MODE else "ADR V8"
+    short_caption = f"{short_title} — {delivery_tag}"
     try:
         _size_mb = os.path.getsize(final_path) / (1024 * 1024)
         if _size_mb > 48:
+            _policy = os.environ.get("ADR_TG_OVERSIZE_POLICY", "compress").strip().lower()
+            if _policy not in ("compress", "split", "document_first"):
+                log(f"[B70] 未知 ADR_TG_OVERSIZE_POLICY={_policy!r}, fallback compress")
+                _policy = "compress"
+            log(f"[B70] 成片 {_size_mb:.1f}MB > 48MB, oversize policy = {_policy}")
+
+            if _policy == "split":
+                # 尝试 split 推送, 成功直接 return; 失败回退 compress
+                globals().pop("_b70_split_partial_failure", None)
+                if _b70_split_and_deliver(final_path, short_caption):
+                    log("step10 deliver 完成：视频 split 分段上传成功")
+                    tg("✅ 全流程完成！")
+                    return
+                # Codex High fix: 残片未撤干净时不 fallback compress, 避免频道里残片 + 整片重复
+                if globals().get("_b70_split_partial_failure"):
+                    log("[B70] split 部分失败且残片未撤干净, 跳过 compress fallback (fail-loud)")
+                    tg(f"❌ [B70 split] 部分段已发但未能全撤回, 文件保留在: {final_path}")
+                    return
+                tg("⚠️ [B70] split 策略失败 (残片已撤), 回退 compress 重编码")
+                _policy = "compress"
+
+            if _policy == "document_first":
+                # 尝试直发 sendDocument, 成功直接 return; 失败回退 compress
+                if _b70_send_document_first(final_path, short_caption):
+                    log("step10 deliver 完成：视频 sendDocument 原画质上传成功")
+                    tg("✅ 全流程完成！")
+                    return
+                tg("⚠️ [B70] document_first 失败, 回退 compress 重编码")
+                _policy = "compress"
+
+            # compress (现状路径, 默认或回退)
             tg(f"🗜 成片 {_size_mb:.1f}MB 超 Telegram 50MB 上限，自动压缩（crf 28 + slow preset）...")
             _lite_path = final_path.rsplit(".", 1)[0] + "_lite.mp4"
             ffmpeg(
@@ -18960,8 +19154,7 @@ def step10_deliver(final_path: str, topic: str, script: list[dict]):
         log(f"自动压缩兜底失败，用原片尝试上传: {e}")
 
     url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendVideo"
-    delivery_tag = ADSD_MODE_NAME if ADS_DIALOGUE_MODE else "ADR V8"
-    short_caption = f"{short_title} — {delivery_tag}"
+    # B70: delivery_tag/short_caption 已在 oversize router 之前提前定义
     video_ok = False
 
     # ── SSL 假阴性防护：见模块级 _tg_probe_send / _tg_probe_delete ──
