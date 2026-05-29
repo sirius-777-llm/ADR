@@ -12323,16 +12323,11 @@ def _grid_multiref_adaptive_group_size(n_panels: int, tts_buffered: float, max_p
     # 每 group 至少 2 panel, 限制 n_groups
     max_n_groups = max(1, n_panels // 2)
     final_n_groups = min(optimal_n_groups, max_n_groups)
-    group_size = math.ceil(n_panels / final_n_groups)
-    # Stage 4 fix: 检测末组 singleton (panel < 2), 缩 n_groups 让末组合并避免被 skip
-    # 例 13 panel group_size=3 → loop [0,3,6,9,12], 末组 1 panel skip → 4 group × 3 = 12 panel.
-    # 修: 减 final_n_groups 直到末组 >= 2 (合并末组到前 group, 实际 group_size 增大).
-    while final_n_groups > 1:
-        tail = n_panels - (final_n_groups - 1) * group_size
-        if tail >= 2:
-            break
-        final_n_groups -= 1
-        group_size = math.ceil(n_panels / final_n_groups)
+    # B62.1 (2026-05-29): floor 法替代 ceil 法, 让 group_size 偏小让 final_n_groups 严格成立.
+    # 末组余下 panel < group_size 时, caller loop 用末组合并模式吸收剩余.
+    # 例 9 panel × final_n_groups=4: group_size=floor(9/4)=2, loop [(0,2),(2,4),(4,6),(6,9)] 末组合并 → 4 group ✓
+    # vs 原 ceil 法 group_size=3 → loop [(0,3),(3,6),(6,9)] 自然只 3 group, optimal 4 没用上.
+    group_size = max(2, n_panels // final_n_groups)
     # clamp 跟 _grid_multiref_group_size 同范围 [2, 12]
     return max(2, min(12, group_size))
 
@@ -13485,11 +13480,9 @@ def _generate_grid_multiref_motion_segments(script: list[dict], motion_prompts: 
     _b52_group_size = _b62_group_size  # 兼容旧变量名
     if _b62_group_size != _grid_multiref_group_size():
         log(f"B62 grid_multiref 自适应 group_size: {_grid_multiref_group_size()} → {_b62_group_size} (n_panels={len(refs)} tts_buffered={_b52_tts_buffered:.1f}s)")
-    _b52_total_panels = sum(
-        min(_b62_group_size, len(refs) - s)
-        for s in range(0, len(refs), _b62_group_size)
-        if min(_b62_group_size, len(refs) - s) >= 2
-    )
+    # B62.1 (2026-05-29): 末组合并后所有 panel 都进 group, total = len(refs)
+    # (新 loop _b62_1_ranges 把末单 panel 合到前组, 不再 skip)
+    _b52_total_panels = len(refs) if len(refs) >= 2 else 0
     if _b52_total_panels <= 0:
         _b52_total_panels = len(refs)  # fallback 防 0 除零
     if _b52_tts_buffered > 0:
@@ -13540,8 +13533,23 @@ def _generate_grid_multiref_motion_segments(script: list[dict], motion_prompts: 
 
     tg(f"🧪 Grid multi-ref motion QA 启动：clean refs {len(refs)} 张，每组 {qa['group_size']} 张")
     group_size = qa["group_size"]
-    for group_no, start in enumerate(range(0, len(refs), group_size), start=1):
-        group_pairs = refs[start:start + group_size]
+    # B62.1 (2026-05-29): 末组合并法 — 9 panel × group_size=2 末单 panel 合并到前组,
+    # [0,2,4,6,8] → [(0,2),(2,4),(4,6),(6,9)] 4 group × 末组 3 panel, 容器 4×15=60s.
+    # 修大哥 174943 反馈"节奏改善但还有点赶". 算 ranges 一次, 末组 < 2 时合到前.
+    _b62_1_ranges: list[tuple[int, int]] = []
+    for s in range(0, len(refs), group_size):
+        _b62_1_ranges.append((s, min(s + group_size, len(refs))))
+    if len(_b62_1_ranges) >= 2:
+        last_start, last_end = _b62_1_ranges[-1]
+        tail_size = last_end - last_start
+        if tail_size < 2:
+            # 末组合并: 删末组, 前组 end 延伸到 len(refs)
+            prev_start, _ = _b62_1_ranges[-2]
+            _b62_1_ranges = _b62_1_ranges[:-1]
+            _b62_1_ranges[-1] = (prev_start, len(refs))
+            log(f"B62.1 末组合并: 末单 {tail_size} panel 合并到前组, 实际 {len(_b62_1_ranges)} group")
+    for group_no, (start, end) in enumerate(_b62_1_ranges, start=1):
+        group_pairs = refs[start:end]
         if len(group_pairs) < 2:
             continue
         scene_indices = [i for i, _ in group_pairs]
