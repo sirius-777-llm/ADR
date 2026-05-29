@@ -16343,11 +16343,92 @@ def _align_segments_via_asr(
     return out
 
 
+def _b61_1_asr_turn_boundaries(audio_path: str, n_turns: int) -> list[tuple[float, float]] | None:
+    """B61.1 (2026-05-30): faster_whisper ASR voice clone audio → segment-level (start, end) per turn.
+    Codex 30min 简化版: 假设 ASR segment 数 ≈ turn 数, 按时间顺序映射. 不做 char overlap match.
+    返回 [(turn_start, turn_end), ...] 或 None (失败 / segment 数严重不对 → caller fallback B61 简化版).
+    """
+    if not audio_path or not os.path.exists(audio_path) or n_turns < 1:
+        return None
+    try:
+        from faster_whisper import WhisperModel
+        model = WhisperModel("base", compute_type="int8")
+        segments_iter, _ = model.transcribe(audio_path, language="zh", word_timestamps=False)
+        segments: list[tuple[float, float, str]] = []
+        for seg in segments_iter:
+            s = float(getattr(seg, "start", 0.0) or 0.0)
+            e = float(getattr(seg, "end", s) or s)
+            t = (getattr(seg, "text", "") or "").strip()
+            if e > s and t:
+                segments.append((s, e, t))
+        if len(segments) < max(2, n_turns // 2):
+            log(f"B61.1 ASR force align segments={len(segments)} 远少于 n_turns={n_turns}, fallback B61")
+            return None
+        # 简化映射: ASR 按时间顺序, 平均分配到 turn
+        # 例 9 turn × 9 segment: 1对1 直接映射
+        # 例 9 turn × 8 segment: 把 8 段按时间均分到 9 turn (差段 turn 取邻段时间)
+        # 例 9 turn × 12 segment: 合并 12 段成 9 组 (按时间均分)
+        boundaries: list[tuple[float, float]] = []
+        n_seg = len(segments)
+        for i in range(n_turns):
+            # 该 turn 对应 segment 范围: [i × n_seg/n_turns, (i+1) × n_seg/n_turns)
+            seg_start_idx = int(i * n_seg / n_turns)
+            seg_end_idx = int((i + 1) * n_seg / n_turns)
+            seg_end_idx = max(seg_end_idx, seg_start_idx + 1)  # 至少 1 段
+            seg_end_idx = min(seg_end_idx, n_seg)
+            turn_start = segments[seg_start_idx][0]
+            turn_end = segments[seg_end_idx - 1][1]
+            if turn_end <= turn_start:
+                turn_end = turn_start + 0.5  # fallback 防 0 时长
+            boundaries.append((turn_start, turn_end))
+        log(f"B61.1 ASR force align: {n_seg} segments → {n_turns} turn boundaries ({segments[0][0]:.2f}s ~ {segments[-1][1]:.2f}s)")
+        return boundaries
+    except Exception as e:
+        log(f"B61.1 ASR force align 失败 ({e}), fallback B61 简化版")
+        return None
+
+
 def step8_subtitles(script: list[dict]) -> str:
     # B61 (2026-05-29): voice clone 字幕对齐 (use_embedded 路径). 大哥 154014 反馈"部分旁白和字幕对不上".
     # root: script[i].sub_start 用 master_voice TTS 时长算, voice clone (raw_concat) 时长可能偏差 → 错位.
     # 简化版 A: 算 raw_concat audio 总时长 / master_voice 总时长 scale, 缩放 script[i].sub_start/audio_start/vid_duration.
-    # 不均匀 turn 偏移留 B61.1 ASR force align 长期解决.
+    # B61.1 (2026-05-30): 大哥 233045 反馈"后半字幕已消失但旁白还在念" → 简化版均匀 scale 假设错.
+    # 优先 ASR force align per-turn boundaries (重写 sub_start), 失败 fallback B61 均匀 scale.
+    try:
+        raw_concat_path_b61_1 = str(OUTPUT_DIR / "raw_concat.mp4")
+        if (
+            os.path.exists(raw_concat_path_b61_1)
+            and _has_audio_stream(raw_concat_path_b61_1)
+            and not script[0].get("_b61_subtitle_scaled")  # B61 简化版 flag 也用作 B61.1 已对齐 flag
+            and len(script) > 0
+        ):
+            n_valid_turns = sum(1 for s in script if isinstance(s, dict) and str(s.get("text") or "").strip())
+            boundaries = _b61_1_asr_turn_boundaries(raw_concat_path_b61_1, n_valid_turns)
+            if boundaries and len(boundaries) == n_valid_turns:
+                log(f"B61.1 应用 ASR force align: 重写 {n_valid_turns} turn boundaries")
+                turn_idx = 0
+                for s in script:
+                    if not isinstance(s, dict) or not str(s.get("text") or "").strip():
+                        continue
+                    if turn_idx >= len(boundaries):
+                        break
+                    new_start, new_end = boundaries[turn_idx]
+                    try:
+                        s["sub_start"] = float(new_start)
+                        s["audio_start"] = float(new_start)
+                        s["vid_duration"] = max(0.3, float(new_end) - float(new_start))
+                        s["_b61_subtitle_scaled"] = True
+                        s["_b61_1_asr_aligned"] = True
+                    except (TypeError, ValueError) as e:
+                        log(f"B61.1 turn {turn_idx+1} 重写失败 (保留旧值): {e}")
+                    turn_idx += 1
+                try:
+                    tg(f"📐 B61.1 ASR force align 字幕重写 {turn_idx} turn (per-turn 不均匀偏移)")
+                except Exception:
+                    pass
+    except Exception as e:
+        log(f"B61.1 ASR force align 入口异常 (不影响, 走 B61 简化版): {e}")
+
     try:
         raw_concat_path = str(OUTPUT_DIR / "raw_concat.mp4")
         master_voice_path = str(OUTPUT_DIR / "master_voice.mp3")
