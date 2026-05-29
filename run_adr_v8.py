@@ -14099,8 +14099,21 @@ def _postprocess_audio_dub_segment(src_video: str, scene: dict, target_dur: floa
     Bug B 续修 (2026-05-20)：narrated_b WERYDANCE 输出 audio 经常前置 4-5s 静音再说话
     → 字幕跟 audio 对齐时画面早于字幕 5s 出现，体感错位
     → 检测 leading silence >0.5s 时同步 trim audio + video，让语音锚在 seg 开头
+
+    B54 (2026-05-29): PR-A merged_a 路径下 src_video == scene["vid_path"] (split 已写入 seg_N.mp4 当 src),
+    导致 ffmpeg "Output ... same as Input - exiting". 修: 同名时先 rename src 到 .inplace_tmp.mp4
+    作 src, 不污染 vid_path 输出. 满江红 105219 实测 PR-A merged_a 3 batch 全失败回退逐 turn root cause.
     """
     vid_path = scene["vid_path"]
+    # B54 fix: src_video == vid_path 时先 rename src 避免 ffmpeg 拒绝 in-place
+    try:
+        if src_video and vid_path and os.path.realpath(src_video) == os.path.realpath(vid_path):
+            tmp_src = vid_path + ".b54_inplace_tmp.mp4"
+            os.rename(src_video, tmp_src)  # 比 copy 快, 因为 PR-A split 已产 seg_N.mp4 不再用
+            src_video = tmp_src
+            log(f"B54 postprocess in-place guard: src renamed to {os.path.basename(tmp_src)}")
+    except Exception as e:
+        log(f"B54 postprocess in-place guard 异常 (继续原 src): {e}")
     # B4 (2026-05-21): action_b SFX 模式跳过 leading silence trim
     # 武戏 SFX 开场可能有 setup 镜头静音 0.5-1s，不应误 trim
     if _is_action_b(scene):
