@@ -733,6 +733,16 @@ def _apply_llm_voice_assignment(turns: list[dict]) -> dict | None:
     conflicts: list[dict] = []
     for i, t in enumerate(turns):
         sp = str(t.get("speaker", "")).strip()
+        # B56 (2026-05-29): IP-locked turn 跳 LLM 覆盖 (keyword 已设 IP voice, LLM 不应改).
+        # 同 speaker 后续 turn 也走 IP voice (B56 _finalize_adsd_turns 已统一 set).
+        if t.get("voice_asset_ip_locked"):
+            ip_vid = str(t.get("voice_asset_id") or "").strip()
+            if ip_vid:
+                if sp and sp not in speaker_to_voice:
+                    speaker_to_voice[sp] = ip_vid
+                    voice_to_speaker[ip_vid] = sp
+                llm_choices.pop(i, None)  # 移除 LLM 选择, 用 IP voice
+                continue
         if i not in llm_choices:
             continue
         vid = llm_choices[i]
@@ -2368,6 +2378,30 @@ def _ensemble_speaker_cap(topic: str = "") -> int:
     return _ENSEMBLE_CAP_BY_ROUTE.get(route, 5)
 
 
+def _ip_voice_asset_for_speaker(speaker: str) -> str:
+    """B56 (2026-05-29): 查 speaker IP voice_asset_id (跟 B50 _resolve_voice_asset_for_ads_speaker 同套路).
+    存在且在音色库 + speech-safe 则返回, 否则空. speaker 通用旁白名跳过.
+    """
+    speaker_clean = (speaker or "").strip()
+    if not speaker_clean or speaker_clean in _GENERIC_NARRATOR_NAMES:
+        return ""
+    try:
+        ip = _match_speaker_ip(speaker_clean)
+        if not ip:
+            return ""
+        ip_asset_id = (ip.get("voice_asset_id") or "").strip()
+        if not ip_asset_id:
+            return ""
+        data = _load_voice_assets()
+        by_id = {a.get("voice_id"): a for a in (data.get("assets") or []) if a.get("voice_id")}
+        asset = by_id.get(ip_asset_id)
+        if asset and _voice_asset_is_speech_safe(asset):
+            return ip_asset_id
+    except Exception as e:
+        log(f"B56 _ip_voice_asset_for_speaker exception: {e}")
+    return ""
+
+
 def _finalize_adsd_turns(turns: list[dict]) -> list[dict]:
     speakers = [t["speaker"] for t in turns if t.get("speaker")]
     shape = _adsd_dialogue_shape(speakers)
@@ -2375,12 +2409,22 @@ def _finalize_adsd_turns(turns: list[dict]) -> list[dict]:
     for turn in turns:
         turn["dialogue_shape"] = shape
         turn["speaker_count"] = speaker_count
+        # B56 (2026-05-29): ADSD IP voice 优先级 (扩 B50 到 ADSD 路径).
+        # 大哥 120745 反馈: 岳飞 IP 配 external_xu_zhiyuan_xyma_001 (许知远) 但 ADSD 实际选
+        # 牧神记绫璟道人 (LLM 分配忽略 IP voice). 修: 先查 IP voice 锁定, 跳 keyword + LLM 覆盖.
+        # ip_locked=True 标志让 _apply_llm_voice_assignment 跳过.
+        ip_voice = _ip_voice_asset_for_speaker(turn.get("speaker", ""))
+        if ip_voice and not turn.get("voice_asset_id"):
+            turn["voice_asset_id"] = ip_voice
+            turn["voice_asset_source"] = f"speaker_ip:{turn.get('speaker')}"
+            turn["voice_asset_ip_locked"] = True
         # P3 音色库智能匹配：未显式设置 voice_asset_id 的 turn 自动按 speaker name 命中音色库
         if not turn.get("voice_asset_id"):
             turn["voice_asset_id"] = _voice_asset_id_for_speaker(
                 turn.get("speaker", ""),
                 turn.get("voice_gender") or turn.get("gender"),
             )
+            turn.setdefault("voice_asset_source", "keyword")
         # A-roll / B-roll 自动判定：旁白类默认 B-roll voice-over，其他默认 A-roll lip-sync
         if "needs_lip_sync" not in turn:
             turn["needs_lip_sync"] = _infer_needs_lip_sync(
@@ -14561,8 +14605,17 @@ def _lip_sync_one_group(group: list[int], script: list[dict], target_durs: list[
     # voice_asset ref (base turn 决定音色)
     voice_asset_ref = _select_voice_asset_reference(scenes[0])
     source_audio = voice_asset_ref["path"] if voice_asset_ref else concat_audio
-    # 提交需要把 dub audio 作为 audio_dub: WERYDANCE 用拼接 audio 直接配音
-    audio_dub_audio = concat_audio
+    # B55 (2026-05-29): PR-A merged_a 升级走 voice_asset clone 路径跟 per-scene 一致 (修跨 turn 音色 = TTS 78 不是 voice clone)
+    # 110947 实测大哥反馈"音色还是俩": 100336 PR-A fail 回退逐 turn 用 per-scene 慕神纪 vs 110947 PR-A 成功用 TTS dub 78 女声.
+    # voice_asset_ref 存在 → audios 上传 voice_asset_ref.path (慕神纪 8s 参考), prompt 加 B49 风格嵌入真台词.
+    # voice_asset_ref 缺失 → fallback 原 concat_audio + TTS dub.
+    _b55_use_voice_clone = bool(voice_asset_ref and voice_asset_ref.get("path") and os.path.exists(voice_asset_ref["path"]))
+    if _b55_use_voice_clone:
+        audio_dub_audio = voice_asset_ref["path"]
+        log(f"B55 PR-A {group_label} 用 voice_asset clone: {voice_asset_ref.get('asset_id')}")
+    else:
+        audio_dub_audio = concat_audio
+        log(f"B55 PR-A {group_label} fallback TTS dub (voice_asset_ref 缺失)")
 
     # base panel = group[0].img_path; alt panels = group[1..].img_path (上限 3 张防 ref 过多)
     base_panel = scenes[0].get("img_path", "")
@@ -14592,13 +14645,31 @@ def _lip_sync_one_group(group: list[int], script: list[dict], target_durs: list[
         ref_images = alt_panel_urls + [image_url]
 
         # 合并 prompt: 各 turn text 顺接, 让 WERYDANCE 知道完整对白
-        merged_text = " ".join(str(s.get("text") or "")[:80] for s in scenes)
-        prompt = (
-            f"Cinematic documentary dialogue scene. {speaker} speaks in Mandarin: 「{merged_text}」. "
-            "Use uploaded audio as the audio dub source (mouth must sync to this audio precisely, "
-            "do NOT regenerate speech). Use uploaded images for identity/costume reference. "
-            "Visible mouth, natural lip sync, stable face, realistic human timing throughout."
-        )
+        # B55 (2026-05-29): voice_clone 模式时 prompt 用 B49 风格嵌入真台词 'speaking exactly these lines'
+        # 让 clone 说真台词跟字幕同步 (跟 grid_multiref B49 一致). TTS dub fallback 仍用原 prompt.
+        if _b55_use_voice_clone:
+            # 每 turn 台词独立 quote, 限 80 char/turn 防 prompt 超长
+            narration_lines = [
+                re.sub(r"\s+", " ", str(s.get("text") or "")).strip()[:80]
+                for s in scenes if str(s.get("text") or "").strip()
+            ]
+            joined_lines = "」「".join(narration_lines) if narration_lines else ""
+            prompt = (
+                f"Cinematic documentary dialogue scene. {speaker} speaks in Mandarin. "
+                "Use uploaded audio only as a voice timbre / speaking-style reference; "
+                "do not treat it as the spoken content. "
+                f"Generate clear Mandarin narration speaking exactly these lines in order and nothing else: 「{joined_lines}」. "
+                "Use uploaded images for identity/costume reference. "
+                "Visible mouth, natural lip sync, stable face, realistic human timing throughout."
+            )[:2000]
+        else:
+            merged_text = " ".join(str(s.get("text") or "")[:80] for s in scenes)
+            prompt = (
+                f"Cinematic documentary dialogue scene. {speaker} speaks in Mandarin: 「{merged_text}」. "
+                "Use uploaded audio as the audio dub source (mouth must sync to this audio precisely, "
+                "do NOT regenerate speech). Use uploaded images for identity/costume reference. "
+                "Visible mouth, natural lip sync, stable face, realistic human timing throughout."
+            )
         # codex Medium fix: 用 actual_total (实际拼接 audio 时长) 算 api_dur
         api_dur = int(round(min(15, max(4, actual_total + 0.3))))
         payload = {
