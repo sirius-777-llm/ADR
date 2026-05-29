@@ -2410,11 +2410,13 @@ def _finalize_adsd_turns(turns: list[dict]) -> list[dict]:
         turn["dialogue_shape"] = shape
         turn["speaker_count"] = speaker_count
         # B56 (2026-05-29): ADSD IP voice 优先级 (扩 B50 到 ADSD 路径).
-        # 大哥 120745 反馈: 岳飞 IP 配 external_xu_zhiyuan_xyma_001 (许知远) 但 ADSD 实际选
-        # 牧神记绫璟道人 (LLM 分配忽略 IP voice). 修: 先查 IP voice 锁定, 跳 keyword + LLM 覆盖.
-        # ip_locked=True 标志让 _apply_llm_voice_assignment 跳过.
+        # B56.1 fix (2026-05-29): 122716 实测 B56 没生效 — _generate_adsd_dialogue_turns LLM 已经
+        # 给 turn["voice_asset_id"] 赋值 (牧神记), B56 原 check 'not turn.get(voice_asset_id)' 跳过.
+        # 改: IP voice 存在则强制覆盖 (IP 是最高优先级, 比 LLM 选择更准).
         ip_voice = _ip_voice_asset_for_speaker(turn.get("speaker", ""))
-        if ip_voice and not turn.get("voice_asset_id"):
+        if ip_voice:
+            if turn.get("voice_asset_id") and turn.get("voice_asset_id") != ip_voice:
+                log(f"B56 IP voice 覆盖 LLM 选择: speaker={turn.get('speaker')} LLM={turn.get('voice_asset_id')} → IP={ip_voice}")
             turn["voice_asset_id"] = ip_voice
             turn["voice_asset_source"] = f"speaker_ip:{turn.get('speaker')}"
             turn["voice_asset_ip_locked"] = True
