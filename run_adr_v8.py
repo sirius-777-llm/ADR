@@ -4320,6 +4320,22 @@ shot_type/camera_angle/lighting/camera_motion 必须从上述 enum 选, 不能�
     except Exception as e:
         log(f"PR-3d brief.visual 写入失败（不影响）：{e}")
 
+    # PR-3e (2026-05-29): Art Director Coordinator 终极协作 — 跨 agent 冲突检测 + 最终锁版
+    # 规则版 Phase 1 (跟 PR-3c/3d 同套路, 不调 LLM): audit 写 brief.coordinator.*, 不动下游.
+    # 必须在所有其他 agent 写完后调用 (跑在 PR-3d 之后).
+    try:
+        brief = _load_brief(topic)
+        if brief.get("agents", {}).get("coordinator", {}).get("status") != "succeeded":
+            review = _coordinator_review(brief)
+            _brief_claim(
+                brief, "coordinator", "brief.coordinator", review,
+                f"Art Director Coordinator 锁版 ({review.get('conflict_count')} 冲突)"
+            )
+            _save_brief(brief)
+            log(f"PR-3e coordinator: {review.get('conflict_count')} 冲突, locked={review.get('locked')} → brief.coordinator")
+    except Exception as e:
+        log(f"PR-3e brief.coordinator 写入失败（不影响）：{e}")
+
     # tone 决定情绪→风格查询池
     style_pool = EMOTION_STYLE_BRIGHT if tone == "轻松" else EMOTION_STYLE
 
@@ -7690,6 +7706,7 @@ def _empty_brief(topic: str) -> dict:
             "audio_director": {"status": "pending", "claimed_at": None, "fields": [], "reason": ""},
             "shot_director": {"status": "pending", "claimed_at": None, "fields": [], "reason": ""},
             "character_designer": {"status": "pending", "claimed_at": None, "fields": [], "reason": ""},
+            "coordinator": {"status": "pending", "claimed_at": None, "fields": [], "reason": ""},
         },
         "brief": {
             "metadata": {"era": None, "culture": None, "audit_risk_score": None},
@@ -7709,6 +7726,7 @@ def _empty_brief(topic: str) -> dict:
             "shot_list": [],
             "pacing": {"acts": [], "cuts": []},
             "flags": {"is_action_topic": False},
+            "coordinator": {"conflicts": [], "decisions": [], "locked": False, "locked_at": None, "version": None, "conflict_count": 0},
         },
         "history": [],
     }
@@ -8199,6 +8217,115 @@ def _art_director_design(topic: str, brief: dict) -> dict | None:
     if validated:
         log(f"PR-3d art_director: route={director_route} era={era} 输出 {len(validated)} 字段 (palette={len(validated.get('palette') or [])} hex)")
     return validated
+
+
+# PR-3e (2026-05-29): Art Director 统筹 Coordinator — OiiOii 7-Agent 第 5 个
+# 不直接生成内容, 跨 agent 冲突合并 + 最终锁版.
+# 规则版 Phase 1 (跟 PR-3c/3d 同套路, 不调 LLM): 检测 era/costume 匹配 / shot_list 完整 / sfx 分布 / palette 存在.
+# 不动下游, 仅 audit 写 brief.coordinator.*. PR-3e.1 长期: LLM 主案 + 自动 fix + step6/65 集成.
+
+_COORDINATOR_VERSION = 1
+
+
+def _coordinator_review(brief: dict) -> dict:
+    """规则版 coordinator: 跨 agent 冲突检测 + 锁版.
+    输出 dict: {conflicts: [...], decisions: [], locked: True, locked_at, version}.
+    每 conflict: {type, severity (warn/error), agents, fields, suggestion}.
+    """
+    conflicts: list[dict] = []
+
+    # 1. era_costume_match: era 含古/historical 但 costume 不含 hanfu/historical/period → warn
+    # Stage 3 Medium2 fix: 'han' 子串误伤 'shanghai/hanover'. 改用更精确 token 边界或长关键词
+    era = (_brief_get(brief, "brief.metadata.era", "") or "").lower()
+    costume = (_brief_get(brief, "brief.visual.costume", "") or "").lower()
+    # 用 token 边界: era 通常是 'late_han_china' / 'tang_dynasty' 等下划线分隔
+    era_tokens = set(re.split(r"[_\s\-]+", era))
+    era_is_historical = bool(
+        era_tokens & {"han", "tang", "song", "ming", "qing", "ancient", "historical"}
+    ) or "古" in era
+    costume_is_historical = any(k in costume for k in ("hanfu", "historical", "period", "ancient", "robe"))
+    if era_is_historical and not costume_is_historical:
+        conflicts.append({
+            "type": "era_costume_mismatch",
+            "severity": "warn",
+            "agents": ["topic_decomposer", "art_director"],
+            "fields": ["brief.metadata.era", "brief.visual.costume"],
+            "suggestion": f"era={era} 是历史古风, costume 应含 hanfu/period/historical 关键词",
+        })
+
+    # 2. shot_list_completeness: 全 8 turn shot_type 都默认 extreme close-up 且 camera_motion 默认 static
+    # Stage 3 Low fix: 过滤后非 dict 全空时 all() 空真假阳, 加 valid 数量 check
+    shot_list = _brief_get(brief, "brief.shot_list", []) or []
+    if shot_list and isinstance(shot_list, list):
+        valid_shots = [s for s in shot_list if isinstance(s, dict)]
+        if len(valid_shots) > 2:
+            all_static = all(
+                (s.get("camera_motion") or "").strip().lower() == "static" for s in valid_shots
+            )
+            all_ecu = all(
+                (s.get("shot_type") or "").strip().lower() == "extreme close-up" for s in valid_shots
+            )
+            if all_static and all_ecu:
+                conflicts.append({
+                    "type": "shot_list_monotone",
+                    "severity": "warn",
+                    "agents": ["shot_director"],
+                    "fields": ["brief.shot_list"],
+                    "suggestion": f"{len(valid_shots)} 个 shot 全 default (extreme close-up + static), LLM 漏字段且 blueprint fallback 也未生效",
+                })
+
+    # 3. sfx_distribution: hook/middle/payoff 三段缺失
+    sfx_list = _brief_get(brief, "brief.audio.sfx", []) or []
+    if isinstance(sfx_list, list) and sfx_list:
+        positions = {str(s.get("position") or "").lower() for s in sfx_list if isinstance(s, dict)}
+        missing_positions = {"hook", "middle", "payoff"} - positions
+        if missing_positions:
+            conflicts.append({
+                "type": "sfx_distribution_incomplete",
+                "severity": "warn",
+                "agents": ["audio_director"],
+                "fields": ["brief.audio.sfx"],
+                "suggestion": f"SFX 缺位置: {sorted(missing_positions)} (覆盖 {sorted(positions)})",
+            })
+
+    # 4. palette_present: visual.palette 不存在 or <5 真 hex → warn (PR-3d 期望 5 hex)
+    # Stage 4 fix: 加 hex 校验, 5 个 '#FFF' 短 hex / 非 hex 字符串都触发警告
+    palette = _brief_get(brief, "brief.visual.palette", []) or []
+    valid_hex_count = 0
+    if isinstance(palette, list):
+        valid_hex_count = sum(1 for c in palette if _hex_color_validate(c))
+    if not isinstance(palette, list) or valid_hex_count < 5:
+        conflicts.append({
+            "type": "palette_missing_or_incomplete",
+            "severity": "warn",
+            "agents": ["art_director"],
+            "fields": ["brief.visual.palette"],
+            "suggestion": f"palette 应有 5 个有效 #RRGGBB hex, 实际有效 {valid_hex_count} (总 {len(palette) if isinstance(palette, list) else 'N/A'})",
+        })
+
+    # 5. agent_status_audit: 检查 5 个核心 agent 都 succeeded (除 coordinator 自己)
+    agents = brief.get("agents", {})
+    pending_agents = [
+        name for name in ("topic_decomposer", "shot_director", "audio_director", "art_director")
+        if agents.get(name, {}).get("status") != "succeeded"
+    ]
+    if pending_agents:
+        conflicts.append({
+            "type": "agents_not_all_succeeded",
+            "severity": "warn",
+            "agents": pending_agents,
+            "fields": [f"agents.{a}.status" for a in pending_agents],
+            "suggestion": f"以下 agent 未 succeeded: {pending_agents}",
+        })
+
+    return {
+        "conflicts": conflicts,
+        "decisions": [],  # 规则版暂空, LLM 版 PR-3e.1 扩
+        "locked": True,
+        "locked_at": datetime.now().isoformat(timespec="seconds"),
+        "version": _COORDINATOR_VERSION,
+        "conflict_count": len(conflicts),
+    }
 
 
 def _llm_topic_decomposition(topic: str, use_cache: bool = True) -> dict:
@@ -15001,8 +15128,31 @@ def step66_adsd_lip_sync(script: list[dict]):
     _batch_groups: list[list[int]] = []
     _batched_idxs: set[int] = set()
     _cg_count = len(consecutive_groups) if 'consecutive_groups' in dir() else -1
-    log(f"PR-A debug: batching={ADSD_CONSECUTIVE_SPEAKER_BATCHING} audio_dub={ADSD_ALMIGHTY_AUDIO_DUB_EXPERIMENT} consecutive_groups={_cg_count}")
-    if ADSD_CONSECUTIVE_SPEAKER_BATCHING and ADSD_ALMIGHTY_AUDIO_DUB_EXPERIMENT:
+    # B53 (2026-05-29): ADSD monologue 自动启用 speaker_batching 修跨 turn voice clone 漂移.
+    # root: 8 turn 单 speaker 独立 clone 8 次 stochastic 漂移 → 跨 turn 音色不统一 (满江红 100336 实测).
+    # 修: detect script 全 monologue (1 unique speaker) → 局部 effective flag enable batching,
+    # env ADR_ADSD_FORCE_SOLO_LIP_SYNC=1 opt-out 强制独立.
+    _b53_unique_speakers = set(
+        (s.get("speaker") or "").strip() for s in script
+        if isinstance(s, dict) and (s.get("speaker") or "").strip()
+    )
+    _b53_force_solo = os.environ.get("ADR_ADSD_FORCE_SOLO_LIP_SYNC", "").strip().lower() in ("1", "true", "yes", "on")
+    _b53_auto_batch = (
+        ADS_DIALOGUE_MODE
+        and len(_b53_unique_speakers) == 1
+        and not _b53_force_solo
+        and not ADSD_CONSECUTIVE_SPEAKER_BATCHING  # 已显式开 flag 不重复 log
+    )
+    if _b53_auto_batch:
+        _sole_speaker = next(iter(_b53_unique_speakers))
+        log(f"B53 ADSD monologue 自动启用 speaker_batching (单 speaker={_sole_speaker})")
+        try:
+            tg(f"🤖 B53 ADSD monologue ({_sole_speaker}) 自动启用 batching 避免跨 turn 音色漂移")
+        except Exception:
+            pass
+    _b53_effective_batching = ADSD_CONSECUTIVE_SPEAKER_BATCHING or _b53_auto_batch
+    log(f"PR-A debug: batching={ADSD_CONSECUTIVE_SPEAKER_BATCHING} b53_auto={_b53_auto_batch} effective={_b53_effective_batching} audio_dub={ADSD_ALMIGHTY_AUDIO_DUB_EXPERIMENT} consecutive_groups={_cg_count}")
+    if _b53_effective_batching and ADSD_ALMIGHTY_AUDIO_DUB_EXPERIMENT:
         for gi, g in enumerate(consecutive_groups):
             if len(g) <= 1:
                 continue
