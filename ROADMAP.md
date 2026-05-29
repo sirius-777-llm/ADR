@@ -3,7 +3,7 @@
 > ADR (Automated Documentary Rendering V8) 项目 backlog · 跨 session 持久化
 > 任何 Claude session 启动时优先查这个文件 + memory/project_adr_backlog.md
 
-Last updated: 2026-05-21
+Last updated: 2026-05-30
 
 ---
 
@@ -11,6 +11,7 @@ Last updated: 2026-05-21
 
 | 日期 | PR/改动 | 说明 |
 |------|---------|------|
+| 2026-05-30 | B67 stdout 敏感词遮罩 (CC content filter 防火墙, CCP 4 阶段全过) | log() 前置 _redact_for_stdout 层 14 词默认 (胡虏/匈奴/腥膻/饥餐/渴饮/秦皇/汉武/唐宗/宋祖/成吉思汗/天骄/贺兰山缺/靖康耻) + env ADR_EXTRA_SENSITIVE_WORDS 追加 + env ADR_DISABLE_STDOUT_REDACT 关闭. 命中替换 [REDACTED] + 原文 audit voice_assets/stdout_redactions.jsonl (gitignore). 防 ADR monitor 推送回灌 CC-小土伯频道触发 Anthropic 400 "Output blocked by content filtering policy" (5/29 实测满江红 235× 累积触发连环 ban). TG 推送走 _tg_send_raw 不经 log, Telegram 收到的进度仍是原文. E2E 6 case + 非 str 5 case + audit 落盘验证通过 |
 | 2026-05-30 | B66 长文分段渲染 MVP | tools/long_text_split.py + tools/long_text_runner.py, 滕王阁序全文/赤壁赋等 split → multi-run → ffmpeg concat |
 | 2026-05-30 | B61.1 voice clone ASR force align | faster_whisper segment-level → per-turn boundaries 重写 sub_start, 修不均匀拉伸导致后半字幕消失 |
 | 2026-05-29 | B62.1 grid_multiref 末组合并法 | floor 法 group_size + loop _b62_1_ranges 末组 <2 合并到前组, 9 panel 53s → 4 group 60s 容器 ✓ |

@@ -1194,8 +1194,52 @@ EMOTION_STYLE_BRIGHT = {
 }
 
 # ── 工具函数 ─────────────────────────────────────────────────────────────────
+# CC 上游回灌防火墙：ADR stdout 被 Claude Code 视为对话历史，
+# 古文题材里的「胡虏肉/匈奴血」等字会撞 Anthropic content filter (400 Output blocked)，
+# 整个频道连环 ban。下面这层在 print 前把命中词替换成占位符，原文写 audit。
+# Telegram 推送走 _tg_send_raw，不经此层，TG 看到的仍是原文。
+_REDACT_PATTERNS_DEFAULT = (
+    "胡虏", "匈奴", "腥膻", "膻肉",
+    "饥餐", "渴饮",
+    "秦皇", "汉武", "唐宗", "宋祖", "成吉思汗", "天骄",
+    "贺兰山缺", "靖康耻",
+)
+_REDACT_EXTRA = tuple(
+    w.strip() for w in os.environ.get("ADR_EXTRA_SENSITIVE_WORDS", "").split(",") if w.strip()
+)
+_REDACT_PATTERNS = _REDACT_PATTERNS_DEFAULT + _REDACT_EXTRA
+_REDACT_DISABLED = os.environ.get("ADR_DISABLE_STDOUT_REDACT", "").strip().lower() in ("1", "true", "yes", "on")
+_REDACT_AUDIT_PATH = Path(__file__).resolve().parent / "voice_assets" / "stdout_redactions.jsonl"
+_redact_audit_lock = threading.Lock()
+
+
+def _redact_for_stdout(msg) -> str:
+    if _REDACT_DISABLED or not msg:
+        return msg if isinstance(msg, str) else str(msg)
+    if not isinstance(msg, str):
+        msg = str(msg)
+    hits = [w for w in _REDACT_PATTERNS if w in msg]
+    if not hits:
+        return msg
+    safe = msg
+    for w in hits:
+        safe = safe.replace(w, "[REDACTED]")
+    try:
+        with _redact_audit_lock:
+            _REDACT_AUDIT_PATH.parent.mkdir(parents=True, exist_ok=True)
+            with open(_REDACT_AUDIT_PATH, "a", encoding="utf-8") as fh:
+                fh.write(json.dumps({
+                    "ts": time.time(),
+                    "hits": hits,
+                    "original": msg[:500],
+                }, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+    return safe
+
+
 def log(msg: str):
-    print(f"[ADR V8] {msg}", flush=True)
+    print(f"[ADR V8] {_redact_for_stdout(msg)}", flush=True)
 
 _tg_lock = threading.Lock()
 _tg_last_digest_ts = 0.0
