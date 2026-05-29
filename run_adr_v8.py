@@ -12384,6 +12384,55 @@ def _grid_multiref_segment_max_stretch() -> float:
     return max(1.0, min(4.0, raw))
 
 
+# B60 (2026-05-29): voice clone 情感引导 — 大哥 154014 反馈"没感情".
+# emotion → 英文 narration style 映射, 注入 voice clone prompt 让 almighty 知道情感基调.
+_EMOTION_NARRATION_STYLE_MAP = {
+    "紧张": "urgent tense delivery with controlled breath and rising intonation",
+    "急迫": "urgent tense delivery with controlled breath and rising intonation",
+    "压抑": "restrained somber delivery with measured pace and weighted pauses",
+    "悲壮": "solemn somber gravitas with measured pace and deep resonance",
+    "悲愤": "solemn somber gravitas with measured pace and deep resonance",
+    "沉郁": "solemn somber gravitas with measured pace and deep resonance",
+    "孤独": "introspective hushed delivery with restrained sorrow and slow phrasing",
+    "辉煌": "passionate intense delivery with rising-falling cadence and broad pacing",
+    "激昂": "passionate intense delivery with rising-falling cadence and broad pacing",
+    "豪迈": "passionate intense delivery with rising-falling cadence and broad pacing",
+    "释然": "reflective wistful delivery with soft warmth and gentle resolve",
+    "怀旧": "reflective wistful delivery with soft warmth and gentle resolve",
+    "静谧": "reflective wistful delivery with soft warmth and gentle resolve",
+    "温暖": "warm intimate delivery with gentle rise and natural breathing",
+    "欢快": "bright energetic delivery with playful cadence and lifted intonation",
+    "活力": "bright energetic delivery with playful cadence and lifted intonation",
+    "希望": "uplifting warm delivery with hopeful rising tone and gentle confidence",
+    "童趣": "playful curious delivery with bright varied intonation and friendly warmth",
+    "惊喜": "elevated surprised delivery with sudden pitch lift and animated phrasing",
+}
+_EMOTION_DEFAULT_STYLE = "historically-grounded measured narration with natural human cadence and contextually appropriate emotional weight"
+
+
+def _voice_clone_emotion_style(scenes: list[dict] | list, max_styles: int = 3) -> str:
+    """收集 scenes 内 emotion 字段, 映射成英文 narration style 短句. 多 emotion 合并去重 cap 3.
+    空 → default. 用于 voice clone prompt 注入情感基调.
+    """
+    if not scenes:
+        return _EMOTION_DEFAULT_STYLE
+    styles_seen: list[str] = []
+    for s in scenes:
+        if not isinstance(s, dict):
+            continue
+        em = str(s.get("emotion") or "").strip()
+        if not em:
+            continue
+        mapped = _EMOTION_NARRATION_STYLE_MAP.get(em)
+        if mapped and mapped not in styles_seen:
+            styles_seen.append(mapped)
+            if len(styles_seen) >= max_styles:
+                break
+    if not styles_seen:
+        return _EMOTION_DEFAULT_STYLE
+    return " ; ".join(styles_seen)
+
+
 def _grid_multiref_prompt(
     group: list[dict],
     start_idx: int,
@@ -12435,11 +12484,15 @@ def _grid_multiref_prompt(
     )
     # B49 (2026-05-28): 台词嵌入指令 — voice clone 必须说真台词跟字幕同步
     # almighty generate_audio=true 默认自由发挥, 必须显式指令 'speaking exactly these lines'
+    # B60 (2026-05-29): 加情感引导 narration style (修大哥反馈"没感情")
     narration_block = ""
     if narration_lines:
         joined = "」「".join(narration_lines)
+        emotion_style = _voice_clone_emotion_style(group)
         narration_block = (
-            f" Generate clear Mandarin narration speaking exactly these lines in order and nothing else: 「{joined}」. "
+            f" Voice style: {emotion_style}. "
+            f"Generate Mandarin narration speaking exactly these lines in order and nothing else: 「{joined}」. "
+            "Carry the specified emotional tone throughout; do not flatten into neutral newsreader delivery. "
             "Match each shot's beat to its corresponding line; do not invent or substitute text."
         )
     return (
@@ -14656,11 +14709,15 @@ def _lip_sync_one_group(group: list[int], script: list[dict], target_durs: list[
                 for s in scenes if str(s.get("text") or "").strip()
             ]
             joined_lines = "」「".join(narration_lines) if narration_lines else ""
+            # B60 (2026-05-29): emotion → voice style 注入 (修大哥反馈"没感情")
+            emotion_style = _voice_clone_emotion_style(scenes)
             prompt = (
                 f"Cinematic documentary dialogue scene. {speaker} speaks in Mandarin. "
                 "Use uploaded audio only as a voice timbre / speaking-style reference; "
                 "do not treat it as the spoken content. "
-                f"Generate clear Mandarin narration speaking exactly these lines in order and nothing else: 「{joined_lines}」. "
+                f"Voice style: {emotion_style}. "
+                f"Generate Mandarin narration speaking exactly these lines in order and nothing else: 「{joined_lines}」. "
+                "Carry the specified emotional tone throughout; do not flatten into neutral newsreader delivery. "
                 "Use uploaded images for identity/costume reference. "
                 "Visible mouth, natural lip sync, stable face, realistic human timing throughout."
             )[:2000]
@@ -16245,6 +16302,56 @@ def _align_segments_via_asr(
 
 
 def step8_subtitles(script: list[dict]) -> str:
+    # B61 (2026-05-29): voice clone 字幕对齐 (use_embedded 路径). 大哥 154014 反馈"部分旁白和字幕对不上".
+    # root: script[i].sub_start 用 master_voice TTS 时长算, voice clone (raw_concat) 时长可能偏差 → 错位.
+    # 简化版 A: 算 raw_concat audio 总时长 / master_voice 总时长 scale, 缩放 script[i].sub_start/audio_start/vid_duration.
+    # 不均匀 turn 偏移留 B61.1 ASR force align 长期解决.
+    try:
+        raw_concat_path = str(OUTPUT_DIR / "raw_concat.mp4")
+        master_voice_path = str(OUTPUT_DIR / "master_voice.mp3")
+        # 仅 use_embedded 路径才缩放 (HADS grid_multiref / ADSD audio_dub). 没 raw_concat audio 跳过.
+        if (
+            os.path.exists(raw_concat_path)
+            and os.path.exists(master_voice_path)
+            and _has_audio_stream(raw_concat_path)
+            and not script[0].get("_b61_subtitle_scaled")  # 防重复缩放
+        ):
+            clone_dur = ffprobe_duration(raw_concat_path)
+            tts_dur = ffprobe_duration(master_voice_path)
+            if clone_dur > 0 and tts_dur > 0 and math.isfinite(clone_dur) and math.isfinite(tts_dur):
+                scale = clone_dur / tts_dur
+                if 0.5 < scale < 3.0 and abs(scale - 1.0) > 0.05:
+                    log(f"B61 voice clone 字幕对齐: clone={clone_dur:.2f}s tts={tts_dur:.2f}s scale={scale:.3f}")
+                    # Stage 4 fix: per-turn isolation 防异常字段半缩放. 先校验所有字段再缩放.
+                    scaled_count = 0
+                    for s in script:
+                        if not isinstance(s, dict):
+                            continue
+                        try:
+                            new_values = {}
+                            for k in ("sub_start", "audio_start", "vid_duration"):
+                                v = s.get(k)
+                                if v is None:
+                                    continue
+                                fv = float(v)
+                                if not math.isfinite(fv):
+                                    raise ValueError(f"{k}={v!r} not finite")
+                                new_values[k] = fv * scale
+                            # 全部字段校验通过才整 turn 缩放 (原子)
+                            s.update(new_values)
+                            s["_b61_subtitle_scaled"] = True
+                            scaled_count += 1
+                        except (TypeError, ValueError) as e:
+                            log(f"B61 turn {s.get('dialogue_turn') or '?'} 字段异常跳过缩放: {e}")
+                    try:
+                        tg(f"📐 B61 字幕时间轴缩放 ×{scale:.3f} 对齐 voice clone ({scaled_count} turn)")
+                    except Exception:
+                        pass
+                else:
+                    log(f"B61 字幕 scale={scale:.3f} 在容差内, 跳过缩放")
+    except Exception as e:
+        log(f"B61 字幕对齐失败 (不影响主流程): {e}")
+
     werydance_caption_turns = _werydance_caption_covered_turns() if WERYDANCE_CAPTIONS else set()
     ass_fallback_turns: list[int] = []
     werydance_captioned_turns: list[int] = []
@@ -17095,11 +17202,20 @@ def step9_render(raw_path: str, voice_path: str, bgm_path: str | None, ass_path:
             # B1 fix (2026-05-21): amix 默认 normalize=1 让两路各 ×0.5，人声从 -16 LUFS 被压到 -22
             # 加 normalize=0 + weights 显式权重让 voice 主导
             # 2nd pass: voice 1.4→1.8 (大哥反馈应更响)
+            # B59 (2026-05-29): voice 1.8→2.5 (大哥 154014 将进酒反馈"声音太小").
+            # WERYDANCE clone audio 输出比 TTS loudnorm 后低, 跟 L17123 master_voice 路径 (volume=2.0) 偏低.
+            # env ADR_USE_EMBEDDED_VOICE_VOLUME 可调 (default 2.5, clamp 1.0-4.0).
+            try:
+                _b59_raw = float(os.environ.get("ADR_USE_EMBEDDED_VOICE_VOLUME", "2.5"))
+                _b59_voice_vol = max(1.0, min(4.0, _b59_raw)) if math.isfinite(_b59_raw) else 2.5
+            except (TypeError, ValueError):
+                _b59_voice_vol = 2.5
+            log(f"B59 step9 use_embedded voice volume={_b59_voice_vol}")
             ffmpeg(
                 "-i", raw_path,
                 "-i", bgm_path,
                 "-filter_complex",
-                f"[0:a]apad=pad_dur={_tail_buffer},volume=1.8[va];[1:a]volume=0.35[ba];[va][ba]amix=inputs=2:duration=first:normalize=0:weights=1.0 0.35[aout]",
+                f"[0:a]apad=pad_dur={_tail_buffer},volume={_b59_voice_vol}[va];[1:a]volume=0.35[ba];[va][ba]amix=inputs=2:duration=first:normalize=0:weights=1.0 0.35[aout]",
                 "-map", "0:v",
                 "-map", "[aout]",
                 "-vf", vf_with_subtitles,
