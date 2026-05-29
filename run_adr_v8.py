@@ -12308,6 +12308,35 @@ def _grid_multiref_group_size() -> int:
     return max(2, min(12, raw))
 
 
+def _grid_multiref_adaptive_group_size(n_panels: int, tts_buffered: float, max_per_group: int = 15) -> int:
+    """B62 (2026-05-29): group_size 自适应拆细 — 大哥 170514 反馈"语速太快赶进度".
+    root: 9 panel × group_size=4 → 2 group × 15s cap = 30s 但 TTS×1.3=38.7s 评书需求, voice clone 被压.
+    算法: optimal_n_groups = ceil(tts_buffered / max_per_group), 但每 group 至少 2 panel.
+    final_n_groups = min(optimal_n_groups, n_panels // 2). group_size = ceil(n_panels / final_n_groups).
+    env ADR_GRID_MULTIREF_ADAPTIVE_GROUP=0 退回固定 group_size (env opt-out).
+    """
+    if os.environ.get("ADR_GRID_MULTIREF_ADAPTIVE_GROUP", "1").strip().lower() in ("0", "false", "no", "off"):
+        return _grid_multiref_group_size()
+    if n_panels < 2 or not (tts_buffered and math.isfinite(tts_buffered) and tts_buffered > 0):
+        return _grid_multiref_group_size()
+    optimal_n_groups = max(1, math.ceil(tts_buffered / max(1.0, max_per_group)))
+    # 每 group 至少 2 panel, 限制 n_groups
+    max_n_groups = max(1, n_panels // 2)
+    final_n_groups = min(optimal_n_groups, max_n_groups)
+    group_size = math.ceil(n_panels / final_n_groups)
+    # Stage 4 fix: 检测末组 singleton (panel < 2), 缩 n_groups 让末组合并避免被 skip
+    # 例 13 panel group_size=3 → loop [0,3,6,9,12], 末组 1 panel skip → 4 group × 3 = 12 panel.
+    # 修: 减 final_n_groups 直到末组 >= 2 (合并末组到前 group, 实际 group_size 增大).
+    while final_n_groups > 1:
+        tail = n_panels - (final_n_groups - 1) * group_size
+        if tail >= 2:
+            break
+        final_n_groups -= 1
+        group_size = math.ceil(n_panels / final_n_groups)
+    # clamp 跟 _grid_multiref_group_size 同范围 [2, 12]
+    return max(2, min(12, group_size))
+
+
 def _grid_multiref_duration(group: list[dict], total_panels: int | None = None, tts_duration_buffered: float | None = None) -> int:
     """B34.1 cap 10→15 (WERYDANCE 硬上限).
     B52 (2026-05-28): 加 tts_duration_buffered + total_panels hint, 防 voice clone 评书慢节奏
@@ -13448,18 +13477,23 @@ def _generate_grid_multiref_motion_segments(script: list[dict], motion_prompts: 
     ]
     # B52 (2026-05-28): 算 TTS-aware buffered duration hint 让每 group 容器够大
     # voice clone 评书慢节奏被 video 截 → 末句被裁 (224938 实测)
-    # Stage 3 Medium fix: total_panels 排除被 skip 的尾组 (len<2 跳过, 不分 TTS share)
+    # B62 (2026-05-29): group_size 自适应拆细修语速太快. 大哥 170514 反馈"语速赶进度":
+    # 9 panel × group_size=4 → 2 group × 15s = 30s 但 TTS 38.7s 评书 → 压 25%.
+    # 改 _grid_multiref_adaptive_group_size 按 TTS buffered 算 optimal group_size.
     _b52_tts_buffered = _grid_multiref_tts_duration_buffered()
-    _b52_group_size = _grid_multiref_group_size()
+    _b62_group_size = _grid_multiref_adaptive_group_size(len(refs), _b52_tts_buffered)
+    _b52_group_size = _b62_group_size  # 兼容旧变量名
+    if _b62_group_size != _grid_multiref_group_size():
+        log(f"B62 grid_multiref 自适应 group_size: {_grid_multiref_group_size()} → {_b62_group_size} (n_panels={len(refs)} tts_buffered={_b52_tts_buffered:.1f}s)")
     _b52_total_panels = sum(
-        min(_b52_group_size, len(refs) - s)
-        for s in range(0, len(refs), _b52_group_size)
-        if min(_b52_group_size, len(refs) - s) >= 2
+        min(_b62_group_size, len(refs) - s)
+        for s in range(0, len(refs), _b62_group_size)
+        if min(_b62_group_size, len(refs) - s) >= 2
     )
     if _b52_total_panels <= 0:
         _b52_total_panels = len(refs)  # fallback 防 0 除零
     if _b52_tts_buffered > 0:
-        log(f"B52 grid_multiref TTS-aware: master_voice × {_grid_multiref_tts_buffer_factor()} = {_b52_tts_buffered:.1f}s 分配 {_b52_total_panels} panel")
+        log(f"B52 grid_multiref TTS-aware: master_voice × {_grid_multiref_tts_buffer_factor()} = {_b52_tts_buffered:.1f}s 分配 {_b52_total_panels} panel × group_size={_b62_group_size}")
     qa = {
         "mode": "storyboard_grid_clean_refs_to_werydance_multiref",
         "enabled": True,
@@ -13467,7 +13501,7 @@ def _generate_grid_multiref_motion_segments(script: list[dict], motion_prompts: 
         "model": "WERYDANCE_2_0",
         "aspect_ratio": aspect_ratio,
         "resolution": os.environ.get("ADR_STORYBOARD_GRID_MULTIREF_RESOLUTION", "720p"),
-        "group_size": _grid_multiref_group_size(),
+        "group_size": _b62_group_size,
         "total_refs": len(refs),
         "tts_duration_buffered": round(_b52_tts_buffered, 2) if _b52_tts_buffered > 0 else None,
         "records": [],
