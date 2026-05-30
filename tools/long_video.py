@@ -27,6 +27,7 @@ import argparse
 import json
 import os
 import shutil
+import signal
 import subprocess
 import sys
 import time
@@ -165,6 +166,19 @@ def _find_final_mp4(out_dir: str) -> str | None:
     return str(cands[0]) if cands else None
 
 
+def _kill_proc_group(proc: "subprocess.Popen", hard: bool = False) -> None:
+    """杀掉 proc 所在进程组 (Popen start_new_session=True 建的), 连 ADR 派生的
+    ffmpeg/curl 子进程一起杀, 防孤儿残留 (Codex High). 兜底单杀 proc."""
+    sig = signal.SIGKILL if hard else signal.SIGTERM
+    try:
+        os.killpg(os.getpgid(proc.pid), sig)
+    except Exception:
+        try:
+            proc.kill() if hard else proc.terminate()
+        except Exception:
+            pass
+
+
 def run_one_chunk(seg: dict, topic: str, fmt: str, extra_args: list[str],
                   bgm_master: str | None, timeout: int, retries: int, run_root: Path) -> bool:
     """跑单段 ADR (含 retry). 直接更新 seg dict. 成功返回 True.
@@ -206,37 +220,77 @@ def run_one_chunk(seg: dict, topic: str, fmt: str, extra_args: list[str],
         print(f"\n=== chunk {seg['idx']} (attempt {attempt}/{max_attempts}): "
               f"{seg['n_sentences']} 句 → {out_dir} ===")
         t0 = time.time()
+        # E2E 实测: ADR 干完活(含成片)后因残留非守护线程/连接池(CLOSE_WAIT)不退出, 卡 ~1h.
+        # subprocess.run 会死等退出 → 改 Popen + 轮询: 最终 mp4 生成且 ffprobe 有效且大小连续两轮稳定即收割.
+        # start_new_session=True 建独立进程组, 收割时 killpg 连 ADR 派生的 ffmpeg/curl 一起杀 (Codex High).
+        # mp4 在 step9 生成、step10 TG 推送之前 → 提前收割顺带跳过 per-chunk 推送(只让最终拼接片推 TG).
         try:
-            with open(log_path, "w") as lf:
-                r = subprocess.run(cmd, stdout=lf, stderr=subprocess.STDOUT,
-                                   env=env, timeout=timeout)
-            rc = r.returncode
-        except subprocess.TimeoutExpired:
-            seg["last_error"] = f"timeout {timeout}s (attempt {attempt})"
-            # 超时不重试: 同 workload + 同 timeout 重跑必再超时, 白烧一个 timeout (E2E fix)
-            print(f"   ⏱ chunk {seg['idx']} 超时 {timeout}s, 不重试 (同超时重跑必再超时), log: {log_path}")
-            break
+            lf = open(log_path, "w")
         except Exception as e:
-            seg["last_error"] = f"{type(e).__name__}: {e}"
-            print(f"   ❌ chunk {seg['idx']} 异常: {e}")
+            seg["last_error"] = f"日志打开失败: {e}"
+            print(f"   ❌ chunk {seg['idx']} 日志打开失败: {e}")
             continue
+        try:
+            proc = subprocess.Popen(cmd, stdout=lf, stderr=subprocess.STDOUT,
+                                    env=env, start_new_session=True)
+        except Exception as e:
+            lf.close()  # Codex Low: Popen 失败也要关 lf
+            seg["last_error"] = f"启动失败 {type(e).__name__}: {e}"
+            print(f"   ❌ chunk {seg['idx']} 启动失败: {e}")
+            continue
+
+        outcome, rc, final, last_size = None, None, None, -1
+        try:
+            while True:
+                rc = proc.poll()
+                if rc is not None:
+                    outcome = "exited"; break
+                if time.time() - t0 > timeout:
+                    _kill_proc_group(proc)
+                    outcome = "timeout"; break
+                cand = _find_final_mp4(str(out_dir))
+                if cand and _ffprobe_duration(cand):
+                    sz = os.path.getsize(cand)
+                    if sz > 0 and sz == last_size:  # 连续两轮大小稳定 = 写完, 防边写边探 race (Codex Med)
+                        _kill_proc_group(proc)
+                        final, outcome = cand, "reaped"; break
+                    last_size = sz
+                time.sleep(5)
+        finally:
+            try: lf.close()
+            except Exception: pass
+        # 统一收割兜底, 不留 zombie/orphan (Codex Med): SIGTERM 已发, wait 不掉则 SIGKILL 整组
+        try:
+            proc.wait(20)
+        except Exception:
+            _kill_proc_group(proc, hard=True)
+            try: proc.wait(10)
+            except Exception: pass
 
         seg["render_seconds"] = round(time.time() - t0, 1)
-        if rc != 0:
-            seg["last_error"] = f"returncode {rc} (attempt {attempt}), log: {log_path}"
-            print(f"   ❌ chunk {seg['idx']} 返回非 0: {rc}, log: {log_path}")
-            continue
 
-        final = _find_final_mp4(str(out_dir))
+        if outcome == "timeout":
+            seg["last_error"] = f"timeout {timeout}s (attempt {attempt})"
+            # 超时不重试: 同 workload + 同 timeout 重跑必再超时, 白烧一个 timeout (E2E fix)
+            print(f"   ⏱ chunk {seg['idx']} 超时 {timeout}s, 不重试, log: {log_path}")
+            break
+
+        # reaped 已有 final; exited 路径重新探一次 (rc 可非 0/负=被信号 → 成片已出也救回)
         if not final:
-            seg["last_error"] = f"no ADR_V8_*.mp4 in {out_dir} (attempt {attempt})"
-            print(f"   ❌ chunk {seg['idx']} 无成片: {out_dir}")
-            continue
+            cand = _find_final_mp4(str(out_dir))
+            final = cand if (cand and _ffprobe_duration(cand)) else None
+        if not final:
+            seg["last_error"] = f"无有效成片 (outcome={outcome}, rc={rc}), log: {log_path}"
+            print(f"   ❌ chunk {seg['idx']} 无有效成片 (outcome={outcome}, rc={rc})")
+            continue  # 崩溃/无产出 可重试
 
+        if outcome == "exited" and rc not in (0, None):  # Codex Low: 记 warning 便于追踪信号终止
+            print(f"   ⚠️ chunk {seg['idx']} 进程 rc={rc}(疑被信号终止) 但成片有效, 救回")
         seg["final_mp4"] = final
         seg["status"] = "done"
         seg["last_error"] = None
-        print(f"   ✅ chunk {seg['idx']} → {final} ({seg['render_seconds']}s)")
+        via = "提前收割·跳过step10推送" if outcome == "reaped" else f"进程自退rc={rc}"
+        print(f"   ✅ chunk {seg['idx']} → {final} ({seg['render_seconds']}s · {via})")
         return True
 
     seg["status"] = "failed"
