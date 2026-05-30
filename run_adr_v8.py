@@ -3530,7 +3530,8 @@ def step1_script(topic: str) -> list[dict]:
 
     # 外部脚本注入场景下，分镜数量已由用户脚本决定；提前探测可跳过
     # "动态分镜数" LLM 调用，避免长稿/分段任务在无意义规划阶段卡住。
-    _OVERRIDE_FILE = Path("/tmp/adr_script_override.txt")
+    # B69 (2026-05-30): override 路径支持 ADR_SCRIPT_OVERRIDE env，让并行 chunk 各用独立 fixture（默认保持原路径，零行为变化）
+    _OVERRIDE_FILE = Path(os.environ.get("ADR_SCRIPT_OVERRIDE", "/tmp/adr_script_override.txt"))
     _early_override_lines: list[str] = []
     _early_override_timings: list[dict | None] = []
     if _OVERRIDE_FILE.exists() and _OVERRIDE_FILE.stat().st_size > 0:
@@ -19513,7 +19514,17 @@ def main():
             t = time.time(); script = step345_bgm_only_timeline(script, bgm_path, voice_path); timings["BGM-driven 时间轴计算"] = time.time() - t
         else:
             t = time.time(); script = step345_timeline(script, voice_path);   timings["时间轴计算"] = time.time() - t
-        t = time.time(); bgm_path   = step6_parallel(script, topic, bgm_path if NO_VOICE else None); timings["图片+BGM 并发"] = time.time() - t
+        # B69 (2026-05-30): 长文 chunk 衔接 — chunk2..N 经 ADR_CHUNK_BGM_REUSE env 复用 chunk1 的 bgm.mp3，
+        # 跳过重生成保证整片 BGM 一致（接 step6_parallel 现有 pregenerated_bgm_path 钩子）。NO_VOICE 模式行为保留。
+        _b69_bgm_reuse = os.environ.get("ADR_CHUNK_BGM_REUSE", "").strip()
+        if _b69_bgm_reuse and os.path.exists(_b69_bgm_reuse):
+            _b69_pregen_bgm = _b69_bgm_reuse
+            log(f"B69 chunk BGM 复用：{_b69_bgm_reuse}")
+        else:
+            if _b69_bgm_reuse:
+                log(f"B69 chunk BGM 复用路径不存在，回退常规生成：{_b69_bgm_reuse}")
+            _b69_pregen_bgm = bgm_path if NO_VOICE else None
+        t = time.time(); bgm_path   = step6_parallel(script, topic, _b69_pregen_bgm); timings["图片+BGM 并发"] = time.time() - t
         # B41 (2026-05-28): step6 后无条件 save pipeline_state，让 HADS 也支持
         # tools/rerun_downstream.py 局部重跑下游（之前只 ADSD 分支存 → HADS 100% 不可 resume）.
         # ADSD 走完 step66 后还会再 save 一次（含 audio_dub vid_path），覆盖此版本.
