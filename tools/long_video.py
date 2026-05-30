@@ -48,7 +48,7 @@ MANIFEST_SCHEMA = "b69_long_video_manifest_v1"
 DEFAULT_SINGLE_RUN_MAX = int(os.environ.get("ADR_LONGVIDEO_SINGLE_RUN_MAX", "30"))
 DEFAULT_CHUNK_SIZE = int(os.environ.get("ADR_LONGVIDEO_CHUNK_SIZE", "12"))
 DEFAULT_CROSSFADE_SEC = float(os.environ.get("ADR_LONGVIDEO_CROSSFADE_SEC", "1.0"))
-DEFAULT_TIMEOUT = int(os.environ.get("ADR_LONGVIDEO_CHUNK_TIMEOUT", "3600"))
+DEFAULT_TIMEOUT = int(os.environ.get("ADR_LONGVIDEO_CHUNK_TIMEOUT", "14400"))  # 4h: 12-scene grid_multiref + WERYDANCE 重试现实值 (E2E 实测 1h 太紧)
 DEFAULT_RETRIES = int(os.environ.get("ADR_LONGVIDEO_RETRIES", "1"))
 
 
@@ -83,6 +83,15 @@ def _final_mp4_belongs(path: str | None, run_root: Path) -> bool:
     if not rp.is_file():
         return False
     return run_root.resolve() in rp.parents
+
+
+def _outdir_belongs(out_dir: Path, run_root: Path) -> bool:
+    """out_dir 必须是 run_root 的直接子目录且名为 out_* —— rmtree 前的安全校验，
+    防篡改 manifest 把 output_dir 指向别处导致误删 (Codex review Med2)."""
+    try:
+        return out_dir.resolve().parent == run_root.resolve() and out_dir.name.startswith("out_")
+    except Exception:
+        return False
 
 
 def build_plan(text: str, chunk_size: int, single_run_max: int) -> tuple[str, list[list[str]]]:
@@ -157,7 +166,7 @@ def _find_final_mp4(out_dir: str) -> str | None:
 
 
 def run_one_chunk(seg: dict, topic: str, fmt: str, extra_args: list[str],
-                  bgm_master: str | None, timeout: int, retries: int) -> bool:
+                  bgm_master: str | None, timeout: int, retries: int, run_root: Path) -> bool:
     """跑单段 ADR (含 retry). 直接更新 seg dict. 成功返回 True.
 
     用 per-chunk ADR_SCRIPT_OVERRIDE + OUTPUT_DIR env (确定性, 不靠 log 解析),
@@ -165,6 +174,12 @@ def run_one_chunk(seg: dict, topic: str, fmt: str, extra_args: list[str],
     """
     override_file = Path(seg["override_file"])
     out_dir = Path(seg["output_dir"])
+    # 安全: out_dir 必须是 run_root/out_* (rmtree 前防篡改 manifest 误删别处 — Codex Med2)
+    if not _outdir_belongs(out_dir, run_root):
+        seg["last_error"] = f"output_dir 非法(非 run_root/out_*): {out_dir}"
+        seg["status"] = "failed"
+        print(f"   ❌ chunk {seg['idx']} output_dir 安全校验失败, 拒绝渲染/清理: {out_dir}", file=sys.stderr)
+        return False
     override_file.parent.mkdir(parents=True, exist_ok=True)
     override_file.write_text("\n".join(seg["sentences"]) + "\n", encoding="utf-8")
 
@@ -182,6 +197,11 @@ def run_one_chunk(seg: dict, topic: str, fmt: str, extra_args: list[str],
     for attempt in range(1, max_attempts + 1):
         seg["attempts"] = attempt
         seg["status"] = "running"
+        # 清空 out_dir 起干净 slate: 防上次失败/部分渲染的残片污染 ADR 本次 run (E2E fix)
+        if out_dir.exists():
+            shutil.rmtree(out_dir, ignore_errors=True)
+            if out_dir.exists() and any(out_dir.iterdir()):  # 删不彻底要 fail-loud 不静默 (Codex Med1)
+                print(f"   ⚠️ chunk {seg['idx']} out_dir 清理不彻底, 残片可能影响渲染: {out_dir}")
         out_dir.mkdir(parents=True, exist_ok=True)
         print(f"\n=== chunk {seg['idx']} (attempt {attempt}/{max_attempts}): "
               f"{seg['n_sentences']} 句 → {out_dir} ===")
@@ -193,8 +213,9 @@ def run_one_chunk(seg: dict, topic: str, fmt: str, extra_args: list[str],
             rc = r.returncode
         except subprocess.TimeoutExpired:
             seg["last_error"] = f"timeout {timeout}s (attempt {attempt})"
-            print(f"   ⏱ chunk {seg['idx']} 超时, log: {log_path}")
-            continue
+            # 超时不重试: 同 workload + 同 timeout 重跑必再超时, 白烧一个 timeout (E2E fix)
+            print(f"   ⏱ chunk {seg['idx']} 超时 {timeout}s, 不重试 (同超时重跑必再超时), log: {log_path}")
+            break
         except Exception as e:
             seg["last_error"] = f"{type(e).__name__}: {e}"
             print(f"   ❌ chunk {seg['idx']} 异常: {e}")
@@ -467,7 +488,7 @@ def main():
             print(f"♻️ chunk {seg['idx']} 已完成, 跳过")
             continue
         ok = run_one_chunk(seg, manifest["topic"], manifest["fmt"], extra_args,
-                           manifest.get("bgm_master"), args.timeout, args.retries)
+                           manifest.get("bgm_master"), args.timeout, args.retries, run_root)
         # chunk0 成功后锁定 BGM master 供后续复用
         if ok and seg["idx"] == 0 and not manifest.get("bgm_master"):
             bgm = Path(seg["output_dir"]) / "bgm.mp3"

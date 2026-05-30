@@ -12,7 +12,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from tools.long_video import (  # noqa: E402
     build_plan, init_manifest, build_crossfade_filter,
-    _atomic_write_json, _load_manifest, _final_mp4_belongs, MANIFEST_SCHEMA,
+    _atomic_write_json, _load_manifest, _final_mp4_belongs, _outdir_belongs, MANIFEST_SCHEMA,
 )
 
 _passed = 0
@@ -165,6 +165,20 @@ def test_resume_content_guard():
     check("仅改 1 句 → chunks 不同", chunksA != chunksC)
 
 
+def test_outdir_belongs():
+    print("[_outdir_belongs rmtree 前 out_dir 安全守卫 (Codex review Med2)]")
+    with tempfile.TemporaryDirectory() as d:
+        rr = Path(d) / "run"
+        rr.mkdir()
+        check("run_root/out_00 → True", _outdir_belongs(rr / "out_00", rr) is True)
+        check("run_root/out_03 → True", _outdir_belongs(rr / "out_03", rr) is True)
+        check("非 out_* 子目录 → False", _outdir_belongs(rr / "foo", rr) is False)
+        check("run_root 外目录 → False", _outdir_belongs(Path(d) / "elsewhere", rr) is False)
+        check("run_root 自身 → False", _outdir_belongs(rr, rr) is False)
+        check("嵌套更深 → False", _outdir_belongs(rr / "out_00" / "sub", rr) is False)
+        check("篡改到家目录 → False", _outdir_belongs(Path.home(), rr) is False)
+
+
 def main():
     test_gate()
     test_manifest()
@@ -172,6 +186,7 @@ def main():
     test_atomic_io()
     test_ownership()
     test_resume_content_guard()
+    test_outdir_belongs()
     print(f"\n{'='*40}\n结果: {_passed} 通过 / {_failed} 失败")
     sys.exit(1 if _failed else 0)
 
