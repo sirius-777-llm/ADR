@@ -16521,6 +16521,9 @@ def step8_subtitles(script: list[dict]) -> str:
                     new_start, new_end = boundaries[turn_idx]
                     try:
                         s["sub_start"] = float(new_start)
+                        # B72: 字幕结束也对齐到 ASR clone 边界 (clamp 防 new_end<new_start 反转)，
+                        # 否则末段字幕被旧 TTS sub_end 钉死 → 后半旁白无字幕 (滕王阁序 5 段实测 ~30%)
+                        s["sub_end"] = max(float(new_start), float(new_end))
                         s["audio_start"] = float(new_start)
                         s["vid_duration"] = max(0.3, float(new_end) - float(new_start))
                         s["_b61_subtitle_scaled"] = True
@@ -16558,7 +16561,8 @@ def step8_subtitles(script: list[dict]) -> str:
                             continue
                         try:
                             new_values = {}
-                            for k in ("sub_start", "audio_start", "vid_duration"):
+                            # B72: sub_end 也按 clone/tts 比例缩放, 否则字幕结束被封顶在 TTS 时长 (同正比例缩放保序不反转)
+                            for k in ("sub_start", "sub_end", "audio_start", "vid_duration"):
                                 v = s.get(k)
                                 if v is None:
                                     continue
