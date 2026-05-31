@@ -16520,12 +16520,15 @@ def step8_subtitles(script: list[dict]) -> str:
                         break
                     new_start, new_end = boundaries[turn_idx]
                     try:
-                        s["sub_start"] = float(new_start)
+                        ns, ne = float(new_start), float(new_end)
+                        if not (math.isfinite(ns) and math.isfinite(ne)):  # B72/Codex: 防 NaN/inf 穿透 ASS
+                            raise ValueError(f"ASR 边界非有限值: {new_start!r},{new_end!r}")
+                        s["sub_start"] = ns
                         # B72: 字幕结束也对齐到 ASR clone 边界 (clamp 防 new_end<new_start 反转)，
                         # 否则末段字幕被旧 TTS sub_end 钉死 → 后半旁白无字幕 (滕王阁序 5 段实测 ~30%)
-                        s["sub_end"] = max(float(new_start), float(new_end))
-                        s["audio_start"] = float(new_start)
-                        s["vid_duration"] = max(0.3, float(new_end) - float(new_start))
+                        s["sub_end"] = max(ns, ne)
+                        s["audio_start"] = ns
+                        s["vid_duration"] = max(0.3, ne - ns)
                         s["_b61_subtitle_scaled"] = True
                         s["_b61_1_asr_aligned"] = True
                     except (TypeError, ValueError) as e:
