@@ -196,7 +196,7 @@ def _kill_proc_group(proc: "subprocess.Popen", hard: bool = False) -> None:
 
 def run_one_chunk(seg: dict, topic: str, fmt: str, extra_args: list[str],
                   bgm_master: str | None, voice_master: str | None,
-                  timeout: int, retries: int, run_root: Path) -> bool:
+                  no_bgm: bool, timeout: int, retries: int, run_root: Path) -> bool:
     """跑单段 ADR (含 retry). 直接更新 seg dict. 成功返回 True.
 
     用 per-chunk ADR_SCRIPT_OVERRIDE + OUTPUT_DIR env (确定性, 不靠 log 解析),
@@ -221,7 +221,8 @@ def run_one_chunk(seg: dict, topic: str, fmt: str, extra_args: list[str],
         env["ADR_CHUNK_BGM_REUSE"] = bgm_master
     if voice_master:  # B73: 跨 chunk 音色锁定, chunk2..N 复用 chunk0 voice_asset
         env["ADR_CHUNK_VOICE_REUSE"] = voice_master
-    env["ADR_CHUNK_NO_BGM"] = "1"  # B74: chunk 渲纯人声, 拼接时叠一条连续 bed (防每段重放 bed)
+    if no_bgm:  # B74: 仅 chunked 多段模式渲纯人声拼接时叠连续 bed; single_run 保留 step9 原生 BGM (Codex High)
+        env["ADR_CHUNK_NO_BGM"] = "1"
 
     cmd = [PYTHON, ADR_SCRIPT, topic, fmt] + extra_args
     log_path = str(out_dir.parent / f"chunk_{seg['idx']:02d}.log")
@@ -441,7 +442,7 @@ def _overlay_continuous_bgm(video_path: str, bgm_path: str, out_path: str, bgm_v
         f"[0:a][ba]amix=inputs=2:duration=first:normalize=0:weights=1.0 {bgm_volume}[aout]",
         "-map", "0:v", "-map", "[aout]",
         "-c:v", "copy", "-c:a", "aac", "-b:a", "128k",
-        "-shortest", out_path,
+        "-movflags", "+faststart", "-shortest", out_path,  # Codex Med: 保留 faststart 播放优化
     ]
     try:
         r = subprocess.run(cmd, capture_output=True, timeout=600)
@@ -586,7 +587,7 @@ def main():
             continue
         ok = run_one_chunk(seg, manifest["topic"], manifest["fmt"], extra_args,
                            manifest.get("bgm_master"), manifest.get("voice_master"),
-                           args.timeout, args.retries, run_root)
+                           manifest["mode"] == "chunked", args.timeout, args.retries, run_root)
         # chunk0 成功后锁定 BGM master + voice master 供后续 chunk 复用 (跨段一致)
         if ok and seg["idx"] == 0:
             if not manifest.get("bgm_master"):
@@ -625,9 +626,9 @@ def main():
         print("❌ concat 失败", file=sys.stderr)
         sys.exit(4)
 
-    # B74: chunk 已渲纯人声 (ADR_CHUNK_NO_BGM) → 叠一条连续 BGM bed (整片不断, 替代每段从 0:00 重放 bed)
+    # B74: chunked 模式各 chunk 已渲纯人声 → 叠一条连续 BGM bed (整片不断). single_run 保留 step9 原生 BGM (Codex High).
     bgm_master = manifest.get("bgm_master")
-    if bgm_master and os.path.exists(bgm_master):
+    if manifest["mode"] == "chunked" and bgm_master and os.path.exists(bgm_master):
         bgm_long = str(run_root / f"ADR_V8_LONG_{topic_safe}_{int(created_at)}_bgm.mp4")
         if _overlay_continuous_bgm(out_long, bgm_master, bgm_long):
             out_long = bgm_long

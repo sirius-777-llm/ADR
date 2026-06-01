@@ -16464,48 +16464,65 @@ def _align_segments_via_asr(
     return out
 
 
-def _b61_1_asr_turn_boundaries(audio_path: str, n_turns: int) -> list[tuple[float, float]] | None:
-    """B61.1 (2026-05-30): faster_whisper ASR voice clone audio → segment-level (start, end) per turn.
-    Codex 30min 简化版: 假设 ASR segment 数 ≈ turn 数, 按时间顺序映射. 不做 char overlap match.
-    返回 [(turn_start, turn_end), ...] 或 None (失败 / segment 数严重不对 → caller fallback B61 简化版).
+def _b61_1_asr_turn_boundaries(audio_path: str, turn_texts: list[str]) -> list[tuple[float, float]] | None:
+    """B61.1/B75 (2026-06-01): faster_whisper ASR voice clone audio → per-turn (start, end).
+    B75: 主路径改 word-level 时间戳 + char 比例映射 (取代 B61.1 的 segment-index 比例 — 后者忽略
+    ASR 段内静音 gap, gap 后字幕漂移). word 时序天然含 gap; char 比例按各 turn 字数加权对齐.
+    无 word 时间戳时 fallback segment-index 比例 (B61.1 旧行为). 返回 [(start, end), ...] 或 None.
     """
+    n_turns = len(turn_texts)
     if not audio_path or not os.path.exists(audio_path) or n_turns < 1:
         return None
     try:
         from faster_whisper import WhisperModel
         model = WhisperModel("base", compute_type="int8")
-        segments_iter, _ = model.transcribe(audio_path, language="zh", word_timestamps=False)
-        segments: list[tuple[float, float, str]] = []
+        segments_iter, _ = model.transcribe(audio_path, language="zh", word_timestamps=True)
+        words: list[tuple[float, float]] = []     # (start, end) per word, gap-aware
+        segments: list[tuple[float, float]] = []  # segment 级 fallback
         for seg in segments_iter:
-            s = float(getattr(seg, "start", 0.0) or 0.0)
-            e = float(getattr(seg, "end", s) or s)
-            t = (getattr(seg, "text", "") or "").strip()
-            if e > s and t:
-                segments.append((s, e, t))
+            ss = float(getattr(seg, "start", 0.0) or 0.0)
+            se = float(getattr(seg, "end", ss) or ss)
+            if se > ss and (getattr(seg, "text", "") or "").strip():
+                segments.append((ss, se))
+            for w in (getattr(seg, "words", None) or []):
+                ws = float(getattr(w, "start", 0.0) or 0.0)
+                we = float(getattr(w, "end", ws) or ws)
+                if we > ws and (getattr(w, "word", "") or "").strip():
+                    words.append((ws, we))
+        # B75 主路径: word-level + char 比例
+        if len(words) >= n_turns:
+            turn_chars = [max(1, len((t or "").strip())) for t in turn_texts]
+            total_chars = sum(turn_chars)
+            nw = len(words)
+            boundaries: list[tuple[float, float]] = []
+            cum = 0
+            for i in range(n_turns):
+                w0 = max(0, min(int(cum / total_chars * nw), nw - 1))
+                w1 = max(w0 + 1, min(int((cum + turn_chars[i]) / total_chars * nw), nw))
+                ts, te = words[w0][0], words[w1 - 1][1]
+                if te <= ts:
+                    te = ts + 0.3
+                boundaries.append((ts, te))
+                cum += turn_chars[i]
+            log(f"B75 ASR word-level align: {nw} words → {n_turns} turns (char 比例, {boundaries[0][0]:.2f}~{boundaries[-1][1]:.2f}s)")
+            return boundaries
+        # fallback: 无 word 时间戳 → segment-index 比例 (B61.1 旧行为)
         if len(segments) < max(2, n_turns // 2):
-            log(f"B61.1 ASR force align segments={len(segments)} 远少于 n_turns={n_turns}, fallback B61")
+            log(f"B61.1 ASR align segments={len(segments)} words={len(words)} 远少于 n_turns={n_turns}, fallback B61")
             return None
-        # 简化映射: ASR 按时间顺序, 平均分配到 turn
-        # 例 9 turn × 9 segment: 1对1 直接映射
-        # 例 9 turn × 8 segment: 把 8 段按时间均分到 9 turn (差段 turn 取邻段时间)
-        # 例 9 turn × 12 segment: 合并 12 段成 9 组 (按时间均分)
-        boundaries: list[tuple[float, float]] = []
+        boundaries = []
         n_seg = len(segments)
         for i in range(n_turns):
-            # 该 turn 对应 segment 范围: [i × n_seg/n_turns, (i+1) × n_seg/n_turns)
-            seg_start_idx = int(i * n_seg / n_turns)
-            seg_end_idx = int((i + 1) * n_seg / n_turns)
-            seg_end_idx = max(seg_end_idx, seg_start_idx + 1)  # 至少 1 段
-            seg_end_idx = min(seg_end_idx, n_seg)
-            turn_start = segments[seg_start_idx][0]
-            turn_end = segments[seg_end_idx - 1][1]
-            if turn_end <= turn_start:
-                turn_end = turn_start + 0.5  # fallback 防 0 时长
-            boundaries.append((turn_start, turn_end))
-        log(f"B61.1 ASR force align: {n_seg} segments → {n_turns} turn boundaries ({segments[0][0]:.2f}s ~ {segments[-1][1]:.2f}s)")
+            si = max(0, min(int(i * n_seg / n_turns), n_seg - 1))
+            ei = min(max(int((i + 1) * n_seg / n_turns), si + 1), n_seg)
+            ts, te = segments[si][0], segments[ei - 1][1]
+            if te <= ts:
+                te = ts + 0.5
+            boundaries.append((ts, te))
+        log(f"B61.1 ASR align (segment fallback): {n_seg} segments → {n_turns} turns ({segments[0][0]:.2f}~{segments[-1][1]:.2f}s)")
         return boundaries
     except Exception as e:
-        log(f"B61.1 ASR force align 失败 ({e}), fallback B61 简化版")
+        log(f"B61.1/B75 ASR force align 失败 ({e}), fallback B61 简化版")
         return None
 
 
@@ -16523,8 +16540,9 @@ def step8_subtitles(script: list[dict]) -> str:
             and not script[0].get("_b61_subtitle_scaled")  # B61 简化版 flag 也用作 B61.1 已对齐 flag
             and len(script) > 0
         ):
-            n_valid_turns = sum(1 for s in script if isinstance(s, dict) and str(s.get("text") or "").strip())
-            boundaries = _b61_1_asr_turn_boundaries(raw_concat_path_b61_1, n_valid_turns)
+            valid_texts = [str(s.get("text") or "").strip() for s in script if isinstance(s, dict) and str(s.get("text") or "").strip()]
+            n_valid_turns = len(valid_texts)
+            boundaries = _b61_1_asr_turn_boundaries(raw_concat_path_b61_1, valid_texts)  # B75: 传 turn 文字做 char 比例映射
             if boundaries and len(boundaries) == n_valid_turns:
                 log(f"B61.1 应用 ASR force align: 重写 {n_valid_turns} turn boundaries")
                 turn_idx = 0
