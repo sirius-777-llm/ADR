@@ -698,8 +698,10 @@ def main():
             print(f"🎵 B74 连续 BGM bed 已叠加 → {out_long}")
         else:
             print("⚠️ B74 连续 BGM 叠加失败, 沿用纯人声拼接 (成片无 BGM)")
+    elif manifest["mode"] == "chunked":
+        print("⚠️ chunked 模式但无 bgm_master, 成片纯人声无 BGM")
     else:
-        print("⚠️ 无 bgm_master, 成片纯人声无 BGM")
+        print("ℹ️ single_run: 成片保留 chunk0 原生 BGM (无需叠加连续 bed)")
 
     manifest["final_output"] = out_long
     _atomic_write_json(manifest_path, manifest)
