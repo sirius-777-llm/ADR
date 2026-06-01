@@ -30,7 +30,9 @@ import shutil
 import signal
 import subprocess
 import sys
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -51,6 +53,7 @@ DEFAULT_CHUNK_SIZE = int(os.environ.get("ADR_LONGVIDEO_CHUNK_SIZE", "12"))
 DEFAULT_CROSSFADE_SEC = float(os.environ.get("ADR_LONGVIDEO_CROSSFADE_SEC", "1.0"))
 DEFAULT_TIMEOUT = int(os.environ.get("ADR_LONGVIDEO_CHUNK_TIMEOUT", "14400"))  # 4h: 12-scene grid_multiref + WERYDANCE 重试现实值 (E2E 实测 1h 太紧)
 DEFAULT_RETRIES = int(os.environ.get("ADR_LONGVIDEO_RETRIES", "1"))
+DEFAULT_PARALLEL = int(os.environ.get("ADR_LONGVIDEO_PARALLEL", "3"))  # B69.2: chunk1..N 并发数 (防 weryai 504; B69.1 调优)
 
 
 # ── manifest helpers ────────────────────────────────────────────────────────
@@ -209,6 +212,17 @@ def run_one_chunk(seg: dict, topic: str, fmt: str, extra_args: list[str],
         seg["last_error"] = f"output_dir 非法(非 run_root/out_*): {out_dir}"
         seg["status"] = "failed"
         print(f"   ❌ chunk {seg['idx']} output_dir 安全校验失败, 拒绝渲染/清理: {out_dir}", file=sys.stderr)
+        return False
+    # 安全: override_file 必须直属 run_root (防篡改 manifest 任意路径写文件 — Codex B69.2 High)
+    try:
+        if override_file.resolve().parent != run_root.resolve():
+            seg["last_error"] = f"override_file 非法(非 run_root 直属): {override_file}"
+            seg["status"] = "failed"
+            print(f"   ❌ chunk {seg['idx']} override_file 安全校验失败: {override_file}", file=sys.stderr)
+            return False
+    except Exception:
+        seg["last_error"] = "override_file 路径解析失败"
+        seg["status"] = "failed"
         return False
     override_file.parent.mkdir(parents=True, exist_ok=True)
     override_file.write_text("\n".join(seg["sentences"]) + "\n", encoding="utf-8")
@@ -509,6 +523,7 @@ def main():
                     help="chunk 间过渡秒数 (0=关, 走 -c copy)")
     ap.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT, help="单 chunk 超时秒")
     ap.add_argument("--retries", type=int, default=DEFAULT_RETRIES, help="单 chunk 失败重试次数")
+    ap.add_argument("--parallel", type=int, default=DEFAULT_PARALLEL, help="B69.2: chunk1..N 并发数 (chunk0 先串行产 master; 默认 3, 防 weryai 504)")
     ap.add_argument("--run-root", default="", help="工作目录 (默认 /tmp/adr_b69_<topic>_<ts>)")
     ap.add_argument("--resume", action="store_true", help="复用已完成 chunk (读 manifest)")
     ap.add_argument("--dry-run", action="store_true", help="只出 manifest 计划, 不渲染")
@@ -581,34 +596,82 @@ def main():
     if args.ads_dialogue:
         extra_args.append("--ads-dialogue")
 
-    for seg in manifest["segments"]:
-        if args.resume and seg["status"] == "done" and _final_mp4_belongs(seg.get("final_mp4"), run_root):
-            print(f"♻️ chunk {seg['idx']} 已完成, 跳过")
-            continue
+    # B69.2: chunk0 先串行跑 (产 BGM+voice master) → chunk1..N 并发. 各 chunk 独立 override/output dir (B69 已铺路).
+    _manifest_lock = threading.Lock()
+
+    def _seg_done(seg) -> bool:
+        return bool(args.resume and seg["status"] == "done" and _final_mp4_belongs(seg.get("final_mp4"), run_root))
+
+    def _capture_chunk0_masters(seg) -> None:
+        # chunk0 锁定 BGM + voice master 供 chunk1..N 复用 (B73/B74 跨段一致). resume 也补抓缺失 master (Codex S1 边界).
+        if not manifest.get("bgm_master"):
+            bgm = Path(seg["output_dir"]) / "bgm.mp3"
+            if bgm.exists():
+                manifest["bgm_master"] = str(bgm)
+                print(f"🎵 BGM master 锁定: {bgm} (chunk1..N 复用)")
+            else:
+                print("⚠️ chunk0 无 bgm.mp3, chunk1..N 各自生成 BGM, 整片 BGM 可能不一致")
+        if not manifest.get("voice_master") and not args.ads_dialogue:  # ADSD 各 speaker 自己音色, 不锁
+            vm = _read_chunk0_voice_asset(Path(seg["output_dir"]))  # B73 跨段音色锁定
+            if vm:
+                manifest["voice_master"] = vm
+                print(f"🎙 voice master 锁定: {vm} (chunk1..N 复用, 防跨段换旁白)")
+            else:
+                print("⚠️ chunk0 无 voice_asset_id, chunk1..N 各自选音色, 跨段音色可能不一致")
+
+    def _run_seg(seg) -> bool:
         ok = run_one_chunk(seg, manifest["topic"], manifest["fmt"], extra_args,
                            manifest.get("bgm_master"), manifest.get("voice_master"),
                            manifest["mode"] == "chunked", args.timeout, args.retries, run_root)
-        # chunk0 成功后锁定 BGM master + voice master 供后续 chunk 复用 (跨段一致)
-        if ok and seg["idx"] == 0:
-            if not manifest.get("bgm_master"):
-                bgm = Path(seg["output_dir"]) / "bgm.mp3"
-                if bgm.exists():
-                    manifest["bgm_master"] = str(bgm)
-                    print(f"🎵 BGM master 锁定: {bgm} (chunk2..N 复用)")
-                else:
-                    print("⚠️ chunk0 无 bgm.mp3 (NO_VOICE/bgm-only?), chunk2..N 各自生成 BGM, 整片 BGM 可能不一致")
-            if not manifest.get("voice_master") and not args.ads_dialogue:  # ADSD 各speaker自己音色, 不锁 (Codex Low)
-                vm = _read_chunk0_voice_asset(Path(seg["output_dir"]))  # B73 跨段音色锁定
-                if vm:
-                    manifest["voice_master"] = vm
-                    print(f"🎙 voice master 锁定: {vm} (chunk2..N 复用, 防跨段换旁白)")
-                else:
-                    print("⚠️ chunk0 无 voice_asset_id, chunk2..N 各自选音色, 跨段音色可能不一致")
-        _atomic_write_json(manifest_path, manifest)
-        # fail-loud: 任一段重试后仍失败 → 中止, 不静默丢 (古文缺段=correctness bug)
-        if not ok:
-            print(f"\n❌ chunk {seg['idx']} 重试后仍失败 (last_error: {seg['last_error']})", file=sys.stderr)
-            print(f"   中止整片合并以防内容缺失. 修复后可 --resume 续跑. manifest: {manifest_path}", file=sys.stderr)
+        with _manifest_lock:  # 并发线程原子写 manifest
+            _atomic_write_json(manifest_path, manifest)
+        return ok
+
+    segments = manifest["segments"]
+    # 1) chunk0 先串行 (master barrier)
+    seg0 = segments[0]
+    if _seg_done(seg0):
+        print("♻️ chunk 0 已完成, 跳过")
+        with _manifest_lock:
+            _capture_chunk0_masters(seg0)
+            _atomic_write_json(manifest_path, manifest)
+    else:
+        if not _run_seg(seg0):
+            print(f"\n❌ chunk 0 失败 (last_error: {seg0.get('last_error')}), 中止. 修复后 --resume 续跑.", file=sys.stderr)
+            sys.exit(2)
+        with _manifest_lock:
+            _capture_chunk0_masters(seg0)
+            _atomic_write_json(manifest_path, manifest)
+
+    # 2) chunk1..N 并发 (复用 chunk0 master; 不 cancel 在飞的 → 失败也保留已成 chunk 供 resume)
+    rest = []
+    for seg in segments[1:]:
+        if _seg_done(seg):
+            print(f"♻️ chunk {seg['idx']} 已完成, 跳过")
+        else:
+            rest.append(seg)
+    if rest:
+        cap = max(1, args.parallel)
+        print(f"\n=== 并行渲染 chunk1..N: {len(rest)} 段 (并发上限 {cap}, 复用 chunk0 BGM+音色) ===")
+        failed = []
+        with ThreadPoolExecutor(max_workers=cap) as ex:
+            futs = {ex.submit(_run_seg, seg): seg for seg in rest}
+            for fut in as_completed(futs):
+                seg = futs[fut]
+                try:
+                    ok = fut.result()
+                except Exception as e:
+                    seg["status"] = "failed"
+                    seg["last_error"] = f"线程异常: {type(e).__name__}: {e}"
+                    ok = False
+                if not ok:
+                    failed.append(seg)
+        with _manifest_lock:
+            _atomic_write_json(manifest_path, manifest)
+        # fail-loud: 任一段失败 → 中止整片合并, 不静默丢 (古文缺段=correctness bug)
+        if failed:
+            idxs = sorted(s["idx"] for s in failed)
+            print(f"\n❌ chunk {idxs} 重试后仍失败, 中止整片合并. 修复后 --resume 续跑. manifest: {manifest_path}", file=sys.stderr)
             sys.exit(2)
 
     final_paths = [s["final_mp4"] for s in manifest["segments"]]
