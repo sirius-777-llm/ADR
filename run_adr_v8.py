@@ -4671,6 +4671,21 @@ shot_type/camera_angle/lighting/camera_motion 必须从上述 enum 选, 不能�
     # (修大哥反馈'没有曹操音色'). speaker 取 script[0].speaker, 通用'旁白'名跳 IP 走 podcast.
     first_speaker = (script[0].get("speaker") if script else "") or ""
     ads_voice_asset_id, voice_reason = _resolve_voice_asset_for_ads_speaker(first_speaker, picked_id)
+    # B73 (2026-06-01): 跨 chunk 音色锁定 — 长视频 chunk2..N 经 ADR_CHUNK_VOICE_REUSE 强制复用 chunk0 的
+    # voice_asset, 避免各 chunk LLM 独立选不同旁白 (滕王阁序长片实测 chunk0-2 梁文道/chunk3 易中天/chunk4 罗翔).
+    # ADSD 多角色模式不锁 (各 speaker 自己的音色). 校验库内 + speech-safe, 否则回退 LLM pick.
+    _chunk_voice = os.environ.get("ADR_CHUNK_VOICE_REUSE", "").strip()
+    if _chunk_voice and not ADS_DIALOGUE_MODE:
+        try:
+            _by_id = {a.get("voice_id"): a for a in (_load_voice_assets().get("assets") or []) if a.get("voice_id")}
+            _va = _by_id.get(_chunk_voice)
+            if _va and _voice_asset_is_speech_safe(_va):
+                log(f"B73 跨 chunk 音色锁定: {ads_voice_asset_id or '(空)'} → {_chunk_voice} (复用 chunk0)")
+                ads_voice_asset_id, voice_reason = _chunk_voice, "B73_chunk_voice_reuse"
+            else:
+                log(f"B73 ADR_CHUNK_VOICE_REUSE={_chunk_voice} 不在库/非 speech-safe, 回退 LLM pick")
+        except Exception as e:
+            log(f"B73 voice reuse 异常, 回退 LLM pick: {e}")
     if ads_voice_asset_id and not ADS_DIALOGUE_MODE:
         for s in script:
             s["voice_asset_id"] = ads_voice_asset_id  # force override
@@ -17417,6 +17432,12 @@ def step9_render(raw_path: str, voice_path: str, bgm_path: str | None, ass_path:
     # -itsoffset AUDIO_DELAY 延迟音频，画面先出
     # 非 BGM-only 字幕已在 step8 中加了 SUB_DELAY 偏移，在画面和配音之间
     offset = str(render_audio_offset)
+
+    # B74 (2026-06-01): 长视频 chunk 渲染纯人声 (跳过 per-chunk BGM mux), 由 long_video 拼接后叠一条
+    # 连续 BGM bed, 避免每 chunk 从 0:00 重放 bed 导致整片 BGM 不连贯. chunk0 仍生成 bgm.mp3 (step6) 供复用.
+    if os.environ.get("ADR_CHUNK_NO_BGM", "").strip().lower() in ("1", "true", "yes") and bgm_path:
+        log("B74: ADR_CHUNK_NO_BGM 启用 → step9 跳过 BGM mux (纯人声, 拼接时叠连续 bed)")
+        bgm_path = None
 
     if bgm_path:
         if NO_VOICE:

@@ -152,6 +152,7 @@ def init_manifest(topic: str, fmt: str, mode: str, chunks: list[list[str]],
         "single_run_max": single_run_max,
         "crossfade_sec": crossfade_sec,
         "bgm_master": None,
+        "voice_master": None,
         "run_root": str(run_root),
         "final_output": None,
         "segments": segments,
@@ -164,6 +165,20 @@ def _find_final_mp4(out_dir: str) -> str | None:
     cands = sorted(Path(out_dir).glob("ADR_V8_*.mp4"),
                    key=lambda p: p.stat().st_mtime, reverse=True)
     return str(cands[0]) if cands else None
+
+
+def _read_chunk0_voice_asset(out_dir: Path) -> str | None:
+    """读 chunk0 的 voice_asset_id (供 chunk2..N 经 ADR_CHUNK_VOICE_REUSE 复用, 跨段音色一致 — B73)."""
+    try:
+        st = json.loads((out_dir / "pipeline_state.json").read_text(encoding="utf-8"))
+        for s in (st.get("script") or []):
+            if isinstance(s, dict):
+                va = (s.get("voice_asset_id") or "").strip()
+                if va:
+                    return va
+    except Exception:
+        pass
+    return None
 
 
 def _kill_proc_group(proc: "subprocess.Popen", hard: bool = False) -> None:
@@ -180,7 +195,8 @@ def _kill_proc_group(proc: "subprocess.Popen", hard: bool = False) -> None:
 
 
 def run_one_chunk(seg: dict, topic: str, fmt: str, extra_args: list[str],
-                  bgm_master: str | None, timeout: int, retries: int, run_root: Path) -> bool:
+                  bgm_master: str | None, voice_master: str | None,
+                  timeout: int, retries: int, run_root: Path) -> bool:
     """跑单段 ADR (含 retry). 直接更新 seg dict. 成功返回 True.
 
     用 per-chunk ADR_SCRIPT_OVERRIDE + OUTPUT_DIR env (确定性, 不靠 log 解析),
@@ -203,6 +219,9 @@ def run_one_chunk(seg: dict, topic: str, fmt: str, extra_args: list[str],
     env.setdefault("ADR_TG_PROGRESS_MODE", "silent")  # 抑制 per-chunk TG 刷屏 (可被外部 env 覆盖)
     if bgm_master and os.path.exists(bgm_master):
         env["ADR_CHUNK_BGM_REUSE"] = bgm_master
+    if voice_master:  # B73: 跨 chunk 音色锁定, chunk2..N 复用 chunk0 voice_asset
+        env["ADR_CHUNK_VOICE_REUSE"] = voice_master
+    env["ADR_CHUNK_NO_BGM"] = "1"  # B74: chunk 渲纯人声, 拼接时叠一条连续 bed (防每段重放 bed)
 
     cmd = [PYTHON, ADR_SCRIPT, topic, fmt] + extra_args
     log_path = str(out_dir.parent / f"chunk_{seg['idx']:02d}.log")
@@ -410,6 +429,30 @@ def concat_segments(paths: list[str], out_path: str, crossfade_sec: float) -> bo
         return False
 
 
+def _overlay_continuous_bgm(video_path: str, bgm_path: str, out_path: str, bgm_volume: float = 0.4) -> bool:
+    """B74: 给纯人声拼接片叠一条连续 BGM bed (aloop 环绕全片), 匹配 step9 混音 (volume 0.4, weights 1.0 0.4).
+    视频流不重编码 (-c:v copy) 仅重混音频. 替代每 chunk 从 0:00 重放 bed 导致的整片 BGM 不连贯."""
+    if not (bgm_path and os.path.exists(bgm_path)):
+        return False
+    cmd = [
+        FFMPEG, "-y", "-i", video_path, "-i", bgm_path,
+        "-filter_complex",
+        f"[1:a]aloop=loop=-1:size=2147483647,volume={bgm_volume}[ba];"
+        f"[0:a][ba]amix=inputs=2:duration=first:normalize=0:weights=1.0 {bgm_volume}[aout]",
+        "-map", "0:v", "-map", "[aout]",
+        "-c:v", "copy", "-c:a", "aac", "-b:a", "128k",
+        "-shortest", out_path,
+    ]
+    try:
+        r = subprocess.run(cmd, capture_output=True, timeout=600)
+        if r.returncode == 0 and os.path.exists(out_path) and os.path.getsize(out_path) > 100_000:
+            return True
+        print(f"⚠️ B74 BGM overlay fail: {r.stderr.decode()[-300:]}")
+    except Exception as e:
+        print(f"⚠️ B74 BGM overlay 异常: {e}")
+    return False
+
+
 def validate_output(out_path: str, manifest: dict) -> bool:
     """按 manifest 校验成片: 存在 + 时长 ≈ 各段和 (扣 crossfade 重叠), 容差 ±15%."""
     if not (os.path.exists(out_path) and os.path.getsize(out_path) > 100_000):
@@ -542,15 +585,24 @@ def main():
             print(f"♻️ chunk {seg['idx']} 已完成, 跳过")
             continue
         ok = run_one_chunk(seg, manifest["topic"], manifest["fmt"], extra_args,
-                           manifest.get("bgm_master"), args.timeout, args.retries, run_root)
-        # chunk0 成功后锁定 BGM master 供后续复用
-        if ok and seg["idx"] == 0 and not manifest.get("bgm_master"):
-            bgm = Path(seg["output_dir"]) / "bgm.mp3"
-            if bgm.exists():
-                manifest["bgm_master"] = str(bgm)
-                print(f"🎵 BGM master 锁定: {bgm} (chunk2..N 复用)")
-            else:
-                print("⚠️ chunk0 无 bgm.mp3 (NO_VOICE/bgm-only?), chunk2..N 各自生成 BGM, 整片 BGM 可能不一致")
+                           manifest.get("bgm_master"), manifest.get("voice_master"),
+                           args.timeout, args.retries, run_root)
+        # chunk0 成功后锁定 BGM master + voice master 供后续 chunk 复用 (跨段一致)
+        if ok and seg["idx"] == 0:
+            if not manifest.get("bgm_master"):
+                bgm = Path(seg["output_dir"]) / "bgm.mp3"
+                if bgm.exists():
+                    manifest["bgm_master"] = str(bgm)
+                    print(f"🎵 BGM master 锁定: {bgm} (chunk2..N 复用)")
+                else:
+                    print("⚠️ chunk0 无 bgm.mp3 (NO_VOICE/bgm-only?), chunk2..N 各自生成 BGM, 整片 BGM 可能不一致")
+            if not manifest.get("voice_master") and not args.ads_dialogue:  # ADSD 各speaker自己音色, 不锁 (Codex Low)
+                vm = _read_chunk0_voice_asset(Path(seg["output_dir"]))  # B73 跨段音色锁定
+                if vm:
+                    manifest["voice_master"] = vm
+                    print(f"🎙 voice master 锁定: {vm} (chunk2..N 复用, 防跨段换旁白)")
+                else:
+                    print("⚠️ chunk0 无 voice_asset_id, chunk2..N 各自选音色, 跨段音色可能不一致")
         _atomic_write_json(manifest_path, manifest)
         # fail-loud: 任一段重试后仍失败 → 中止, 不静默丢 (古文缺段=correctness bug)
         if not ok:
@@ -572,6 +624,18 @@ def main():
     if not concat_segments(final_paths, out_long, manifest["crossfade_sec"]):
         print("❌ concat 失败", file=sys.stderr)
         sys.exit(4)
+
+    # B74: chunk 已渲纯人声 (ADR_CHUNK_NO_BGM) → 叠一条连续 BGM bed (整片不断, 替代每段从 0:00 重放 bed)
+    bgm_master = manifest.get("bgm_master")
+    if bgm_master and os.path.exists(bgm_master):
+        bgm_long = str(run_root / f"ADR_V8_LONG_{topic_safe}_{int(created_at)}_bgm.mp4")
+        if _overlay_continuous_bgm(out_long, bgm_master, bgm_long):
+            out_long = bgm_long
+            print(f"🎵 B74 连续 BGM bed 已叠加 → {out_long}")
+        else:
+            print("⚠️ B74 连续 BGM 叠加失败, 沿用纯人声拼接 (成片无 BGM)")
+    else:
+        print("⚠️ 无 bgm_master, 成片纯人声无 BGM")
 
     manifest["final_output"] = out_long
     _atomic_write_json(manifest_path, manifest)
