@@ -9313,9 +9313,10 @@ def _llm_pick_voice_asset_for_ip(voice_gender: str, voice_tone_hint: str) -> str
 
 只输出 1 个 voice_id 字符串，不要解释，不要 markdown。"""
     try:
-        raw = tier_chat("data", "你只输出一个 voice_id 字符串。", prompt, max_tokens=80, timeout=30)
+        # B77: 同 MAX_TOKENS 隐患里最毒的一个 — 80-token budget 在 thinking 模型 Lite 上几乎必撞空响应, 静默 fallback candidates[0] 会误选音色(与多音色问题相关). 改非 thinking 的 2.5-Flash + 300 余量.
+        raw = chat("GEMINI_25_FLASH", "你只输出一个 voice_id 字符串。", prompt, max_tokens=300, timeout=30)
         vid = raw.strip().strip('"').strip("'").strip()
-        valid = {a["voice_id"] for a in candidates}
+        valid = {a.get("voice_id") for a in candidates if a.get("voice_id")}  # B77/codex: 坏 catalog 缺 voice_id 不再 KeyError 静默 fallback
         if vid in valid:
             return vid
     except Exception as e:
@@ -18097,7 +18098,8 @@ def _llm_bottom_note(topic: str, script_texts: list) -> str:
         f"只输出注脚本身一行，不加任何解释。"
     )
     try:
-        raw = tier_chat("data", "你是中国古典编辑，擅长从典籍节气物象里提炼诗意注脚。", prompt, max_tokens=200, timeout=45).strip()
+        # B77: 原 tier_chat("data") 走 thinking 模型 GEMINI_3_1_FLASH_LITE, 推理 token 计入 maxOutputTokens, 200 budget 被吃光 → finishReason=MAX_TOKENS 空响应. 改用非 thinking 的 2.5-Flash + 600 余量 (注脚正文仅 ~30-50 token, 12x headroom), 顺带卸 Lite 429 压力.
+        raw = chat("GEMINI_25_FLASH", "你是中国古典编辑，擅长从典籍节气物象里提炼诗意注脚。", prompt, max_tokens=600, timeout=45).strip()
         raw = raw.split("\n")[0].strip()
         # 清洗：去掉标点 / 英文 / 特殊字符（保留中点 · 和中文）
         raw = re.sub(r"[《》\"'【】\[\]()（）!?！？#。，、；：—…-]", '', raw)
