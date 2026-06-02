@@ -13750,6 +13750,7 @@ def _generate_grid_multiref_motion_segments(script: list[dict], motion_prompts: 
                     log(f"B35 grid_multiref group {group_no} voice_ref: {voice_ref.get('asset_id')} ({ref_kind})")
                     break
                 record["b35_fallback_reason"] = f"{ref_kind}_rejected"
+                record.setdefault("b51_reject_chain", []).append(f"{ref_kind}_rejected")  # Codex Low: 完整失败链
             # 候选都被拒 (或无 voice_ref) → silent (step9 mux master TTS). silent submit 异常走外层 except.
             if not task_id:
                 if ref_candidates:
@@ -14641,7 +14642,18 @@ def _build_combined_voice_reference(asset_id: str, ref_paths: list[str]) -> str 
     """B51 (2026-06-02): 把 voice_asset 多段参考拼成一条长参考 (降 WERYDANCE clone 随机方差 → 跨组音色一致).
     沁园春实测: 9s 短参考 × 多组独立 clone → 多音色. 缓存于 OUTPUT_DIR (per-run).
     WERYDANCE 拒长参考时调用方回退单段短参考 (不退化到 master TTS)."""
-    paths = [p for p in ref_paths if p and os.path.exists(p)]
+    # 安全: 仅 repo 内的参考 (防 voice_assets.json 含 ../绝对路径被 ffmpeg/upload 读取外传 — Codex Med)
+    _repo = Path(__file__).resolve().parent
+    paths: list[str] = []
+    for p in ref_paths:
+        if not (p and os.path.exists(p)):
+            continue
+        try:
+            rp = Path(p).resolve()
+            if _repo in rp.parents:
+                paths.append(str(rp))
+        except Exception:
+            continue
     if len(paths) < 2:
         return None
     safe = re.sub(r"[^A-Za-z0-9_]", "_", asset_id)[:40] or "asset"
