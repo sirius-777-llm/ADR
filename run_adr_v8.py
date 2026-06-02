@@ -14661,14 +14661,19 @@ def _build_combined_voice_reference(asset_id: str, ref_paths: list[str]) -> str 
     if out.exists() and out.stat().st_size > 10000:  # per-run 缓存
         return str(out)
     try:
+        # 实测 (沁园春 2026-06-02): WERYDANCE 克隆参考也卡 15s (36s 被拒回退). 截到 <15s 才被接受.
+        # 14s vs 9s 单段 → 更多音色信息降方差 (但多组独立 clone 漂移仍在, 非彻底修).
+        maxlen = float(os.environ.get("ADR_VOICE_REF_MAXLEN", "14"))
+        if not math.isfinite(maxlen) or maxlen <= 0:
+            maxlen = 14.0
         n = len(paths)
         args: list[str] = []
         for p in paths:
             args += ["-i", p]
         fc = "".join(f"[{i}:a]" for i in range(n)) + f"concat=n={n}:v=0:a=1[a]"
-        ffmpeg(*args, "-filter_complex", fc, "-map", "[a]", "-ar", "16000", "-ac", "1", str(out))
+        ffmpeg(*args, "-filter_complex", fc, "-map", "[a]", "-t", f"{maxlen}", "-ar", "16000", "-ac", "1", str(out))
         if out.exists() and out.stat().st_size > 10000:
-            log(f"B51 拼接长参考: {n} 段 → {out.name} ({asset_id})")
+            log(f"B51 拼接长参考: {n} 段 → {out.name} (截 {maxlen}s, {asset_id})")
             return str(out)
     except Exception as e:
         log(f"B51 长参考拼接失败 (回退单段): {e}")

@@ -230,7 +230,8 @@ def run_one_chunk(seg: dict, topic: str, fmt: str, extra_args: list[str],
     env = dict(os.environ)
     env["ADR_SCRIPT_OVERRIDE"] = str(override_file)
     env["OUTPUT_DIR"] = str(out_dir)
-    env.setdefault("ADR_TG_PROGRESS_MODE", "silent")  # 抑制 per-chunk TG 刷屏 (可被外部 env 覆盖)
+    if no_bgm:  # no_bgm==chunked: 多段(并发)dashboard 面板互踩 → 静默; single_run 保留 ADR 原生进度面板
+        env.setdefault("ADR_TG_PROGRESS_MODE", "silent")
     if bgm_master and os.path.exists(bgm_master):
         env["ADR_CHUNK_BGM_REUSE"] = bgm_master
     if voice_master:  # B73: 跨 chunk 音色锁定, chunk2..N 复用 chunk0 voice_asset
