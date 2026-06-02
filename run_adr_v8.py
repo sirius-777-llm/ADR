@@ -13708,8 +13708,7 @@ def _generate_grid_multiref_motion_segments(script: list[dict], motion_prompts: 
             # 现在: 加 audios=[voice_ref.path] + generate_audio=true → combined 含 LLM 选音色 clone
             # try/except 包整 submit, 上游 reject combo 自动回退原 silent 路径
             voice_ref = _select_voice_asset_reference(group[0], mode="motion")
-            audio_url = None
-            payload = {
+            base_payload = {
                 "model": "WERYDANCE_2_0",
                 "images": image_urls,
                 "prompt": prompt,
@@ -13719,42 +13718,44 @@ def _generate_grid_multiref_motion_segments(script: list[dict], motion_prompts: 
                 "generate_audio": "false",
                 "video_number": 1,
             }
+            # B51 (2026-06-02): 候选参考 [长拼接, 短单段] 依次试, 拿到 task_id 即用; 都被拒才 silent.
+            # 修沁园春实测多音色: 长参考降 clone 漂移; WERYDANCE 拒长参考则回退短参考(不退化到 master TTS).
+            ref_candidates: list[tuple[str, str]] = []
             if voice_ref and voice_ref.get("path") and os.path.exists(voice_ref["path"]):
-                try:
-                    audio_url = _upload_to_weryai(voice_ref["path"])
-                    payload["audios"] = [audio_url]
-                    payload["generate_audio"] = "true"
-                    record["voice_ref_used"] = voice_ref.get("asset_id")
-                    record["audio_url"] = audio_url
-                    log(f"B35 grid_multiref group {group_no} voice_ref: {voice_ref.get('asset_id')}")
-                except Exception as _e:
-                    log(f"B35 voice_ref upload 失败 (回退 silent): {_e}")
-                    payload.pop("audios", None)
-                    payload["generate_audio"] = "false"
-                    record["b35_fallback_reason"] = f"upload_failed:{_e}"
-            # B35 (2026-05-28): 上游 reject combo 自动回退 silent retry
-            # 覆盖 3 种 reject: 200 no task_id / 4xx exception / 5xx exception
+                ref_candidates.append((voice_ref["path"], "combined_long" if voice_ref.get("combined_ref") else "single"))
+                fb = voice_ref.get("fallback_path")
+                if fb and fb != voice_ref["path"] and os.path.exists(fb):
+                    ref_candidates.append((fb, "single_fallback"))
             r = None
             task_id = None
-            try:
-                r = req_post("/generation/almighty-reference-to-video", payload, timeout=30)
-                task_id = r.get("data", {}).get("task_id") or (r.get("data", {}).get("task_ids") or [None])[0]
-            except Exception as _e:
-                if audio_url:
-                    log(f"B35 grid_multiref group {group_no} combo exception: {_e}, 回退 silent retry")
-                    record["b35_fallback_reason"] = f"combo_exception:{str(_e)[:200]}"
-                    payload.pop("audios", None)
-                    payload["generate_audio"] = "false"
-                    audio_url = None  # 防 inner retry 又 fallback
+            audio_url = None
+            for ref_path, ref_kind in ref_candidates:
+                try:
+                    a_url = _upload_to_weryai(ref_path)
+                except Exception as _e:
+                    log(f"B35 group {group_no} voice_ref upload 失败 ({ref_kind}): {_e}, 试下一候选")
+                    continue
+                payload = dict(base_payload, audios=[a_url], generate_audio="true")
+                try:
                     r = req_post("/generation/almighty-reference-to-video", payload, timeout=30)
                     task_id = r.get("data", {}).get("task_id") or (r.get("data", {}).get("task_ids") or [None])[0]
-                else:
-                    raise  # 没用 audio_url, 上游异常直接 raise 走外层 except
-            if not task_id and audio_url:
-                log(f"B35 grid_multiref group {group_no} combo reject (no task_id), 回退 silent retry")
-                record["b35_fallback_reason"] = f"combo_no_task_id:{json.dumps(r or {}, ensure_ascii=False)[:200]}"
-                payload.pop("audios", None)
-                payload["generate_audio"] = "false"
+                except Exception as _e:
+                    log(f"B35 group {group_no} combo exception ({ref_kind}): {str(_e)[:120]}, 试下一候选/silent")
+                    task_id = None
+                if task_id:
+                    audio_url = a_url
+                    record["voice_ref_used"] = voice_ref.get("asset_id")
+                    record["audio_url"] = a_url
+                    record["b51_ref_kind"] = ref_kind
+                    log(f"B35 grid_multiref group {group_no} voice_ref: {voice_ref.get('asset_id')} ({ref_kind})")
+                    break
+                record["b35_fallback_reason"] = f"{ref_kind}_rejected"
+            # 候选都被拒 (或无 voice_ref) → silent (step9 mux master TTS). silent submit 异常走外层 except.
+            if not task_id:
+                if ref_candidates:
+                    log(f"B35 group {group_no} 全部 voice_ref 候选被拒, 回退 silent")
+                    record["b35_fallback_reason"] = "all_voice_refs_rejected_silent"
+                payload = dict(base_payload, generate_audio="false")
                 r = req_post("/generation/almighty-reference-to-video", payload, timeout=30)
                 task_id = r.get("data", {}).get("task_id") or (r.get("data", {}).get("task_ids") or [None])[0]
             record.update({
@@ -14636,6 +14637,32 @@ def _load_voice_assets() -> dict:
     return data
 
 
+def _build_combined_voice_reference(asset_id: str, ref_paths: list[str]) -> str | None:
+    """B51 (2026-06-02): 把 voice_asset 多段参考拼成一条长参考 (降 WERYDANCE clone 随机方差 → 跨组音色一致).
+    沁园春实测: 9s 短参考 × 多组独立 clone → 多音色. 缓存于 OUTPUT_DIR (per-run).
+    WERYDANCE 拒长参考时调用方回退单段短参考 (不退化到 master TTS)."""
+    paths = [p for p in ref_paths if p and os.path.exists(p)]
+    if len(paths) < 2:
+        return None
+    safe = re.sub(r"[^A-Za-z0-9_]", "_", asset_id)[:40] or "asset"
+    out = OUTPUT_DIR / f"voice_ref_combined_{safe}.wav"
+    if out.exists() and out.stat().st_size > 10000:  # per-run 缓存
+        return str(out)
+    try:
+        n = len(paths)
+        args: list[str] = []
+        for p in paths:
+            args += ["-i", p]
+        fc = "".join(f"[{i}:a]" for i in range(n)) + f"concat=n={n}:v=0:a=1[a]"
+        ffmpeg(*args, "-filter_complex", fc, "-map", "[a]", "-ar", "16000", "-ac", "1", str(out))
+        if out.exists() and out.stat().st_size > 10000:
+            log(f"B51 拼接长参考: {n} 段 → {out.name} ({asset_id})")
+            return str(out)
+    except Exception as e:
+        log(f"B51 长参考拼接失败 (回退单段): {e}")
+    return None
+
+
 def _select_voice_asset_reference(scene: dict, *, mode: str = "adsd", ref_offset: int = 0) -> dict | None:
     if mode == "adsd":
         if not ADSD_ALMIGHTY_AUDIO_DUB_EXPERIMENT:
@@ -14684,7 +14711,7 @@ def _select_voice_asset_reference(scene: dict, *, mode: str = "adsd", ref_offset
     if valid_refs:
         ref_index = max(0, min(int(ref_offset or 0), len(valid_refs) - 1))
         ref, path = valid_refs[ref_index]
-        return {
+        result = {
             "asset_id": asset_id,
             "display_name": asset.get("display_name"),
             "identified_person": asset.get("identified_person"),
@@ -14698,6 +14725,16 @@ def _select_voice_asset_reference(scene: dict, *, mode: str = "adsd", ref_offset
             "reference_index": ref_index,
             "reference_count": len(valid_refs),
         }
+        # B51: grid_multiref(motion) 默认选择时试长拼接参考(降 clone 漂移); 调用方在 WERYDANCE 拒绝时
+        # 回退 fallback_path 单段短参考 (不退化到 master TTS). adsd 路径不动 (零回归). env 可关.
+        if (mode == "motion" and (ref_offset or 0) == 0 and len(valid_refs) > 1
+                and os.environ.get("ADR_VOICE_COMBINED_REF", "1").strip().lower() not in ("0", "false", "no")):
+            combined = _build_combined_voice_reference(asset_id, [str(p) for _, p in valid_refs])
+            if combined:
+                result["fallback_path"] = str(path)  # 单段短参考兜底
+                result["path"] = combined             # 长拼接参考主用
+                result["combined_ref"] = True
+        return result
     log(f"[voice-asset] 默认音色 {asset_id} reference 文件缺失，回退 turn TTS")
     return None
 
