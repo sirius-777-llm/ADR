@@ -3534,7 +3534,63 @@ def _maybe_neutralize_topic(topic: str) -> str:
     return topic
 
 
+def _apply_llm_mode_decision(topic: str) -> None:
+    """B64.1: ADR 自决渲染 mode (env ADR_MODE_DECIDER, 默认关 = 零回归)。
+    _llm_topic_decomposition.mode (ads/adsd/adr) → 改 mode 全局 + 重算整条派生链(label/lip_sync/storyboard_grid)。
+    手动 flag/env 显式传了就跳过(bot/power-user 优先), 防自决覆盖显式指定。LLM 失败/无效 mode → 保持现状(graceful)。
+    必须在 step1_script 读 CURRENT_MODE_WITH_ASPECT 之前调用。"""
+    global ADS_DIALOGUE_MODE, WITH_MOTION, NO_VOICE, ADSD_MODE_NAME
+    global CURRENT_MODE_LABEL, CURRENT_MODE_WITH_ASPECT, ADSD_STORYBOARD_GRID, ADSD_LIP_SYNC_EXPERIMENT
+    global STORYBOARD_GRID_MULTIREF_MOTION, STORYBOARD_GRID_MULTIREF_MAIN
+    global STORYBOARD_GRID_MULTIREF_SEGMENTS, GRID_MULTIREF_PRIMARY
+    if os.environ.get("ADR_MODE_DECIDER", "").strip().lower() not in ("1", "true", "yes", "on"):
+        return
+    manual_flags = ("--ads-dialogue", "--adsd", "--no-motion", "--bgm-only",
+                    "--no-tts", "--no-narration", "--no-voice")
+    # ADS_REPORTER_MODE 全局已聚合 --ads-reporter/--first-person-reporter/ADR_ADS_REPORTER(+ALLOW_ENV) 全别名 (codex Med)
+    if ADS_REPORTER_MODE or any(f in sys.argv for f in manual_flags) or \
+            any(os.environ.get(e, "").strip().lower() in ("1", "true", "yes", "on")
+                for e in ("ADR_ADS_DIALOGUE", "ADR_BGM_ONLY")):
+        log("B64 mode_decider: 检测到手动 mode flag/env(含 ads_reporter), 尊重显式指定, 跳过自决")
+        return
+    try:
+        mode = str((_llm_topic_decomposition(topic) or {}).get("mode", "")).strip().lower()
+    except Exception as e:
+        log(f"B64 mode_decider 调用失败, 保持现状: {e}")
+        return
+    if mode not in ("adr", "ads", "adsd"):
+        log(f"B64 mode_decider: 无效 mode={mode!r}, 保持现状")
+        return
+    # 改 base flags + 重算整条派生链 (严格对齐 L168/176/202/282/1036-1046 的模块级定义)
+    ADS_DIALOGUE_MODE = (mode == "adsd")
+    WITH_MOTION = (mode == "ads")
+    if not WITH_MOTION:  # B64/codex High: adr静态/adsd对话 不走 grid_multiref 动态主路径, 撤回模块初始化的预开
+        STORYBOARD_GRID_MULTIREF_MOTION = False
+        STORYBOARD_GRID_MULTIREF_MAIN = False
+        STORYBOARD_GRID_MULTIREF_SEGMENTS = False
+        GRID_MULTIREF_PRIMARY = False
+    NO_VOICE = BGM_ONLY_REQUESTED
+    ADSD_STORYBOARD_GRID = ADS_DIALOGUE_MODE and os.environ.get(
+        "ADR_ADSD_STORYBOARD_GRID", "1").strip().lower() not in ("0", "false", "no", "off")
+    ADSD_LIP_SYNC_EXPERIMENT = (
+        ADS_DIALOGUE_MODE
+        and "--no-lip-sync" not in sys.argv and "--no-adsd-lip-sync" not in sys.argv
+        and os.environ.get("ADR_ADSD_LIP_SYNC", "1").strip().lower() not in ("0", "false", "no", "off")
+    ) or "--adsd-lip-sync" in sys.argv or "--lip-sync" in sys.argv
+    ADSD_MODE_NAME = ("VADSD" if IS_VERTICAL else "HADSD") if ADS_DIALOGUE_MODE else ""
+    if ADS_DIALOGUE_MODE:
+        CURRENT_MODE_LABEL = ADSD_MODE_NAME
+    elif WITH_MOTION:
+        CURRENT_MODE_LABEL = "VADS" if IS_VERTICAL else "HADS"
+    else:
+        CURRENT_MODE_LABEL = "VADR" if IS_VERTICAL else "HADR"
+    CURRENT_MODE_WITH_ASPECT = f"{CURRENT_MODE_LABEL} {'9:16' if IS_VERTICAL else '16:9'}"
+    log(f"B64 mode_decider: ADR 自决 mode={mode} → {CURRENT_MODE_WITH_ASPECT}")
+    tg(f"🧭 ADR 自决 mode: {CURRENT_MODE_WITH_ASPECT} (mode={mode})")
+
+
 def step1_script(topic: str) -> list[dict]:
+    _apply_llm_mode_decision(topic)  # B64.1: 自决 mode (env ADR_MODE_DECIDER, 默认关), 必须在 fmt_label 前
     fmt_label = CURRENT_MODE_WITH_ASPECT  # B12.2: HADS/VADS/HADR/VADR/HADSD/VADSD
     # R2 阶段 C++ (2026-05-26): Hard Abort 高危题材
     # audit_risk_score >= 75 直接 raise, 不浪费 30min 跑废片
@@ -7755,7 +7811,7 @@ def _topic_cache_path(topic: str) -> Path:
 # v2: 2026-05-21 加 is_action_topic / action_density_hint / recommended_action_b_count
 # v3: 2026-05-25 加 director_style_route (PR-2)
 # v4: 2026-05-25 加 audit_risk_score (达尔文 R2 阶段 C)
-TOPIC_DECOMPOSITION_CACHE_VERSION = 4
+TOPIC_DECOMPOSITION_CACHE_VERSION = 5  # B64: 加 mode 字段, v4 cache 自动失效重推
 
 
 def _load_topic_decomposition_cache(topic: str) -> dict | None:
@@ -7931,6 +7987,17 @@ def _brief_get(brief: dict, field_path: str, default=None):
             return default
         cur = cur[seg]
     return cur
+
+
+def _brief_field(topic: str, field_path: str, fallback=None):
+    """B65.0: brief 单字段 read-through 访问器。按 topic 重载+校验 brief, 读 dotted path, 缺/None → fallback。
+    B65 '真融合' 的第一块地基: 让下游消费者从 brief 单一数据契约读, 但**永远带 fallback = 今天直接读 decomp 的那个值**,
+    永不静默丢数据。本身零行为变化 (无人调用); B65.1+ 才逐个把消费者迁过来 (各自 env-gated 默认关 + 保留 fallback)。"""
+    try:
+        val = _brief_get(_load_brief(topic), field_path, None)
+    except Exception:
+        return fallback
+    return fallback if val is None else val
 
 
 def _brief_set(brief: dict, field_path: str, value) -> bool:
@@ -8509,6 +8576,8 @@ def _llm_topic_decomposition(topic: str, use_cache: bool = True) -> dict:
   "director_style_route": "intimate_wuxia | imax_war_epic | saturated_folk | slow_poetic | gritty_kinetic | classical_realism | modern_documentary",
   "cover_art_direction": "封面美术方向 中文短语 (e.g. 极简金融感冷色调 / 史诗水墨卷轴)",
   "is_action_topic": false,
+  "mode": "ads | adsd | adr — B64自决: adsd=多人对话/访谈/辩论(双人+对白); ads=单旁白纪录片(默认,旁白讲述+动态画面); adr=极简静态(罕用). 绝大多数纪录片=ads",
+  "mode_reason": "一句中文理由说明为何选此 mode",
   "action_density_hint": "low",
   "recommended_action_b_count": 0,
   "audit_risk_score": 30,
