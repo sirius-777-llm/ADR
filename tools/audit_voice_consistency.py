@@ -44,7 +44,7 @@ FRAME = int(0.025 * SR)
 HOP = int(0.010 * SR)
 SILENCE_RMS = 0.005
 MIN_SECONDS = 0.5
-DEFAULT_T = 6.0          # 全局尺度下的"跨说话人"绝对距离阈值 (校准得出)
+DEFAULT_T = 6.5          # 全局尺度下的"跨说话人"绝对距离阈值 (校准: 同人NN p90=6.0, 两两 p75=6.16)
 
 # ---------- 特征提取 (向量化纯 numpy) ----------
 
@@ -122,7 +122,9 @@ def extract_features(x: np.ndarray) -> np.ndarray | None:
 # ---------- 单链聚类 (绝对阈值) ----------
 
 def _components(D: np.ndarray, t: float) -> list[list[int]]:
-    """距离 <t 即同簇 (单链/连通分量, union-find)。"""
+    """距离 <t 即同簇 (单链/连通分量, union-find)。
+    codex Med: 单链有链式合并风险 (A-B、B-C<t 但 A-C 远会并一簇); n≤4 时影响小, 且 audit_asset
+    的 confidence 用'到核心最近距离'二次度量缓解; 作为分诊筛查可接受 (彻底解需 embedding)。"""
     n = D.shape[0]
     parent = list(range(n))
     def find(a):
@@ -221,8 +223,14 @@ def asset_clip_paths(asset: dict) -> list[str]:
     out = []
     for r in (asset.get("reference_audios") or []):
         p = r.get("path") if isinstance(r, dict) else r
-        if p:
-            out.append(str(ROOT / p) if not os.path.isabs(p) else p)
+        if not p:
+            continue
+        rp = (Path(p) if os.path.isabs(p) else ROOT / p).resolve()
+        try:
+            rp.relative_to(ROOT)            # codex Med: registry 路径必须在 repo 内, 防读任意本地文件
+        except ValueError:
+            continue
+        out.append(str(rp))
     return out
 
 
@@ -262,7 +270,10 @@ def extract_all(targets) -> dict:
 
 
 def global_stats(feats_by_path: dict):
-    M = np.array([f for f in feats_by_path.values() if f is not None])
+    vals = [f for f in feats_by_path.values() if f is not None]
+    if not vals:                                     # codex High: 全坏/空目标防崩
+        return None, None, np.zeros((0, 0))
+    M = np.array(vals)
     med = np.median(M, axis=0)
     mad = np.median(np.abs(M - med), axis=0) * 1.4826
     scale = np.where(mad < 1e-6, M.std(0) + 1e-9, mad)
@@ -301,12 +312,16 @@ def main():
     ap.add_argument("--min-confidence", type=float, default=0.5)
     ap.add_argument("--include-verified", action="store_true")
     ap.add_argument("--md", action="store_true")
-    ap.add_argument("--apply", action="store_true")
+    ap.add_argument("--apply", action="store_true", help="(占位: review-code 通过后才启用高置信自动隔离; 当前仅报告)")
     args = ap.parse_args()
 
     targets = collect_targets(args)
+    if not targets:
+        print("没有匹配的 asset/目录。"); return 1
     feats = extract_all(targets)
     gmed, gscale, M = global_stats(feats)
+    if gmed is None:                                 # codex High: 全坏文件 → 无特征
+        print("所有 clip 解码/特征提取失败 (检查 ffmpeg 与文件)。"); return 1
 
     if args.calibrate:
         # 全库 within-asset nearest-neighbor 距离分布 (同说话人主导) + 全 pairwise
@@ -322,6 +337,8 @@ def main():
                 nn.append(min(D[i, j] for j in range(len(fs)) if j != i))
                 for j in range(i + 1, len(fs)):
                     allpair.append(D[i, j])
+        if not nn or not allpair:                    # codex High: 无足够多片对 → 防 percentile 崩
+            print("可校准的多片 asset 不足 (每 asset 需 ≥2 有效片)。"); return 1
         nn, allpair = np.array(nn), np.array(allpair)
         print(f"\n=== 全局校准 ({len(targets)} asset) ===")
         print(f"within-asset 最近邻距离 (同说话人主导): "

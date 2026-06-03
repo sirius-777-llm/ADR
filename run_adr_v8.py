@@ -1514,6 +1514,21 @@ def _is_rate_limited_response(resp: dict) -> bool:
     )
 
 
+def _is_transient_workflow_error(resp) -> bool:
+    """B76: 网关/工作流层瞬时错误 (status 6001 工作流系统异常). 跟 1001 限频区分 —
+    提交即时返回(~5s)且**没创建任务**, 重试可救. 普通单图靠外层 loop 熬, storyboard/封面无外层会漏,
+    故让 submit_text_to_image 对它也有限退避重试。"""
+    if isinstance(resp, Exception):
+        t = str(resp)
+        return any(s in t for s in ('"status": 6001', "'status': 6001",
+                                    '"status": 6002', "'status': 6002", "工作流系统异常"))
+    if not isinstance(resp, dict):
+        return False
+    if resp.get("status") in (6001, 6002):
+        return True
+    return "工作流系统异常" in json.dumps(resp, ensure_ascii=False)
+
+
 # B44 (2026-05-28): LLM 429 quota 识别 — 跟 image rate limit (1001) 区分.
 # Flash Lite 单 run 多次触发 'Resource has been exhausted (e.g. check quota)' status=429
 # (观沧海 4 run 实测). 通用 3s/6s 退避救不了 quota, 需要 30s/60s 退避 (attempt 0/1 sleep, attempt 2 不 sleep).
@@ -1583,11 +1598,17 @@ def submit_text_to_image(payload: dict, label: str, timeout: int = 45, max_attem
             if _is_rate_limited_response(resp):
                 log(f"{label} text-to-image submit 限频: {json.dumps(resp, ensure_ascii=False)[:180]}")
                 continue
+            if _is_transient_workflow_error(resp):  # B76: 6001/6002 网关瞬时, 退避重试 (没创建任务可救)
+                log(f"{label} text-to-image submit 网关瞬时错误(6001/6002), 退避重试: {json.dumps(resp, ensure_ascii=False)[:180]}")
+                continue
             return resp
         except Exception as e:
             last_err = e
             if _is_rate_limited_error(e):
                 log(f"{label} text-to-image submit 限频异常: {type(e).__name__}: {str(e)[:160]}")
+                continue
+            if _is_transient_workflow_error(e):  # B76: 6001/6002 抛成异常时同样重试
+                log(f"{label} text-to-image submit 网关瞬时异常(6001/6002), 退避重试: {type(e).__name__}: {str(e)[:160]}")
                 continue
             raise
     if last_resp is not None:
@@ -13668,10 +13689,14 @@ def _generate_grid_multiref_motion_segments(script: list[dict], motion_prompts: 
             _b62_1_ranges = _b62_1_ranges[:-1]
             _b62_1_ranges[-1] = (prev_start, len(refs))
             log(f"B62.1 末组合并: 末单 {tail_size} panel 合并到前组, 实际 {len(_b62_1_ranges)} group")
-    for group_no, (start, end) in enumerate(_b62_1_ranges, start=1):
+    # B79 (2026-06-03): 组级处理抽成 _run_grid_group, 串行(默认 workers=1)/有界并发共用一条路径。
+    # 并发时提交仍由 _wait_motion_submit_slot 全局节流(不撞 1001/504), 只有 poll 真并发 = 富内容提速核心。
+    _grid_qa_lock = threading.Lock()  # 保护 qa["records"] append + QA 文件写 (task-store 已自带 _grid_multiref_tasks_lock)
+
+    def _run_grid_group(group_no, start, end):
         group_pairs = refs[start:end]
         if len(group_pairs) < 2:
-            continue
+            return
         scene_indices = [i for i, _ in group_pairs]
         group = [scene for _, scene in group_pairs]
         record = {
@@ -13682,10 +13707,16 @@ def _generate_grid_multiref_motion_segments(script: list[dict], motion_prompts: 
             "image_paths": [scene.get("img_path") for scene in group],
             "pass": False,
         }
-        qa["records"].append(record)
+        def _finalize():
+            # B79/codex High: 完成后锁内一次性 append+写 QA; 处理中 record 线程局部(不在共享结构), 防半状态序列化竞态
+            with _grid_qa_lock:
+                if record not in qa["records"]:
+                    qa["records"].append(record)
+                _write_grid_multiref_motion_qa(qa)
         group_key = f"{scene_indices[0] + 1:02d}_{scene_indices[-1] + 1:02d}"
         try:
-            existing_tid = _load_grid_multiref_tasks().get(group_key)
+            with _grid_multiref_tasks_lock:  # B79/codex Med: 加锁读, 防并发写 task 文件时读到半文件 → resume 丢失
+                existing_tid = _load_grid_multiref_tasks().get(group_key)
             out_path = OUTPUT_DIR / f"grid_multiref_{group_key}.mp4"
             if existing_tid:
                 record.update({"task_id": existing_tid, "resumed_task": True})
@@ -13698,8 +13729,8 @@ def _generate_grid_multiref_motion_segments(script: list[dict], motion_prompts: 
                     tg(f"🧪 Grid multi-ref {record['scene_start']}-{record['scene_end']} ✓ (resumed)")
                 else:
                     tg(f"⚠️ Grid multi-ref {record['scene_start']}-{record['scene_end']} 未完成：{record.get('reason')}")
-                _write_grid_multiref_motion_qa(qa)
-                continue
+                _finalize()
+                return
             image_urls = ([sheet_url] if sheet_url else []) + [_upload_to_weryai(scene["img_path"]) for scene in group]
             duration = _grid_multiref_duration(group, total_panels=_b52_total_panels, tts_duration_buffered=_b52_tts_buffered)
             prompt = _grid_multiref_prompt(group, scene_indices[0], motion_prompts, has_character_sheet=bool(sheet_url))
@@ -13768,7 +13799,8 @@ def _generate_grid_multiref_motion_segments(script: list[dict], motion_prompts: 
             })
             if not task_id:
                 record.update({"reason": "submit_without_task_id", "response": r})
-                continue
+                _finalize()
+                return
             _save_grid_multiref_task(group_key, task_id)
             ok, info = _poll_video_task_download(task_id, out_path, f"grid multi-ref {group_no}")
             record.update(info)
@@ -13787,6 +13819,7 @@ def _generate_grid_multiref_motion_segments(script: list[dict], motion_prompts: 
                 tg(f"🔁 B40.3 Grid multi-ref {record['scene_start']}-{record['scene_end']} retry (60s 后)")
                 time.sleep(60)
                 try:
+                    _wait_motion_submit_slot(f"grid multi-ref {group_no} B40.3 retry")  # B79/codex Med: retry 也走全局提交节流
                     r2 = req_post("/generation/almighty-reference-to-video", payload, timeout=30)
                     task_id2 = r2.get("data", {}).get("task_id") or (r2.get("data", {}).get("task_ids") or [None])[0]
                     if task_id2:
@@ -13812,7 +13845,26 @@ def _generate_grid_multiref_motion_segments(script: list[dict], motion_prompts: 
         except Exception as e:
             record.update({"pass": False, "reason": str(e)})
             tg(f"⚠️ Grid multi-ref {record['scene_start']}-{record['scene_end']} 异常：{str(e)[:120]}")
-        _write_grid_multiref_motion_qa(qa)
+        _finalize()
+
+    # B79 驱动: 串行(workers=1, 行为同旧串行循环)或有界并发(workers>1, env ADR_MOTION_GROUP_WORKERS)
+    _grid_specs = list(enumerate(_b62_1_ranges, start=1))
+    try:
+        _grid_workers = max(1, int(os.environ.get("ADR_MOTION_GROUP_WORKERS", "1") or "1"))
+    except ValueError:                                # B79/codex Low: 非数字 env 回退串行
+        _grid_workers = 1
+    if _grid_workers > 1 and len(_grid_specs) > 1:
+        log(f"B79 并行 motion: {len(_grid_specs)} 组 × {_grid_workers} workers (提交全局节流, poll 并发)")
+        with ThreadPoolExecutor(max_workers=_grid_workers) as _ex:
+            _futs = [_ex.submit(_run_grid_group, gno, s, e) for gno, (s, e) in _grid_specs]
+            for _f in as_completed(_futs):
+                try:
+                    _f.result()
+                except Exception as _ge:
+                    log(f"B79 组线程异常(已隔离不阻断): {_ge}")
+    else:
+        for gno, (s, e) in _grid_specs:
+            _run_grid_group(gno, s, e)
 
     success_count = sum(1 for r in qa["records"] if r.get("pass"))
     qa.update({
@@ -18674,20 +18726,22 @@ def _generate_cover_image(topic: str, short_title: str, script: list[dict]) -> s
             cover_prompt = cut.rstrip() + ' No watermarks. Every Chinese character sharp and complete.'
             log(f"万年历封面 prompt 超长已截断：{len(cover_prompt)} 字符")
 
-    # 调 WeryAI text-to-image
+    # 调 WeryAI text-to-image — B76: 走 submit_text_to_image 包装器 (内置限频+6001瞬时退避重试),
+    # 不再裸 req_post. max_attempts=2 与 B39 worker 单次协调, 防双层 retry 叠爆. 包装器内部已做
+    # _wait_image_submit_slot + _inject_image2_quality_suffix, 故此处不再重复。
     try:
         _m, _ar, _extra = pick_image_model(aspect)
-        _wait_image_submit_slot("封面")
-        resp = req_post(
-            "/generation/text-to-image",
-            _inject_image2_quality_suffix({
+        resp = submit_text_to_image(
+            {
                 "model": _m,
                 "prompt": cover_prompt,
                 "aspect_ratio": _ar,
                 "image_number": 1,
                 **_extra,
-            }),
+            },
+            label="封面",
             timeout=30,
+            max_attempts=2,
         )
         data = resp.get("data", {})
         task_id = data.get("task_id") or (data.get("task_ids") or [None])[0]
@@ -18702,7 +18756,10 @@ def _generate_cover_image(topic: str, short_title: str, script: list[dict]) -> s
         return None
 
     # 封面图常比正片慢，实测可超过 220s；默认最多等 10 分钟，避免误判失败。
-    cover_timeout = int(os.environ.get("ADR_COVER_TIMEOUT", "600"))
+    try:                                            # B76 codex Low: 非整数 env 不该崩封面流程
+        cover_timeout = int(os.environ.get("ADR_COVER_TIMEOUT", "600"))
+    except ValueError:
+        cover_timeout = 600
     poll_interval = 5
     polls = max(1, cover_timeout // poll_interval)
     last_status_log = 0.0
@@ -18779,8 +18836,10 @@ def _async_kickoff_cover_caption(topic: str, script: list[dict]) -> None:
     """
     def _worker():
         # B39: caption 单独 try, 一次成功即缓存; cover_image 失败才 retry
-        max_attempts = 3  # 1 次初次 + 2 次 retry
-        backoffs = [15.0, 30.0]
+        # B76: submit 瞬时 6001 现由 submit_text_to_image 内部 2 次退避兜住, worker 这层 3→2
+        # (保留 1 次 generation 阶段失败重试), 防 worker×submit 双层 retry 叠爆 (上限 2×2=4 次提交)。
+        max_attempts = 2  # 1 次初次 + 1 次 retry
+        backoffs = [20.0]
         last_error: str | None = None
 
         # caption 阶段: 失败用兜底, 不阻 cover retry (step10 需要 caption 字段非 None)
@@ -19563,6 +19622,35 @@ def _print_execution_plan() -> None:
         log(line)
 
 
+def _write_run_timings(timings: dict, t_start: float, ok: bool = True) -> None:
+    """⏱ 落盘 run_timings.json — per-step 耗时 + 总计 + 30min 预算判定 (支撑'每次生成≤30min'目标)。
+    内容驱动铁律: 超 30min 只标记不中止 (长内容本就该长; wall-clock 由 B69.2 并行 chunk 路径压)。
+    env ADR_RENDER_BUDGET_MIN 可调预算 (默认 30)。成功/异常两路都落盘, 失败也留部分耗时供诊断。"""
+    try:
+        total_sec = time.time() - t_start
+        budget_sec = float(os.environ.get("ADR_RENDER_BUDGET_MIN", "30")) * 60
+        steps = {k: round(float(v), 1) for k, v in timings.items()}
+        dominant = max(steps.items(), key=lambda kv: kv[1]) if steps else ("", 0.0)
+        data = {
+            "ok": ok,
+            "total_seconds": round(total_sec, 1),
+            "total_minutes": round(total_sec / 60, 2),
+            "budget_minutes": round(budget_sec / 60, 1),
+            "over_budget": total_sec > budget_sec,
+            "dominant_step": dominant[0],
+            "dominant_step_minutes": round(dominant[1] / 60, 2),
+            "steps_seconds": steps,
+            "mode": globals().get("CURRENT_MODE_WITH_ASPECT", ""),
+        }
+        (OUTPUT_DIR / "run_timings.json").write_text(
+            json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        if data["over_budget"]:
+            log(f"⏱ 渲染 {data['total_minutes']:.1f}min 超 {budget_sec/60:.0f}min 预算 "
+                f"(主导步骤: {dominant[0]} {dominant[1]/60:.1f}min) — 内容驱动不中止, 长内容建议并行 chunk")
+    except Exception as e:
+        log(f"run_timings 落盘失败（不影响）：{e}")
+
+
 def main():
     topic = TOPIC
     log(f"开始处理：{topic}")
@@ -19695,13 +19783,17 @@ def main():
             log(f"Speaker IP 自学习回写失败（不影响）：{e}")
 
         total_min = (time.time() - t_start) / 60
+        _write_run_timings(timings, t_start, ok=True)
+        budget_min = float(os.environ.get("ADR_RENDER_BUDGET_MIN", "30"))
+        budget_tag = "✅ ≤预算" if total_min <= budget_min else f"⚠️ 超 {budget_min:.0f}min 预算(长内容/可并行)"
         summary = "\n".join(f"  {k}：{v/60:.1f} min" for k, v in timings.items())
-        tg(f"⏱ 耗时统计（总计 {total_min:.1f} min）\n\n{summary}")
+        tg(f"⏱ 耗时统计（总计 {total_min:.1f} min · {budget_tag}）\n\n{summary}")
 
     except Exception as e:
         import traceback
         err = traceback.format_exc()
         total_min = (time.time() - t_start) / 60
+        _write_run_timings(timings, t_start, ok=False)
         log(f"管线异常:\n{err}")
         tg(f"❌ ADR V8 管线异常（已运行 {total_min:.1f} min）\n节点：{e}\n\n详情已写入日志")
         sys.exit(1)
