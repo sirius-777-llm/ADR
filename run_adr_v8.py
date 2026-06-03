@@ -1816,7 +1816,7 @@ _LLM_TIER = {
     "producer":  "CLAUDE_4_6_OPUS",          # Tier 1 决策性创意 (制片人, 导演 jiangwen)
     "creative":  "GEMINI_25_FLASH",          # Tier 2 创意输出 (台词/分镜 prompt 等)
     "review":    "GEMINI_25_FLASH",          # Tier 3 审稿/规划 — B43 从 Flash Lite 迁出减压
-    "data":      "GEMINI_3_1_FLASH_LITE",    # Tier 4 数据/机械任务 (短文 JSON / 一行 rewrite / id 选择) — 待 B44 兜底
+    "data":      "GEMINI_25_FLASH",          # B80 (2026-06-03): GEMINI_3_1_FLASH_LITE 被 weryai 下线(status 1006 not model)→ 全改 25_FLASH(唯一可用 Flash, 非 thinking 顺带根除 B77 类 MAX_TOKENS). 原 Tier 4 数据/机械任务
 }
 
 
@@ -2997,7 +2997,7 @@ action_b    武戏 / 激烈对抗 / 突破冲击 镜头
     arr: list[dict] = []
     last_err = ""
     for attempt in range(2):
-        raw = chat("GEMINI_3_1_FLASH_LITE", "你只输出严格 JSON 数组。", _build_prompt(last_err), max_tokens=3000, timeout=180)
+        raw = chat("GEMINI_25_FLASH", "你只输出严格 JSON 数组。", _build_prompt(last_err), max_tokens=3000, timeout=180)
         try:
             arr = _extract_json_array(raw)
         except Exception as e:
@@ -3673,7 +3673,7 @@ def step1_script(topic: str) -> list[dict]:
 • 中性（人物传记、历史事件、科技发展、政治变革、文化现象）
 
 主题：{topic}"""
-    tone = chat("GEMINI_3_1_FLASH_LITE", "你是情感分析专家。", tone_prompt).strip()
+    tone = chat("GEMINI_25_FLASH", "你是情感分析专家。", tone_prompt).strip()
     if tone not in ("庄重", "轻松", "怀旧", "中性"):
         tone = "中性"
     log(f"题材基调判断：{tone}")
@@ -3723,7 +3723,7 @@ def step1_script(topic: str) -> list[dict]:
         log(f"外部脚本注入预设分镜数：{num_lines}")
     else:
         try:
-            plan_raw = chat("GEMINI_3_1_FLASH_LITE", "你是纪录片分镜规划师。", plan_prompt)
+            plan_raw = chat("GEMINI_25_FLASH", "你是纪录片分镜规划师。", plan_prompt)
             fence = re.search(r'```(?:\w*)\s*\n?([\s\S]*?)```', plan_raw)
             plan_clean = fence.group(1).strip() if fence else plan_raw.strip()
             plan = json.loads(re.search(r'\{[\s\S]+\}', plan_clean).group())
@@ -3933,7 +3933,7 @@ def step1_script(topic: str) -> list[dict]:
         if not ADS_DIALOGUE_MODE:
             lines = []
             for _try in range(3):
-                raw_lines = chat("GEMINI_3_1_FLASH_LITE", "你是纪录片旁白创作大师。", spielberg_prompt)
+                raw_lines = chat("GEMINI_25_FLASH", "你是纪录片旁白创作大师。", spielberg_prompt)
                 lines = [l.strip() for l in raw_lines.strip().splitlines() if l.strip()][:num_lines]
                 if len(lines) < num_lines:
                     log(f"斯皮尔伯格只生成了 {len(lines)} 句（需要 {num_lines} 句），重试...")
@@ -10573,7 +10573,7 @@ def _llm_bgm_description(topic: str, tone: str) -> str | None:
 
 直接输出英文描述（一行）："""
     try:
-        out = chat("GEMINI_3_1_FLASH_LITE", "你是纪录片配乐导演，精通电影配乐风格与乐器编排。", prompt, max_tokens=1000, timeout=45).strip()
+        out = chat("GEMINI_25_FLASH", "你是纪录片配乐导演，精通电影配乐风格与乐器编排。", prompt, max_tokens=1000, timeout=45).strip()
         out = out.strip('"').strip("'").strip()
         out = out.split('\n')[0].strip()
         word_count = len(out.split())
@@ -10791,6 +10791,26 @@ def _b68_clamp_scene_durations_to_werydance_bounds(script: list[dict], origin: s
                     }, ensure_ascii=False) + "\n")
         except Exception as e:
             log(f"[B68] audit 写入失败: {e}")
+        # B68.2 OBSERVE (env ADR_SPLIT_PLAN_OBSERVE, 默认关): 只记录拆合候选+不改 script, 攒生产分布数据给后续
+        # B-act(自动拆合)和 A(两段式规划)定型。越界的 clamp 即拆合候选: from>15→split(ceil(from/15)段), from<4→merge。
+        if os.environ.get("ADR_SPLIT_PLAN_OBSERVE", "").strip().lower() in ("1", "true", "yes", "on"):
+            recs = [
+                ({"i": c["i"], "dur": round(c["from"], 2), "action": "split",
+                  "segments": math.ceil(c["from"] / 15.0)} if c["bound"] == "upper"
+                 else {"i": c["i"], "dur": round(c["from"], 2), "action": "merge"})
+                for c in clamps
+            ]
+            log(f"[B68.2-OBSERVE] 拆合候选 {len(recs)} (origin={origin}): "
+                f"split {sum(1 for r in recs if r['action']=='split')} / merge {sum(1 for r in recs if r['action']=='merge')}")
+            try:
+                with _b68_dur_audit_lock:
+                    with open(_B68_DUR_AUDIT_PATH, "a", encoding="utf-8") as fh:
+                        fh.write(json.dumps({"ts": time.time(), "origin": origin,
+                                             "kind": "split_plan_observe",
+                                             "total_scenes": len(script), "recs": recs},
+                                            ensure_ascii=False) + "\n")
+            except Exception as e:
+                log(f"[B68.2-OBSERVE] audit 写入失败: {e}")
     return len(clamps)
 
 
