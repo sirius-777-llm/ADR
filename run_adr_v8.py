@@ -2388,8 +2388,12 @@ def _adsd_allows_media_role(topic: str) -> bool:
 def _adsd_role_candidates(topic: str) -> list[str]:
     # 阶段 3 (2026-05-21): 优先 LLM topic_decomposition role_candidates
     decomp = _llm_topic_decomposition(topic)
-    if decomp.get("role_candidates"):
-        roles = [str(r).strip() for r in decomp["role_candidates"] if str(r).strip()]
+    # B65.3: role_candidates 从 brief 单一契约读 (env ADR_BRIEF_READ_CHARACTERS 默认关, fallback=decomp)
+    _roles_src = (_brief_field(topic, "brief.characters.role_candidates", decomp.get("role_candidates"))
+                  if os.environ.get("ADR_BRIEF_READ_CHARACTERS", "").strip().lower() in ("1", "true", "yes", "on")
+                  else decomp.get("role_candidates"))
+    if _roles_src and isinstance(_roles_src, (list, tuple)):  # codex Med: 防 brief 写成字符串被按字符拆
+        roles = [str(r).strip() for r in _roles_src if str(r).strip()]
         if len(roles) >= 3:
             return roles[:6]
     # Fallback 现有硬编码关键词分支
@@ -3545,7 +3549,7 @@ def _apply_render_budget_scene_cap(num_lines: int) -> int:
         return num_lines
     try:
         budget_min = float(os.environ.get("ADR_RENDER_BUDGET_MIN", "30"))
-        per_scene_min = float(os.environ.get("ADR_PER_SCENE_RENDER_MIN", "2.5"))
+        per_scene_min = float(os.environ.get("ADR_PER_SCENE_RENDER_MIN", "3.0"))  # 实测 8镜=30.0min(~2.9/镜)→ 3.0 留余量稳进预算
         overhead_min = float(os.environ.get("ADR_RENDER_OVERHEAD_MIN", "8"))
         if not (math.isfinite(budget_min) and math.isfinite(per_scene_min)
                 and math.isfinite(overhead_min) and per_scene_min > 0):
@@ -4112,7 +4116,12 @@ THUMBNAIL_ANCHOR: Air Force One stairs, black leather jacket figure, glowing chi
 
     # PR-2 (2026-05-25) 题材路由：从 topic_decomposition 拿 director_style_route
     _decomp_for_director = _llm_topic_decomposition(topic) or {}
-    _director_route = (_decomp_for_director.get("director_style_route") or "modern_documentary").strip().lower()
+    # B65.2: director_route 从 brief 单一契约读 (env ADR_BRIEF_READ_VISUAL 默认关, fallback=decomp 永不丢数据)
+    if os.environ.get("ADR_BRIEF_READ_VISUAL", "").strip().lower() in ("1", "true", "yes", "on"):
+        _director_route = str(_brief_field(topic, "brief.visual.director_route",
+            _decomp_for_director.get("director_style_route") or "modern_documentary") or "modern_documentary").strip().lower()
+    else:
+        _director_route = (_decomp_for_director.get("director_style_route") or "modern_documentary").strip().lower()
     director_route_block = _director_route_block(_director_route)
     log(f"PR-2 导演路由: topic={topic[:30]} → route={_director_route}")
 
@@ -8027,7 +8036,7 @@ def _brief_field(topic: str, field_path: str, fallback=None):
         val = _brief_get(_load_brief(topic), field_path, None)
     except Exception:
         return fallback
-    return fallback if val is None else val
+    return fallback if not val else val  # B65/codex High: 空(None/""/[])也回退, 防 brief 空字段覆盖 decomp 真值
 
 
 def _brief_set(brief: dict, field_path: str, value) -> bool:
@@ -10622,7 +10631,13 @@ def generate_bgm(topic: str, tone: str = "中性") -> str | None:
     # 阶段 2 (2026-05-21): 优先用 topic_decomposition LLM 推断的 bgm_style + instruments + mood
     decomposition = _llm_topic_decomposition(topic)
     if decomposition.get("bgm_style_label") and decomposition.get("bgm_instruments"):
-        style = decomposition["bgm_style_label"]
+        # B65.1 (2026-06-03): 真融合第一迁 — bgm_style 从 brief 单一契约读 (env ADR_BRIEF_READ_AUDIO 默认关).
+        # 永远 fallback=decomp 原值 (brief.audio.bgm_style 由 _brief_from_topic_decomposition 镜像同值,
+        # 故 on/off 结果应一致), 永不静默丢数据。叶子+非结构+失败仅乐器集不同, 最安全的首迁验证点。
+        if os.environ.get("ADR_BRIEF_READ_AUDIO", "").strip().lower() in ("1", "true", "yes", "on"):
+            style = str(_brief_field(topic, "brief.audio.bgm_style", decomposition["bgm_style_label"]))  # codex Low: 保证 str 防 .replace 崩
+        else:
+            style = decomposition["bgm_style_label"]
         instruments = decomposition.get("bgm_instruments") or []
         mood = decomposition.get("bgm_mood") or ""
         era = decomposition.get("era", "")
