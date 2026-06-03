@@ -3534,6 +3534,31 @@ def _maybe_neutralize_topic(topic: str) -> str:
     return topic
 
 
+def _apply_render_budget_scene_cap(num_lines: int) -> int:
+    """B79.1: 渲染预算感知 scene cap (env ADR_RENDER_BUDGET_SCENE_CAP, 默认关 = 尊重内容驱动铁律)。
+    **关键诊断**: step65_motion 已 20 路并发(ThreadPoolExecutor max_workers=min(20,n)), 64.7min/20镜
+    不是串行造成的, 是 weryai 渲染吞吐硬限(实测~3.2min/镜, 服务端排队)→ 再并行无用。
+    减 render 数是唯一 ADR 侧能**保证** ≤30min 的杠杆。开启 → 按预算 cap 分镜(更短但保时长)。
+    env: ADR_RENDER_BUDGET_MIN(默认30) · ADR_PER_SCENE_RENDER_MIN(默认3.2) · ADR_RENDER_OVERHEAD_MIN(默认8, 非motion步骤)。"""
+    if os.environ.get("ADR_RENDER_BUDGET_SCENE_CAP", "").strip().lower() not in ("1", "true", "yes", "on"):
+        return num_lines
+    try:
+        budget_min = float(os.environ.get("ADR_RENDER_BUDGET_MIN", "30"))
+        per_scene_min = float(os.environ.get("ADR_PER_SCENE_RENDER_MIN", "3.2"))
+        overhead_min = float(os.environ.get("ADR_RENDER_OVERHEAD_MIN", "8"))
+        if not (math.isfinite(budget_min) and math.isfinite(per_scene_min) and per_scene_min > 0):
+            return num_lines
+        budget_scenes = max(6, int((budget_min - overhead_min) / per_scene_min))
+        if num_lines > budget_scenes:
+            log(f"B79.1 渲染预算 cap: {num_lines}→{budget_scenes} 镜 "
+                f"(预算 {budget_min:.0f}min, ~{per_scene_min}min/镜 weryai 吞吐限, overhead {overhead_min:.0f}min)")
+            tg(f"⏱ 渲染预算 cap: 分镜 {num_lines}→{budget_scenes} (保 ≤{budget_min:.0f}min, 牺牲部分丰富度)")
+            return budget_scenes
+    except Exception as e:
+        log(f"B79.1 预算 cap 解析失败, 不 cap: {e}")
+    return num_lines
+
+
 def _apply_llm_mode_decision(topic: str) -> None:
     """B64.1: ADR 自决渲染 mode (env ADR_MODE_DECIDER, 默认关 = 零回归)。
     _llm_topic_decomposition.mode (ads/adsd/adr) → 改 mode 全局 + 重算整条派生链(label/lip_sync/storyboard_grid)。
@@ -3698,6 +3723,7 @@ def step1_script(topic: str) -> list[dict]:
             plan = json.loads(re.search(r'\{[\s\S]+\}', plan_clean).group())
             # B68 (2026-05-30): 18→30 cap 抬升, 配合 B69 chunk concat 达 4-5min 长视频目标
             num_lines = max(6, min(30, int(plan["count"])))
+            num_lines = _apply_render_budget_scene_cap(num_lines)  # B79.1: env-gated ≤30min 预算 cap (默认关)
             log(f"LLM 规划分镜数：{num_lines}（理由：{plan.get('reason', '')}）")
         except:
             # B68: fallback 抬升 — almanac 24 (后面被强制覆盖 22), 非 almanac 9→12 (配 cap 30 中间保守值)
