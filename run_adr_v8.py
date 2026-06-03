@@ -10679,7 +10679,7 @@ def generate_bgm(topic: str, tone: str = "中性") -> str | None:
         mood = decomposition.get("bgm_mood") or ""
         era = decomposition.get("era", "")
         bgm_desc = (
-            f"{style.replace('_', ' ')} soundtrack for '{topic}'. "
+            f"{style.replace('_', ' ')} soundtrack. "
             f"Era/style anchor: {era}. "
             f"Featured instruments: {', '.join(instruments)}. "
             f"Mood: {mood}. "
@@ -10695,38 +10695,39 @@ def generate_bgm(topic: str, tone: str = "中性") -> str | None:
             bgm_desc = f"{llm_desc}{SUFFIX}"
             log(f"BGM 描述: LLM ({len(llm_desc.split())} 词) → {llm_desc[:120]}...")
         elif tone == "轻松":
-            bgm_desc = f"Cheerful upbeat children's background music for '{topic}', ukulele marimba glockenspiel whistle claps, warm playful hopeful mood, light and bouncy, family-friendly, starting directly at peak energy with minimal intro, no vocals"
+            bgm_desc = f"Cheerful upbeat children's background music, ukulele marimba glockenspiel whistle claps, warm playful hopeful mood, light and bouncy, family-friendly, starting directly at peak energy with minimal intro, no vocals"
         elif tone == "怀旧":
-            bgm_desc = f"Nostalgic warm instrumental soundtrack for '{topic}', solo piano and harmonica and accordion and music box, slow waltz tempo, sentimental tender mood, like memories of 1980s China, starting directly at peak energy with minimal intro, no vocals"
+            bgm_desc = f"Nostalgic warm instrumental soundtrack, solo piano and harmonica and accordion and music box, slow waltz tempo, sentimental tender mood, like memories of 1980s China, starting directly at peak energy with minimal intro, no vocals"
         elif tone == "庄重":
-            bgm_desc = f"Solemn reflective documentary soundtrack for '{topic}', slow strings and piano, restrained reverent atmosphere, starting directly at peak energy with minimal intro, no vocals"
+            bgm_desc = f"Solemn reflective documentary soundtrack, slow strings and piano, restrained reverent atmosphere, starting directly at peak energy with minimal intro, no vocals"
         else:  # 中性 → 按主题关键词细分
             if is_1919_global_topic(topic):
                 bgm_desc = (
-                    f"Restrained post World War I 1919 historical documentary score for '{topic}', "
+                    f"Restrained post World War I 1919 historical documentary score, "
                     "low strings, muted piano, distant military snare, newspaper-press rhythm, cold archival atmosphere, "
                     "grave but not triumphant, no guzheng, no erhu, no festive Chinese folk instruments, no heroic propaganda march, "
                     "starting directly with a tense pulse and minimal intro, no vocals"
                 )
                 log("BGM 细分: 1919战后民族觉醒")
             elif any(k in topic for k in ("航天", "太空", "卫星", "火箭", "东方红", "神舟", "嫦娥", "北斗", "天宫", "宇宙", "星辰")):
-                bgm_desc = f"Heroic epic orchestral soundtrack for '{topic}', grand strings brass choir and timpani, triumphant uplifting mood, space exploration cinematic like Interstellar and Apollo, starting directly at peak energy with minimal intro, no vocals"
+                bgm_desc = f"Heroic epic orchestral soundtrack, grand strings brass choir and timpani, triumphant uplifting mood, space exploration cinematic like Interstellar and Apollo, starting directly at peak energy with minimal intro, no vocals"
                 log("BGM 细分: 航天史诗")
             elif any(k in topic for k in ("AI", "人工智能", "科技", "互联网", "算法", "机器人", "智能")):
-                bgm_desc = f"Modern cinematic electronic soundtrack for '{topic}', synth pad deep bass subtle percussion, futuristic thoughtful mood, tech documentary style, starting directly at peak energy with minimal intro, no vocals"
+                bgm_desc = f"Modern cinematic electronic soundtrack, synth pad deep bass subtle percussion, futuristic thoughtful mood, tech documentary style, starting directly at peak energy with minimal intro, no vocals"
                 log("BGM 细分: 科技未来")
             elif any(k in topic for k in ("读书", "书单", "书香", "文学", "文化", "诗词", "典籍", "阅读")):
-                bgm_desc = f"Gentle contemplative piano soundtrack for '{topic}', solo piano with soft violin strings, bookish quiet reflective mood, literary documentary style, starting directly at peak energy with minimal intro, no vocals"
+                bgm_desc = f"Gentle contemplative piano soundtrack, solo piano with soft violin strings, bookish quiet reflective mood, literary documentary style, starting directly at peak energy with minimal intro, no vocals"
                 log("BGM 细分: 文学书香")
             elif any(k in topic for k in ("历史", "朝代", "古代", "千年", "诞辰", "周年", "纪念")):
-                bgm_desc = f"Warm cinematic historical soundtrack for '{topic}', piano strings and subtle Chinese elements, reflective dignified mood, history documentary style, starting directly at peak energy with minimal intro, no vocals"
+                bgm_desc = f"Warm cinematic historical soundtrack, piano strings and subtle Chinese elements, reflective dignified mood, history documentary style, starting directly at peak energy with minimal intro, no vocals"
                 log("BGM 细分: 历史纪录")
             elif any(k in topic for k in ("美食", "旅行", "民俗", "节日", "风物")):
-                bgm_desc = f"Upbeat acoustic soundtrack for '{topic}', acoustic guitar soft percussion, cheerful warm mood, lifestyle documentary, starting directly at peak energy with minimal intro, no vocals"
+                bgm_desc = f"Upbeat acoustic soundtrack, acoustic guitar soft percussion, cheerful warm mood, lifestyle documentary, starting directly at peak energy with minimal intro, no vocals"
                 log("BGM 细分: 生活风物")
             else:
-                bgm_desc = f"Gentle contemplative Chinese documentary soundtrack for '{topic}', erhu guzheng pipa soft strings, calm thoughtful atmosphere, starting directly at peak energy with minimal intro, no vocals"
+                bgm_desc = f"Gentle contemplative Chinese documentary soundtrack, erhu guzheng pipa soft strings, calm thoughtful atmosphere, starting directly at peak energy with minimal intro, no vocals"
                 log("BGM 细分: 默认传统纪录")
+    _bgm_generic_switched = False  # B83.1: 是否已切纯净 generic prompt (防重复切)
     for attempt in range(1, MAX_BGM_RETRY + 1):
         try:
             log(f"BGM 生成尝试 {attempt}/{MAX_BGM_RETRY}（tone={tone}）")
@@ -10736,6 +10737,18 @@ def generate_bgm(topic: str, tone: str = "中性") -> str | None:
             }, timeout=30)
             if not r.get("success") and r.get("status", 1) != 0:
                 log(f"BGM 提交失败: {r}")
+                # B83.1: 1002 敏感内容 → 当前 desc 撞音乐接口审核, 切到纯净 generic prompt(零题材词, 按 tone)重试,
+                # 防同一敏感 desc 死循环 3 次。覆盖所有 desc 来源(含 _llm_bgm_description LLM 路径可能复带敏感词)。
+                _rtext = json.dumps(r, ensure_ascii=False)
+                if not _bgm_generic_switched and ("1002" in _rtext or "敏感" in _rtext):
+                    bgm_desc = {
+                        "轻松": "Upbeat cheerful instrumental, ukulele marimba light percussion, playful warm mood",
+                        "庄重": "Solemn slow instrumental, soft strings and piano, restrained reverent mood",
+                        "怀旧": "Nostalgic warm instrumental, solo piano harmonica music box, gentle sentimental mood",
+                        "诗词古文": "Elegant traditional Chinese instrumental, guzheng erhu bamboo flute, serene poetic mood",
+                    }.get(tone, "Gentle cinematic instrumental, soft piano and strings, calm neutral mood") + SUFFIX
+                    _bgm_generic_switched = True
+                    log("BGM B83.1: 撞敏感审核(1002), 切纯净 generic prompt 重试")
                 continue
             data = poll(r["data"]["task_id"], "BGM")
             bgm_url = (data.get("audios") or [None])[0]

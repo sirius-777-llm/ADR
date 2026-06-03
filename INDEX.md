@@ -1,6 +1,6 @@
 # ADR Code Index
 
-Auto-generated. Source: `run_adr_v8.py` (19974 lines). Regenerate: `python3 tools/generate_index.py`.
+Auto-generated. Source: `run_adr_v8.py` (19987 lines). Regenerate: `python3 tools/generate_index.py`.
 
 ## Sections
 
@@ -9,13 +9,13 @@ Auto-generated. Source: `run_adr_v8.py` (19974 lines). Regenerate: `python3 tool
 - [`第一步：双导演生成剧本`](#第一步-双导演生成剧本) — L2293-4912 (2620 lines · 33 fn · 1 sub)
 - [`第二步：逐句生成音轨（WeryAI Podcast，线程池并发）`](#第二步-逐句生成音轨-weryai-podcast-线程池并发) — L4913-6044 (1132 lines · 20 fn · 0 sub)
 - [`第三步 + 第四步 + 第五步：时间轴计算（Whisper + 同步优先剪辑节奏）`](#第三步---第四步---第五步-时间轴计算-whisper---同步优先剪辑节奏) — L6045-6596 (552 lines · 9 fn · 4 sub)
-- [`第六步：并行生成图片 + BGM + 视频片段`](#第六步-并行生成图片---bgm---视频片段) — L6597-11185 (4589 lines · 103 fn · 7 sub)
-- [`第 6.5 步：动态化（HADS/VADS 默认 ON，--no-motion 关）`](#第-6-5-步-动态化-hads-vads-默认-on---no-motion-关) — L11186-16373 (5188 lines · 109 fn · 5 sub)
-- [`第七步：拼接视频轨`](#第七步-拼接视频轨) — L16374-16633 (260 lines · 1 fn · 0 sub)
-- [`第八步：生成 ASS 字幕`](#第八步-生成-ass-字幕) — L16634-17592 (959 lines · 10 fn · 1 sub)
-- [`第九步：最终合成`](#第九步-最终合成) — L17593-17883 (291 lines · 1 fn · 0 sub)
-- [`第十步：推送 Telegram`](#第十步-推送-telegram) — L17884-19746 (1863 lines · 19 fn · 6 sub)
-- [`主流程`](#主流程) — L19747-19974 (228 lines · 3 fn · 0 sub)
+- [`第六步：并行生成图片 + BGM + 视频片段`](#第六步-并行生成图片---bgm---视频片段) — L6597-11198 (4602 lines · 103 fn · 7 sub)
+- [`第 6.5 步：动态化（HADS/VADS 默认 ON，--no-motion 关）`](#第-6-5-步-动态化-hads-vads-默认-on---no-motion-关) — L11199-16386 (5188 lines · 109 fn · 5 sub)
+- [`第七步：拼接视频轨`](#第七步-拼接视频轨) — L16387-16646 (260 lines · 1 fn · 0 sub)
+- [`第八步：生成 ASS 字幕`](#第八步-生成-ass-字幕) — L16647-17605 (959 lines · 10 fn · 1 sub)
+- [`第九步：最终合成`](#第九步-最终合成) — L17606-17896 (291 lines · 1 fn · 0 sub)
+- [`第十步：推送 Telegram`](#第十步-推送-telegram) — L17897-19759 (1863 lines · 19 fn · 6 sub)
+- [`主流程`](#主流程) — L19760-19987 (228 lines · 3 fn · 0 sub)
 
 ---
 
@@ -266,16 +266,16 @@ Range: **L6045 – L6596** (552 lines)
 ---
 
 ### 第六步：并行生成图片 + BGM + 视频片段
-Range: **L6597 – L11185** (4589 lines)
+Range: **L6597 – L11198** (4602 lines)
 
 **Sub-sections:**
 - _人设符 PR (2026-05-20)_ — L7819-7869 (51 lines)
 - _topic-level LLM decomposition + cache (2026-05-21)_ — L7870-8718 (849 lines)
 - _era-aware meta_grid 模板系统 (2026-05-21)_ — L8719-9153 (435 lines)
-- _Speaker IP Card (2026-05-21)_ — L9154-10785 (1632 lines)
-- _B68 (2026-05-30) WERYDANCE 段长合规 gate_ — L10786-11018 (233 lines)
-- _审批流程_ — L11019-11075 (57 lines)
-- _并行等待审批结果，被拒的后台重做再审_ — L11076-11185 (110 lines)
+- _Speaker IP Card (2026-05-21)_ — L9154-10798 (1645 lines)
+- _B68 (2026-05-30) WERYDANCE 段长合规 gate_ — L10799-11031 (233 lines)
+- _审批流程_ — L11032-11088 (57 lines)
+- _并行等待审批结果，被拒的后台重做再审_ — L11089-11198 (110 lines)
 
 **Top-level constants:**
 - `_CORE_TERMS_STOP_WORDS` — L6992
@@ -390,222 +390,222 @@ Range: **L6597 – L11185** (4589 lines)
 - `_llm_bgm_description` — L10590
 - `_bgm_contains_vocals` — L10629
 - `generate_bgm` — L10663
-- `_b68_clamp_scene_durations_to_werydance_bounds` — L10794
-- `step6_parallel` — L10854
+- `_b68_clamp_scene_durations_to_werydance_bounds` — L10807
+- `step6_parallel` — L10867
 
 ---
 
 ### 第 6.5 步：动态化（HADS/VADS 默认 ON，--no-motion 关）
-Range: **L11186 – L16373** (5188 lines)
+Range: **L11199 – L16386** (5188 lines)
 
 **Sub-sections:**
-- _PR-A (2026-05-27): merged_a 合并跑 helpers_ — L14514-16108 (1595 lines)
-- _pipeline state 持久化：让 tools/rerun_downstream.py 跳过 step1-66 局部重跑下游_ — L16109-16151 (43 lines)
-- _audio_dub retiming：按 seg 真实长度重算 timeline，避免克隆语音被截_ — L16152-16189 (38 lines)
-- _audio_dub voice-clone splice：把 A-roll seg 里的克隆音色拼回时间轴锚定音轨_ — L16190-16328 (139 lines)
-- _silent_b BGM 动态浮起：silent_b 区间 BGM 音量 +40%（让 BGM 接管呼吸位）_ — L16329-16373 (45 lines)
+- _PR-A (2026-05-27): merged_a 合并跑 helpers_ — L14527-16121 (1595 lines)
+- _pipeline state 持久化：让 tools/rerun_downstream.py 跳过 step1-66 局部重跑下游_ — L16122-16164 (43 lines)
+- _audio_dub retiming：按 seg 真实长度重算 timeline，避免克隆语音被截_ — L16165-16202 (38 lines)
+- _audio_dub voice-clone splice：把 A-roll seg 里的克隆音色拼回时间轴锚定音轨_ — L16203-16341 (139 lines)
+- _silent_b BGM 动态浮起：silent_b 区间 BGM 音量 +40%（让 BGM 接管呼吸位）_ — L16342-16386 (45 lines)
 
 **Top-level constants:**
-- `_PR3B1_SHOT_TYPE_ENUM` — L11656
-- `_PR3B1_CAMERA_ANGLE_ENUM` — L11660
-- `_PR3B1_LIGHTING_ENUM` — L11665
-- `_PR3B1_CAMERA_MOTION_ENUM` — L11670
-- `_EMOTION_NARRATION_STYLE_MAP` — L12722
+- `_PR3B1_SHOT_TYPE_ENUM` — L11669
+- `_PR3B1_CAMERA_ANGLE_ENUM` — L11673
+- `_PR3B1_LIGHTING_ENUM` — L11678
+- `_PR3B1_CAMERA_MOTION_ENUM` — L11683
+- `_EMOTION_NARRATION_STYLE_MAP` — L12735
 
 **Functions:**
-- `_generate_motion_prompts` — L11189
-- `_motion_tasks_file` — L11256
-- `_motion_qa_file` — L11260
-- `_append_motion_qa` — L11264
-- `_finalize_motion_qa` — L11288
-- `_lip_sync_tasks_file` — L11372
-- `_load_motion_tasks` — L11376
-- `_save_motion_task` — L11386
-- `_remove_motion_task` — L11394
-- `_load_lip_sync_tasks` — L11401
-- `_save_lip_sync_task` — L11411
-- `_remove_lip_sync_task` — L11418
-- `_video_visual_motion_qa` — L11425
-- `_motion_output_qa` — L11497
-- `_has_audio_stream` — L11542
-- `_normalize_motion_video` — L11553
-- `_motion_poll_and_download` — L11603
-- `_validate_enum_field` — L11676
-- `_build_motion_video_prompt` — L11691
-- `_short_board_text` — L11741
-- `_wrap_board_text` — L11748
-- `_storyboard_font` — L11779
-- `_draw_storyboard_arrow` — L11794
-- `_build_annotated_storyboard_reference` — L11808
-- `_plain_caption_text` — L11909
-- `_werydance_caption_request` — L11917
-- `_werydance_caption_instruction` — L11944
-- `_werydance_negative_prompt` — L11956
-- `_motion_reference_prompt` — L11974
-- `_motion_audio_dub_prompt` — L11997
-- `_motion_audio_dub_poll_and_download` — L12031
-- `_try_motion_audio_dub_video` — L12096
-- `_try_motion_reference_video` — L12259
-- `_motion_one_scene` — L12375
-- `_grid_multiref_tasks_file` — L12505
-- `_previs_page_tasks_file` — L12509
-- `_load_grid_multiref_tasks` — L12513
-- `_load_previs_page_tasks` — L12523
-- `_save_grid_multiref_task` — L12533
-- `_save_previs_page_task` — L12540
-- `_remove_grid_multiref_task` — L12547
-- `_remove_previs_page_task` — L12554
-- `_poll_video_task_download` — L12561
-- `_grid_multiref_group_size` — L12610
-- `_grid_multiref_adaptive_group_size` — L12620
-- `_grid_multiref_duration` — L12644
-- `_grid_multiref_tts_buffer_factor` — L12682
-- `_grid_multiref_tts_duration_buffered` — L12696
-- `_grid_multiref_segment_max_stretch` — L12712
-- `_voice_clone_emotion_style` — L12746
-- `_grid_multiref_prompt` — L12769
-- `_write_grid_multiref_motion_qa` — L12843
-- `_write_previs_page_motion_qa` — L12853
-- `_write_storyboard_trailer_qa` — L12863
-- `_write_character_trailer_qa` — L12873
-- `_write_grid_multiref_segment_qa` — L12883
-- `_motion_compare_record` — L12893
-- `_write_storyboard_motion_compare_qa` — L12915
-- `_scene_segment_duration` — L12951
-- `_apply_grid_multiref_segments` — L12970
-- `_previs_page_duration` — L13175
-- `_previs_page_group_prompt` — L13186
-- `_previs_page_groups` — L13212
-- `_storyboard_trailer_duration` — L13227
-- `_storyboard_trailer_prompt` — L13237
-- `_character_trailer_max_shots` — L13265
-- `_character_trailer_shot_duration` — L13273
-- `_character_trailer_prompt` — L13289
-- `_concat_character_trailer_segments` — L13304
-- `_generate_character_trailer_motion` — L13343
-- `_multi_trailer_prompt_for_group` — L13451
-- `_generate_multi_trailer_segments` — L13474
-- `_generate_storyboard_trailer_motion` — L13585
-- `_generate_previs_page_motion_segments` — L13660
-- `_generate_grid_multiref_motion_segments` — L13772
-- `_grid_multiref_concat_groups` — L14082
-- `_grid_multiref_concat_groups_partial` — L14099
-- `_grid_multiref_concat_paths` — L14117
-- `_lip_sync_slot_duration` — L14159
-- `_adsd_lip_sync_prompt` — L14166
-- `_adsd_broll_motion_prompt` — L14212
-- `_adsd_action_b_motion_prompt` — L14254
-- `_adsd_silent_b_motion_prompt` — L14300
-- `_adsd_narrated_b_audio_dub_prompt` — L14335
-- `_adsd_almighty_audio_dub_prompt` — L14379
-- `_postprocess_lip_sync_segment` — L14420
-- `_detect_audio_leading_silence` — L14492
-- `_concat_audio_files_for_group` — L14517
-- `_split_lip_sync_raw_by_durations` — L14540
-- `_postprocess_audio_dub_segment` — L14575
-- `_lips_change_repair_segment` — L14703
-- `_load_lips_change_requested_turns` — L14788
-- `_parse_turn_set` — L14805
-- `_load_motion_voice_repair_turns` — L14827
-- `_voice_assets_file` — L14839
-- `_load_voice_assets` — L14846
-- `_build_combined_voice_reference` — L14865
-- `_select_voice_asset_reference` — L14907
-- `_lip_sync_poll_download_and_process` — L14983
-- `_lip_sync_one_group` — L15051
-- `_lip_sync_one_scene` — L15259
-- `step66_adsd_lip_sync` — L15583
-- `step65_motion` — L15928
-- `step65_grid_multiref_motion_qa` — L16081
-- `_sanitize_scene_for_state` — L16110
-- `_save_pipeline_state` — L16129
-- `_retime_after_audio_dub` — L16153
-- `_build_voice_clone_hybrid_audio` — L16191
-- `_build_dynamic_bgm` — L16330
+- `_generate_motion_prompts` — L11202
+- `_motion_tasks_file` — L11269
+- `_motion_qa_file` — L11273
+- `_append_motion_qa` — L11277
+- `_finalize_motion_qa` — L11301
+- `_lip_sync_tasks_file` — L11385
+- `_load_motion_tasks` — L11389
+- `_save_motion_task` — L11399
+- `_remove_motion_task` — L11407
+- `_load_lip_sync_tasks` — L11414
+- `_save_lip_sync_task` — L11424
+- `_remove_lip_sync_task` — L11431
+- `_video_visual_motion_qa` — L11438
+- `_motion_output_qa` — L11510
+- `_has_audio_stream` — L11555
+- `_normalize_motion_video` — L11566
+- `_motion_poll_and_download` — L11616
+- `_validate_enum_field` — L11689
+- `_build_motion_video_prompt` — L11704
+- `_short_board_text` — L11754
+- `_wrap_board_text` — L11761
+- `_storyboard_font` — L11792
+- `_draw_storyboard_arrow` — L11807
+- `_build_annotated_storyboard_reference` — L11821
+- `_plain_caption_text` — L11922
+- `_werydance_caption_request` — L11930
+- `_werydance_caption_instruction` — L11957
+- `_werydance_negative_prompt` — L11969
+- `_motion_reference_prompt` — L11987
+- `_motion_audio_dub_prompt` — L12010
+- `_motion_audio_dub_poll_and_download` — L12044
+- `_try_motion_audio_dub_video` — L12109
+- `_try_motion_reference_video` — L12272
+- `_motion_one_scene` — L12388
+- `_grid_multiref_tasks_file` — L12518
+- `_previs_page_tasks_file` — L12522
+- `_load_grid_multiref_tasks` — L12526
+- `_load_previs_page_tasks` — L12536
+- `_save_grid_multiref_task` — L12546
+- `_save_previs_page_task` — L12553
+- `_remove_grid_multiref_task` — L12560
+- `_remove_previs_page_task` — L12567
+- `_poll_video_task_download` — L12574
+- `_grid_multiref_group_size` — L12623
+- `_grid_multiref_adaptive_group_size` — L12633
+- `_grid_multiref_duration` — L12657
+- `_grid_multiref_tts_buffer_factor` — L12695
+- `_grid_multiref_tts_duration_buffered` — L12709
+- `_grid_multiref_segment_max_stretch` — L12725
+- `_voice_clone_emotion_style` — L12759
+- `_grid_multiref_prompt` — L12782
+- `_write_grid_multiref_motion_qa` — L12856
+- `_write_previs_page_motion_qa` — L12866
+- `_write_storyboard_trailer_qa` — L12876
+- `_write_character_trailer_qa` — L12886
+- `_write_grid_multiref_segment_qa` — L12896
+- `_motion_compare_record` — L12906
+- `_write_storyboard_motion_compare_qa` — L12928
+- `_scene_segment_duration` — L12964
+- `_apply_grid_multiref_segments` — L12983
+- `_previs_page_duration` — L13188
+- `_previs_page_group_prompt` — L13199
+- `_previs_page_groups` — L13225
+- `_storyboard_trailer_duration` — L13240
+- `_storyboard_trailer_prompt` — L13250
+- `_character_trailer_max_shots` — L13278
+- `_character_trailer_shot_duration` — L13286
+- `_character_trailer_prompt` — L13302
+- `_concat_character_trailer_segments` — L13317
+- `_generate_character_trailer_motion` — L13356
+- `_multi_trailer_prompt_for_group` — L13464
+- `_generate_multi_trailer_segments` — L13487
+- `_generate_storyboard_trailer_motion` — L13598
+- `_generate_previs_page_motion_segments` — L13673
+- `_generate_grid_multiref_motion_segments` — L13785
+- `_grid_multiref_concat_groups` — L14095
+- `_grid_multiref_concat_groups_partial` — L14112
+- `_grid_multiref_concat_paths` — L14130
+- `_lip_sync_slot_duration` — L14172
+- `_adsd_lip_sync_prompt` — L14179
+- `_adsd_broll_motion_prompt` — L14225
+- `_adsd_action_b_motion_prompt` — L14267
+- `_adsd_silent_b_motion_prompt` — L14313
+- `_adsd_narrated_b_audio_dub_prompt` — L14348
+- `_adsd_almighty_audio_dub_prompt` — L14392
+- `_postprocess_lip_sync_segment` — L14433
+- `_detect_audio_leading_silence` — L14505
+- `_concat_audio_files_for_group` — L14530
+- `_split_lip_sync_raw_by_durations` — L14553
+- `_postprocess_audio_dub_segment` — L14588
+- `_lips_change_repair_segment` — L14716
+- `_load_lips_change_requested_turns` — L14801
+- `_parse_turn_set` — L14818
+- `_load_motion_voice_repair_turns` — L14840
+- `_voice_assets_file` — L14852
+- `_load_voice_assets` — L14859
+- `_build_combined_voice_reference` — L14878
+- `_select_voice_asset_reference` — L14920
+- `_lip_sync_poll_download_and_process` — L14996
+- `_lip_sync_one_group` — L15064
+- `_lip_sync_one_scene` — L15272
+- `step66_adsd_lip_sync` — L15596
+- `step65_motion` — L15941
+- `step65_grid_multiref_motion_qa` — L16094
+- `_sanitize_scene_for_state` — L16123
+- `_save_pipeline_state` — L16142
+- `_retime_after_audio_dub` — L16166
+- `_build_voice_clone_hybrid_audio` — L16204
+- `_build_dynamic_bgm` — L16343
 
 ---
 
 ### 第七步：拼接视频轨
-Range: **L16374 – L16633** (260 lines)
+Range: **L16387 – L16646** (260 lines)
 
 **Functions:**
-- `step7_concat` — L16375
+- `step7_concat` — L16388
 
 ---
 
 ### 第八步：生成 ASS 字幕
-Range: **L16634 – L17592** (959 lines)
+Range: **L16647 – L17605** (959 lines)
 
 **Sub-sections:**
-- _字幕分段：LLM 智能语义断句_ — L16913-17592 (680 lines)
+- _字幕分段：LLM 智能语义断句_ — L16926-17605 (680 lines)
 
 **Functions:**
-- `_werydance_caption_covered_turns` — L16635
-- `_word_timings_for_subtitle_align` — L16661
-- `_align_segments_via_asr` — L16702
-- `_b61_1_asr_turn_boundaries` — L16745
-- `step8_subtitles` — L16807
-- `_read_output_json` — L17313
-- `_qa_file_pass` — L17324
-- `_ass_has_dialogue` — L17331
-- `_write_adsd_delivery_qa` — L17341
-- `_write_bgm_only_qa` — L17481
+- `_werydance_caption_covered_turns` — L16648
+- `_word_timings_for_subtitle_align` — L16674
+- `_align_segments_via_asr` — L16715
+- `_b61_1_asr_turn_boundaries` — L16758
+- `step8_subtitles` — L16820
+- `_read_output_json` — L17326
+- `_qa_file_pass` — L17337
+- `_ass_has_dialogue` — L17344
+- `_write_adsd_delivery_qa` — L17354
+- `_write_bgm_only_qa` — L17494
 
 ---
 
 ### 第九步：最终合成
-Range: **L17593 – L17883** (291 lines)
+Range: **L17606 – L17896** (291 lines)
 
 **Functions:**
-- `step9_render` — L17594
+- `step9_render` — L17607
 
 ---
 
 ### 第十步：推送 Telegram
-Range: **L17884 – L19746** (1863 lines)
+Range: **L17897 – L19759** (1863 lines)
 
 **Sub-sections:**
-- _异步封面 + caption（与 step6-9 并发）_ — L18990-19099 (110 lines)
-- _B70 (2026-05-30) TG oversize policy helpers_ — L19100-19553 (454 lines)
-- _SSL 假阴性防护：见模块级 _tg_probe_send / _tg_probe_delete_ — L19554-19558 (5 lines)
-- _尝试 1：requests（timeout 放大到 600s），前后 probe 跳号检测_ — L19559-19622 (64 lines)
-- _尝试 2：curl fallback（更稳定，不受 httpx/urllib3 限制），同样跳号检测_ — L19623-19668 (46 lines)
-- _尝试 3：小土伯/TG 文件兜底。视频上传链路 SSL 抖动时，压 lite/micro 后用 sendDocument 发文件。_ — L19669-19746 (78 lines)
+- _异步封面 + caption（与 step6-9 并发）_ — L19003-19112 (110 lines)
+- _B70 (2026-05-30) TG oversize policy helpers_ — L19113-19566 (454 lines)
+- _SSL 假阴性防护：见模块级 _tg_probe_send / _tg_probe_delete_ — L19567-19571 (5 lines)
+- _尝试 1：requests（timeout 放大到 600s），前后 probe 跳号检测_ — L19572-19635 (64 lines)
+- _尝试 2：curl fallback（更稳定，不受 httpx/urllib3 限制），同样跳号检测_ — L19636-19681 (46 lines)
+- _尝试 3：小土伯/TG 文件兜底。视频上传链路 SSL 抖动时，压 lite/micro 后用 sendDocument 发文件。_ — L19682-19759 (78 lines)
 
 **Top-level constants:**
-- `PANTONE_JIEQI` — L18253
-- `PANTONE_FALLBACK` — L18280
-- `FESTIVAL_DATE_TAG` — L18394
+- `PANTONE_JIEQI` — L18266
+- `PANTONE_FALLBACK` — L18293
+- `FESTIVAL_DATE_TAG` — L18407
 
 **Functions:**
-- `_generate_caption` — L17885
-- `_overlay_title_on_cover` — L18123
-- `_prepare_tg_photo` — L18233
-- `_get_pantone_for_date` — L18283
-- `_llm_bottom_note` — L18308
-- `_get_bottom_note` — L18338
-- `_get_date_tag` — L18416
-- `_shrink_to_b64` — L18438
-- `_llm_check_scenes_anomalies` — L18454
-- `_llm_check_cover_unique` — L18507
-- `_llm_check_cover_quality` — L18537
-- `_try_almanac_cover` — L18579
-- `_generate_cover_image` — L18750
-- `_async_kickoff_cover_caption` — L18997
-- `_await_async_cover_caption` — L19073
-- `_b70_env_float` — L19103
-- `_b70_split_and_deliver` — L19118
-- `_b70_send_document_first` — L19218
-- `step10_deliver` — L19255
+- `_generate_caption` — L17898
+- `_overlay_title_on_cover` — L18136
+- `_prepare_tg_photo` — L18246
+- `_get_pantone_for_date` — L18296
+- `_llm_bottom_note` — L18321
+- `_get_bottom_note` — L18351
+- `_get_date_tag` — L18429
+- `_shrink_to_b64` — L18451
+- `_llm_check_scenes_anomalies` — L18467
+- `_llm_check_cover_unique` — L18520
+- `_llm_check_cover_quality` — L18550
+- `_try_almanac_cover` — L18592
+- `_generate_cover_image` — L18763
+- `_async_kickoff_cover_caption` — L19010
+- `_await_async_cover_caption` — L19086
+- `_b70_env_float` — L19116
+- `_b70_split_and_deliver` — L19131
+- `_b70_send_document_first` — L19231
+- `step10_deliver` — L19268
 
 ---
 
 ### 主流程
-Range: **L19747 – L19974** (228 lines)
+Range: **L19760 – L19987** (228 lines)
 
 **Functions:**
-- `_print_execution_plan` — L19748
-- `_write_run_timings` — L19796
-- `main` — L19825
+- `_print_execution_plan` — L19761
+- `_write_run_timings` — L19809
+- `main` — L19838
 
 ---
