@@ -16651,6 +16651,13 @@ def step7_concat(script: list[dict]) -> str:
             log(f"step7 防御：turn {i+1} seg 三 motion 接口(almighty/图生/文生)全失败, 不可恢复 → 从 script 移除（坚决不退静止）")
             tg(f"⚠️ turn {i+1} 三 motion 接口均失败, 从拼接队列剔除（坚决不出静止）")
     script[:] = [s for s in script if s.get("vid_path") and os.path.exists(s["vid_path"]) and os.path.getsize(s["vid_path"]) > 1000]
+    if not script:  # B86/final-qa: 全分镜三 motion 接口(almighty/图生/文生)均失败被剔光 → 空 concat 会让 ffmpeg 崩, 改清晰 hard-fail
+        err = "⛔ step7: 所有分镜 motion 全部失败 (almighty/图生视频/文生视频 三接口均挂, 多半 weryai 全线异常), 无可拼接片段, 中止出片 (稍后重试或查 weryai 状态)"
+        try:
+            tg(err)
+        except Exception:
+            pass
+        raise RuntimeError(err)
     segment_paths = [str(s["vid_path"]) for s in script]
     audio_flags = [_has_audio_stream(p) for p in segment_paths]
     prefer_embedded_partial_audio = (
