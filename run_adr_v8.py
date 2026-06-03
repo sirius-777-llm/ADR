@@ -1812,8 +1812,11 @@ def poll_storyboard_task(task_id: str, label: str, max_wait: float) -> dict:
 # B43 (2026-05-28): review tier Flash Lite → Flash 2.5. Flash Lite 429 quota 严重 (观沧海 101437
 # run L16289 注脚 quota exhausted), review tier 量小迁出减少 Lite 压力. 真正治本是 B44 chat() 429
 # 智能退避 (Codex Stage 2 共识). WeryAI 不支持 Haiku, data tier 暂保持 Flash Lite 等 B44 兜底.
+# B81 (2026-06-03): 质量优先 — 台词/旁白/视觉导演/制片准则 升最强 Claude (env 可改 GEMINI_3_5_FLASH/GPT_5_5).
+# 机械档(分镜数/情感/BGM 描述/data tier)仍 25_FLASH: 要的是可靠 JSON, premium 模型啰嗦反伤解析。
+CREATIVE_MODEL = os.environ.get("ADR_CREATIVE_MODEL", "CLAUDE_4_8_OPUS")  # 列表里最强 Claude (out=1250)
 _LLM_TIER = {
-    "producer":  "CLAUDE_4_6_OPUS",          # Tier 1 决策性创意 (制片人, 导演 jiangwen)
+    "producer":  CREATIVE_MODEL,             # Tier 1 决策性创意 (制片人, 导演 jiangwen) — B81 升 CREATIVE_MODEL
     "creative":  "GEMINI_25_FLASH",          # Tier 2 创意输出 (台词/分镜 prompt 等)
     "review":    "GEMINI_25_FLASH",          # Tier 3 审稿/规划 — B43 从 Flash Lite 迁出减压
     "data":      "GEMINI_25_FLASH",          # B80 (2026-06-03): GEMINI_3_1_FLASH_LITE 被 weryai 下线(status 1006 not model)→ 全改 25_FLASH(唯一可用 Flash, 非 thinking 顺带根除 B77 类 MAX_TOKENS). 原 Tier 4 数据/机械任务
@@ -1852,11 +1855,27 @@ def chat(model: str, system: str, user: str, max_tokens: int = 4096, timeout: in
             # B44: 在 truncate 前先 check 完整 resp 防 quota 关键字被切掉漏判 (Medium fix)
             full_resp_text = json.dumps(resp, ensure_ascii=False) if isinstance(resp, dict) else str(resp)
             is_quota_err = _is_llm_rate_limited_error(full_resp_text)
+            # B80.1 (2026-06-03): 模型被 weryai 无预警下线/改名 (status 1006 / "model does not exist") → 自动
+            # fallback 到已验证可用模型, 不让一次模型变动崩掉整管线 (B80 P0: GEMINI_3_1_FLASH_LITE 突然 1006 致全崩)。
+            _fb = os.environ.get("ADR_CHAT_FALLBACK_MODEL", "GEMINI_25_FLASH")
+            _ltxt = full_resp_text.lower()
+            if payload["model"] != _fb and ('"status": 1006' in full_resp_text
+                    or "does not exist" in _ltxt or "not model" in _ltxt):
+                log(f"[chat/{model}] ⚠️ B80.1 模型不可用(1006/not model), 自动 fallback → {_fb}")
+                payload["model"] = _fb
+                continue  # 立即用 fallback 重试
             last_err = f"响应无 choices: {full_resp_text[:200]}"
             log(f"[chat/{model}] 尝试 {attempt+1}/3 响应异常: {last_err}" + (" [B44 429]" if is_quota_err else ""))
         except Exception as e:
             last_err = f"{type(e).__name__}: {e}"
             is_quota_err = _is_llm_rate_limited_error(e)
+            _fb = os.environ.get("ADR_CHAT_FALLBACK_MODEL", "GEMINI_25_FLASH")
+            _etxt = str(e).lower()
+            if payload["model"] != _fb and ('"status": 1006' in str(e)  # B80.1/codex Med2: 1006 抛异常时也 fallback
+                    or "does not exist" in _etxt or "not model" in _etxt):
+                log(f"[chat/{model}] ⚠️ B80.1 模型不可用(异常 1006/not model), 自动 fallback → {_fb}")
+                payload["model"] = _fb
+                continue
             log(f"[chat/{model}] 尝试 {attempt+1}/3 异常: {last_err}" + (" [B44 429]" if is_quota_err else ""))
         if attempt < 2:
             # B44: 429 quota 用长退避 30/60/120s, 普通瞬断仍 3s/6s
@@ -2997,7 +3016,7 @@ action_b    武戏 / 激烈对抗 / 突破冲击 镜头
     arr: list[dict] = []
     last_err = ""
     for attempt in range(2):
-        raw = chat("GEMINI_25_FLASH", "你只输出严格 JSON 数组。", _build_prompt(last_err), max_tokens=3000, timeout=180)
+        raw = chat(CREATIVE_MODEL, "你只输出严格 JSON 数组。", _build_prompt(last_err), max_tokens=3000, timeout=300)  # B81: ADSD 对话台词升最强 Claude (Opus 慢, timeout 300)
         try:
             arr = _extract_json_array(raw)
         except Exception as e:
@@ -3933,7 +3952,7 @@ def step1_script(topic: str) -> list[dict]:
         if not ADS_DIALOGUE_MODE:
             lines = []
             for _try in range(3):
-                raw_lines = chat("GEMINI_25_FLASH", "你是纪录片旁白创作大师。", spielberg_prompt)
+                raw_lines = chat(CREATIVE_MODEL, "你是纪录片旁白创作大师。", spielberg_prompt, timeout=300)  # B81: 旁白台词升最强 Claude
                 lines = [l.strip() for l in raw_lines.strip().splitlines() if l.strip()][:num_lines]
                 if len(lines) < num_lines:
                     log(f"斯皮尔伯格只生成了 {len(lines)} 句（需要 {num_lines} 句），重试...")
@@ -4006,7 +4025,7 @@ THUMBNAIL_ANCHOR: Air Force One stairs, black leather jacket figure, glowing chi
 """
         log("外部脚本注入：使用确定性 Producer Brief，跳过重模型制片准则生成")
     else:
-        historical_context = chat("CLAUDE_4_6_OPUS", "你是总制片人，全能把关人，只输出严格结构化英文准则。", producer_prompt)
+        historical_context = chat(CREATIVE_MODEL, "你是总制片人，全能把关人，只输出严格结构化英文准则。", producer_prompt, timeout=300)  # B81: 制片准则升最强 Claude
     tg(f"✅ 制片人准则就绪（已定调子 + 事实考证 + 价值观把关）\n\n姜文正在据此标注情绪 + 生成画面提示词...")
 
     # 老黄历主题：给每句台词标注板块名，让姜文生成针对性画面
@@ -4319,7 +4338,7 @@ shot_type/camera_angle/lighting/camera_motion 必须从上述 enum 选, 不能�
         log(f"外部脚本注入：使用确定性财经科技分镜 prompt，共 {len(visuals)} 个")
     else:
         raw_json = chat(
-            "CLAUDE_4_6_OPUS",
+            CREATIVE_MODEL,  # B81: jiangwen 视觉导演升最强 Claude
             "你是精通各类电影镜头语言的导演。每个画面必须指定景别+机位+光影+视觉母题，严禁默认居中中景平庸画面。★ 输出限制：每条英文 prompt 严格 40-60 词（更长会撞 WeryAI gateway 504 timeout）。★ 绝对禁令：你输出的英文 prompt 里禁止出现任何具体导演/画家/艺术家姓名（Akira Kurosawa / Zhang Yimou / Ang Lee / Wong Kar-wai / Christopher Nolan / Caravaggio / Rembrandt / Sergio Leone 等都禁止），改用纯描述词。OpenAI GPT Image 2 对人名风格模仿触发版权 filter 强制拒绝。只输出 JSON。",
             jiangwen_prompt,
             max_tokens=3072,
