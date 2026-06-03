@@ -3539,14 +3539,16 @@ def _apply_render_budget_scene_cap(num_lines: int) -> int:
     **关键诊断**: step65_motion 已 20 路并发(ThreadPoolExecutor max_workers=min(20,n)), 64.7min/20镜
     不是串行造成的, 是 weryai 渲染吞吐硬限(实测~3.2min/镜, 服务端排队)→ 再并行无用。
     减 render 数是唯一 ADR 侧能**保证** ≤30min 的杠杆。开启 → 按预算 cap 分镜(更短但保时长)。
-    env: ADR_RENDER_BUDGET_MIN(默认30) · ADR_PER_SCENE_RENDER_MIN(默认3.2) · ADR_RENDER_OVERHEAD_MIN(默认8, 非motion步骤)。"""
+    env: ADR_RENDER_BUDGET_MIN(默认30) · ADR_PER_SCENE_RENDER_MIN(默认2.5) · ADR_RENDER_OVERHEAD_MIN(默认8, 非motion步骤)。
+    注: almanac(老黄历 22句结构刚需)与外部脚本 override 结构性豁免, 不 cap(cap 会破坏其固定结构)。"""
     if os.environ.get("ADR_RENDER_BUDGET_SCENE_CAP", "").strip().lower() not in ("1", "true", "yes", "on"):
         return num_lines
     try:
         budget_min = float(os.environ.get("ADR_RENDER_BUDGET_MIN", "30"))
-        per_scene_min = float(os.environ.get("ADR_PER_SCENE_RENDER_MIN", "3.2"))
+        per_scene_min = float(os.environ.get("ADR_PER_SCENE_RENDER_MIN", "2.5"))
         overhead_min = float(os.environ.get("ADR_RENDER_OVERHEAD_MIN", "8"))
-        if not (math.isfinite(budget_min) and math.isfinite(per_scene_min) and per_scene_min > 0):
+        if not (math.isfinite(budget_min) and math.isfinite(per_scene_min)
+                and math.isfinite(overhead_min) and per_scene_min > 0):
             return num_lines
         budget_scenes = max(6, int((budget_min - overhead_min) / per_scene_min))
         if num_lines > budget_scenes:
@@ -3728,13 +3730,15 @@ def step1_script(topic: str) -> list[dict]:
         except:
             # B68: fallback 抬升 — almanac 24 (后面被强制覆盖 22), 非 almanac 9→12 (配 cap 30 中间保守值)
             num_lines = 24 if almanac_data else 12
+            if not almanac_data:  # B79.1/codex Med: fallback 也过预算 cap (almanac 22句结构刚需→下方豁免)
+                num_lines = _apply_render_budget_scene_cap(num_lines)
             log(f"LLM 规划失败，使用默认分镜数：{num_lines}")
 
     current_year = __import__("datetime").datetime.now().year
 
     # 老黄历主题用专用强约束 prompt
     if almanac_data:
-        num_lines = 22  # 老黄历固定 22 句，覆盖全部 24 个数据字段
+        num_lines = 22  # 老黄历固定 22 句，覆盖全部 24 个数据字段 (B79.1: 结构刚需, 预算 cap 豁免—黄历题材 ≤30min 需 FAST 模型而非削句)
         almanac_block = f"""
 
 以下是该日期的完整老黄历数据（由系统精确计算，请直接使用这些数据，不要自行编造）：
