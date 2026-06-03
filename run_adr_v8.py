@@ -6844,7 +6844,11 @@ def _upload_to_weryai(file_path: str) -> str:
             return cached
     mime = _guess_upload_mime(file_path)
     last_err = None
-    for attempt in range(3):
+    try:  # B84: weryai SSL/网络持续抖→多扛防 seg 缺失变 Ken Burns 静止 (codex Med: 非数字 env 不崩)
+        _upload_retries = max(3, int(os.environ.get("ADR_UPLOAD_RETRIES", "6")))
+    except (ValueError, TypeError):
+        _upload_retries = 6
+    for attempt in range(_upload_retries):
         try:
             with _weryai_upload_lock:
                 # codex fix: double-check 防并发两线程同时 cache miss 后重复 upload
@@ -6872,11 +6876,14 @@ def _upload_to_weryai(file_path: str) -> str:
             return url
         except Exception as e:
             last_err = e
-            if attempt < 2:
-                wait_s = 3 * (attempt + 1)
-                log(f"upload-file 失败（{Path(file_path).name} 第 {attempt+1}/3 次）：{e}，{wait_s}s 后重试")
+            if attempt < _upload_retries - 1:
+                # B84: 网络错(SSL bad-record-mac/超时/重置/connection)用更长退避熬过 weryai 抖动窗口, 普通错短退避
+                _net = any(k in str(e).lower() for k in
+                           ("ssl", "timed out", "timeout", "connection", "reset", "bad record", "max retries", "aborted"))
+                wait_s = min(40, (8 if _net else 3) * (attempt + 1))
+                log(f"upload-file 失败（{Path(file_path).name} 第 {attempt+1}/{_upload_retries} 次{' 网络' if _net else ''}）：{e}，{wait_s}s 后重试")
                 time.sleep(wait_s)
-    raise RuntimeError(f"upload-file 重试失败: {last_err}")
+    raise RuntimeError(f"upload-file 重试失败({_upload_retries} 次): {last_err}")
 
 
 APPROVAL_DIR = Path("/tmp/adr_approval")
@@ -16385,6 +16392,72 @@ def _build_dynamic_bgm(script: list[dict], bgm_path: str | None) -> str | None:
 
 
 # ── 第七步：拼接视频轨 ────────────────────────────────────────────────────────
+def _rescue_motion_image_to_video(scene: dict, img_src: str, out_path: str, target_dur: float, aspect_ratio: str) -> bool:
+    """B85 (2026-06-04): step7 seg 缺失兜底 —— Ken Burns 静止前先用 WERYDANCE image-to-video 给图生成真动效。
+    大哥铁律: almighty/图生/文生 三个 motion 接口都在, 绝不退静止。step66 lip-sync(almighty)失败 → 此处补图生视频。
+    成功写入 out_path 返回 True。env ADR_MOTION_RESCUE_I2V=0 可关。"""
+    try:
+        if not img_src or not os.path.exists(img_src) or os.path.basename(img_src).startswith("meta_grid_"):
+            return False
+        image_url = _upload_to_weryai(img_src)  # B84 已加硬重试
+        dur = max(4.0, min(15.0, float(target_dur or 5.0)))
+        prompt = (str(scene.get("prompt") or "").strip()[:400]) or "subtle natural cinematic motion, gentle ambient camera movement, living breathing scene"
+        for attempt in range(2):
+            _wait_motion_submit_slot("B85 i2v 救援")
+            try:
+                resp = req_post("/generation/image-to-video", {
+                    "model": "WERYDANCE_2_0", "image": image_url, "prompt": prompt,
+                    "negative_prompt": _werydance_negative_prompt(scene),
+                    "duration": dur, "aspect_ratio": aspect_ratio, "resolution": "1080p",
+                    "generate_audio": "false",
+                }, timeout=30)
+            except Exception as e:
+                log(f"B85 i2v 救援 submit 异常({attempt+1}/2): {e}")
+                continue
+            tid = (resp.get("data") or {}).get("task_id") or ((resp.get("data") or {}).get("task_ids") or [None])[0]
+            if not tid:
+                log(f"B85 i2v 救援无 task_id: {json.dumps(resp, ensure_ascii=False)[:160]}")
+                continue
+            # B85/codex Med1: 限 ~3.5min 单次 poll (救援是兜底, 缺多段不能各等 20min 拖爆批量)
+            ok, _info = _poll_video_task_download(tid, Path(out_path), "B85 i2v 救援", max_iterations=45)
+            return bool(ok and os.path.exists(out_path) and os.path.getsize(out_path) > 1000)
+        return False
+    except Exception as e:
+        log(f"B85 i2v 救援异常: {e}")
+        return False
+
+
+def _rescue_motion_text_to_video(scene: dict, out_path: str, target_dur: float, aspect_ratio: str) -> bool:
+    """B86 (2026-06-04): image-to-video 也失败后的 motion 兜底 —— WERYDANCE text-to-video 用场景 prompt 生成真动效。
+    大哥铁律: Ken Burns 静止彻底不要, 三 motion 接口(almighty/图生/文生)用尽。t2v 不吃图、按 prompt 生成,
+    任何场景都能救(含 still_src 是邻图/cover 的情况)。成功写 out_path 返回 True。env ADR_MOTION_RESCUE_T2V=0 可关。"""
+    try:
+        prompt = (str(scene.get("prompt") or "").strip()[:2000]) or "cinematic documentary scene with natural ambient motion, gentle camera movement"
+        dur = max(4.0, min(15.0, float(target_dur or 5.0)))
+        for attempt in range(2):
+            _wait_motion_submit_slot("B86 t2v 救援")
+            try:
+                resp = req_post("/generation/text-to-video", {
+                    "model": "WERYDANCE_2_0", "prompt": prompt,
+                    "negative_prompt": _werydance_negative_prompt(scene),
+                    "duration": dur, "aspect_ratio": aspect_ratio, "resolution": "1080p",
+                    "generate_audio": "false",
+                }, timeout=30)
+            except Exception as e:
+                log(f"B86 t2v 救援 submit 异常({attempt+1}/2): {e}")
+                continue
+            tid = (resp.get("data") or {}).get("task_id") or ((resp.get("data") or {}).get("task_ids") or [None])[0]
+            if not tid:
+                log(f"B86 t2v 救援无 task_id: {json.dumps(resp, ensure_ascii=False)[:160]}")
+                continue
+            ok, _info = _poll_video_task_download(tid, Path(out_path), "B86 t2v 救援", max_iterations=45)
+            return bool(ok and os.path.exists(out_path) and os.path.getsize(out_path) > 1000)
+        return False
+    except Exception as e:
+        log(f"B86 t2v 救援异常: {e}")
+        return False
+
+
 def step7_concat(script: list[dict]) -> str:
     # P1：grid_multiref 主路径：N 组 group videos concat 成 grid_multiref_combined.mp4 → raw_concat
     # 同 trailer-main 套路：循环到 master_voice 时长，24fps CFR
@@ -16538,42 +16611,45 @@ def step7_concat(script: list[dict]) -> str:
                 orig_img = s.get("img_path")
                 s["img_path"] = still_src
                 src_label = "邻 turn 图" if still_src in legit_imgs else ("cover" if still_src == cover_path else "原 img")
-                # 三层降级：Ken Burns 大 timeout → Ken Burns 失败回退静态 → 静态也失败 才丢弃
+                if not vp:  # B86/codex Med: 救援前保证有输出路径, 否则 i2v/t2v 下载到 Path("") 白烧 API
+                    vp = str(OUTPUT_DIR / f"seg_{i}.mp4")
+                    s["vid_path"] = vp
+                # B86 motion cascade：image-to-video(救场景自己的图) → text-to-video(场景 prompt 真动效) → 全失败才丢弃 (Ken Burns/静止 已彻底移除)
                 ken_burns_success = False
-                try:
-                    log(f"step7 防御：seg_{i}.mp4 缺失 → 用 {os.path.basename(still_src)} 现场补 Ken Burns still seg")
-                    # ken_burns timeout 180s 给长 dur turn (10s+ 296 帧) 足够余量
-                    _render_still_segment(s, timeout=180, ken_burns=True)
-                    if os.path.exists(vp) and os.path.getsize(vp) > 1000:
-                        ken_burns_success = True
-                        tg(f"⚠️ turn {i+1} WERYDANCE 失败 → Ken Burns 慢推静态图补救（来源: {src_label}）")
-                except Exception as e:
-                    log(f"step7 防御 turn {i+1} Ken Burns 失败 (降级静态): {e}")
+                # B85 (大哥铁律: 三 motion 接口在绝不退静止): Ken Burns 前先 cascade WERYDANCE image-to-video 拿真动效
+                # codex Med2: i2v 只救场景自己的图(邻 turn/cover 图 animate 会动错内容); 邻/cover 情况交给下面 t2v(用 prompt 不吃图)
+                if still_src == img and not is_meta_grid_img and \
+                        os.environ.get("ADR_MOTION_RESCUE_I2V", "1").strip().lower() not in ("0", "false", "no", "off"):
                     try:
-                        if vp and os.path.exists(vp):
-                            os.remove(vp)
+                        _tdur = float(s.get("vid_duration") or s.get("dur") or 5.0)
+                        if _rescue_motion_image_to_video(s, still_src, vp, _tdur, "9:16" if IS_VERTICAL else "16:9"):
+                            ken_burns_success = True
+                            tg(f"🎬 turn {i+1} WERYDANCE 失败 → image-to-video 救回真动效（来源: {src_label}），跳过静止兜底")
+                            log(f"step7 B85: seg_{i} image-to-video 救回真动效, 不做 Ken Burns")
+                    except Exception as e:
+                        log(f"step7 B85 i2v 救援异常: {e}")
+                # B86 (大哥铁律: Ken Burns/静止 彻底不要, 换 text-to-video): i2v 未成 → text-to-video 从场景 prompt 生成真动效
+                # (t2v 不吃图, 任何场景都能救; 含 still_src 是邻图/cover 的情况)。三接口全失败才丢弃, 绝不出静止。
+                if not ken_burns_success and \
+                        os.environ.get("ADR_MOTION_RESCUE_T2V", "1").strip().lower() not in ("0", "false", "no", "off"):
+                    try:
+                        _tdur2 = float(s.get("vid_duration") or s.get("dur") or 5.0)
+                        if _rescue_motion_text_to_video(s, vp, _tdur2, "9:16" if IS_VERTICAL else "16:9"):
+                            ken_burns_success = True
+                            tg(f"🎬 turn {i+1} WERYDANCE+图生视频失败 → text-to-video 生成真动效救回（坚决不出静止）")
+                            log(f"step7 B86: seg_{i} text-to-video 救回真动效")
+                    except Exception as e:
+                        log(f"step7 B86 t2v 救援异常: {e}")
+                if not ken_burns_success and vp and os.path.exists(vp):
+                    try:
+                        os.remove(vp)  # 半成品 seg 清掉, 让下方剔除生效
                     except Exception:
                         pass
-                # Ken Burns 失败 → 回退到无 motion 静态图
-                if not ken_burns_success:
-                    try:
-                        _render_still_segment(s, timeout=60, ken_burns=False)
-                        if os.path.exists(vp) and os.path.getsize(vp) > 1000:
-                            tg(f"⚠️ turn {i+1} Ken Burns 失败 → 降级静态图补救（来源: {src_label}）")
-                            s["img_path"] = orig_img
-                            continue
-                    except Exception as e2:
-                        log(f"step7 防御 turn {i+1} 静态图补救也失败：{e2}")
-                        try:
-                            if vp and os.path.exists(vp):
-                                os.remove(vp)
-                        except Exception:
-                            pass
                 s["img_path"] = orig_img
                 if ken_burns_success:
                     continue
-            log(f"step7 防御：turn {i+1} seg 不可恢复（无合法图源），从 script 移除")
-            tg(f"⚠️ turn {i+1} seg 不可恢复，从拼接队列剔除")
+            log(f"step7 防御：turn {i+1} seg 三 motion 接口(almighty/图生/文生)全失败, 不可恢复 → 从 script 移除（坚决不退静止）")
+            tg(f"⚠️ turn {i+1} 三 motion 接口均失败, 从拼接队列剔除（坚决不出静止）")
     script[:] = [s for s in script if s.get("vid_path") and os.path.exists(s["vid_path"]) and os.path.getsize(s["vid_path"]) > 1000]
     segment_paths = [str(s["vid_path"]) for s in script]
     audio_flags = [_has_audio_stream(p) for p in segment_paths]
