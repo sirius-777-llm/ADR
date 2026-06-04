@@ -12121,18 +12121,27 @@ _DOLLY_ZOOM_EMOTIONS = (  # codex Low: 收窄为强情绪多字词, 去"惊/恐/
     "紧张", "压抑", "震撼", "眩晕", "悬疑", "悬念", "惊悚", "恐惧", "高潮", "崩溃", "窒息",
     "tense", "climax", "vertigo", "dread", "shock",
 )
+# B91.3: 壮阔/史诗正向情绪 → epic crane reveal 复合运镜 (与 dolly-zoom 紧张档区分)
+_GRAND_EMOTIONS = (
+    "辉煌", "史诗", "壮阔", "磅礴", "豪迈", "激昂", "崇高", "宏大", "苍茫",
+    "epic", "grand", "majestic", "awe", "sweeping",
+)
 
 
 def _seedance_camera_directive(scene: dict, base_move: str = "") -> str:
-    """B91.1: camera_motion enum → Seedance 结构化运镜指令 + 情绪门控复合运镜。"""
+    """B91.1/.3: camera_motion enum → Seedance 结构化运镜指令 + 情绪门控复合运镜。"""
     move = str(base_move or scene.get("camera_motion") or "").strip().lower()  # codex Med: 防非str崩
     if move not in _SEEDANCE_CAMERA_GRAMMAR:
         move = "slow push-in"
     emotion = str(scene.get("emotion", "")).lower()
-    # 复合运镜: 紧张/震撼/高潮 + 推近/静止 → dolly-zoom 眩晕 (Seedance 招牌复合镜)
+    # 复合运镜 1: 紧张/震撼/高潮 + 推近/静止 → dolly-zoom 眩晕 (Seedance 招牌复合镜)
     if move in ("slow push-in", "static") and any(k in emotion for k in _DOLLY_ZOOM_EMOTIONS):
         return ("Camera: dolly-zoom vertigo effect (dolly backward while zooming in), "
                 "unsettling perspective warp, subject locked center, dramatic and tense")
+    # 复合运镜 2 (B91.3): 壮阔/史诗 + 升/拉/推 → epic crane reveal
+    if move in ("crane up", "pull-back reveal", "slow push-in") and any(k in emotion for k in _GRAND_EMOTIONS):
+        return ("Camera: sweeping epic crane reveal, rising up and pulling back to unveil vast scale, "
+                "smooth majestic boom, grand cinematic vista")
     return _SEEDANCE_CAMERA_GRAMMAR[move]
 
 
@@ -14675,6 +14684,12 @@ def _adsd_broll_motion_prompt(scene: dict, safe_retry: bool = False) -> str:
     )
     action_boost = _action_motion_fragment() if _is_action_scene(text, shot) else ""
     expr = _emotion_expression_phrase(scene.get("emotion"))
+    # B91.2: B-roll 也接导演运镜——scene 有合法 camera_motion 时用 Seedance 结构化指令, 否则通用手持
+    _bm = _validate_enum_field(scene.get("camera_motion"), _PR3B1_CAMERA_MOTION_ENUM, "")
+    _cam_line = (
+        f"{_seedance_camera_directive(scene, _bm)}. " if _bm
+        else "Camera style: handheld documentary realism with organic shake and breathing framing; or smooth gimbal dolly when emphasizing motion direction. "
+    )
     _no_text_ban = (
         "ABSOLUTELY NO TEXT IN FRAME: do not burn in subtitles, do not render Chinese/English captions, "
         "no chyron / lower-thirds / speech bubbles / on-screen typography. Purely cinematic image. "
@@ -14686,7 +14701,7 @@ def _adsd_broll_motion_prompt(scene: dict, safe_retry: bool = False) -> str:
         f"{_adsd_gender_lock_phrase(scene.get('voice_gender'))} "
         "No character speaks directly to camera; no lip-sync needed; no mouth animation prioritized. "
         f"Character expression and body language matching mood: {expr}. Avoid blank serious face — let mood read in eyes, brow, posture. "
-        "Camera style: handheld documentary realism with organic shake and breathing framing; or smooth gimbal dolly when emphasizing motion direction. "
+        f"{_cam_line}"
         "Subjects move with full-body engagement: walking, gesturing, working, reacting — NOT subtle micro-twitches alone. "
         f"Lighting: practical real-world sources with motivated shadows; {_active_texture_motion_phrase()}; mild lens vignette; depth of field. "
         "All visible elements (characters, objects, environment) carry kinetic life: garment ripple, hair flow, ambient particles, foliage drift, water ripple. "
@@ -14769,11 +14784,17 @@ def _adsd_silent_b_motion_prompt(scene: dict, safe_retry: bool = False) -> str:
     _no_text_ban = (
         "ABSOLUTELY NO TEXT IN FRAME: no subtitles, no captions, no chyron, no on-screen typography. "
     )
+    # B91.2: silent_b 也接导演运镜——有合法 camera_motion 用 Seedance 指令, 否则保留慢呼吸运镜
+    _sb_bm = _validate_enum_field(scene.get("camera_motion"), _PR3B1_CAMERA_MOTION_ENUM, "")
+    _sb_cam = (
+        f"{_seedance_camera_directive(scene, _sb_bm)}. " if _sb_bm
+        else "Slow contemplative camera move (glide / slow push / hold). "
+    )
     base = (
         f"{_no_text_ban}"
         "Cinematic documentary breathing shot — pure atmospheric mood, no spoken dialogue, no lip-sync, no character close-up. "
         f"{rule_emphasis} "
-        "Slow contemplative camera move (glide / slow push / hold). "
+        f"{_sb_cam}"
         f"Lighting: practical real-world sources with motivated shadows; {_active_texture_motion_phrase()}; lens vignette; soft depth of field. "
         "Ambient kinetic life: dust motes, light flicker, water ripple, foliage drift, fabric breath, particles in air. "
         "No synthetic smoothness — let it read as captured reality. "
@@ -15848,16 +15869,19 @@ def _lip_sync_one_scene(idx: int, scene: dict, target_dur: float, aspect_ratio: 
                     for _r in range(FAST_RETRY_COUNT):
                         variants.append((f"action_b_fast_retry_{_r+1}", "WERYDANCE_2_0_FAST", _act_prompt_safe, "true"))
             elif is_silent:
-                # silent_b：纯 motion，无 audio，呼吸位 prompt
+                # silent_b：纯 motion，呼吸位 prompt。B91.5: env ADR_SILENT_B_NATIVE_AUDIO 开 →
+                # 用 Seedance(WERYDANCE_2_0)原生环境音(silent_b 无旁白/对话, 叠在 BGM 下不冲突;
+                # 默认关, 待 live A/B 确认 Seedance 环境音质量后再默认开)
+                _sil_ga = "true" if os.environ.get("ADR_SILENT_B_NATIVE_AUDIO", "0").strip().lower() in ("1", "true", "yes", "on") else "false"
                 _sil_prompt_safe = _adsd_silent_b_motion_prompt(scene, safe_retry=True)
                 variants = [
-                    ("silent_b_motion", "WERYDANCE_2_0", _adsd_silent_b_motion_prompt(scene, safe_retry=False), "false"),
-                    ("silent_b_motion_safe", "WERYDANCE_2_0", _sil_prompt_safe, "false"),
+                    ("silent_b_motion", "WERYDANCE_2_0", _adsd_silent_b_motion_prompt(scene, safe_retry=False), _sil_ga),
+                    ("silent_b_motion_safe", "WERYDANCE_2_0", _sil_prompt_safe, _sil_ga),
                 ]
                 if fast_fallback_enabled:
-                    variants.append(("silent_b_motion_fast", "WERYDANCE_2_0_FAST", _sil_prompt_safe, "false"))
+                    variants.append(("silent_b_motion_fast", "WERYDANCE_2_0_FAST", _sil_prompt_safe, _sil_ga))
                     for _r in range(FAST_RETRY_COUNT):
-                        variants.append((f"silent_b_fast_retry_{_r+1}", "WERYDANCE_2_0_FAST", _sil_prompt_safe, "false"))
+                        variants.append((f"silent_b_fast_retry_{_r+1}", "WERYDANCE_2_0_FAST", _sil_prompt_safe, _sil_ga))
             elif is_narrated and ADSD_ALMIGHTY_AUDIO_DUB_EXPERIMENT and audio_url:
                 # narrated_b：走 audio_dub 拿克隆旁白音色 + 含 dialogue text 的专属 prompt
                 # (之前用 broll prompt 没 dialogue text 导致 WERYDANCE 脑补杂音)
