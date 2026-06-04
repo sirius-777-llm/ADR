@@ -389,7 +389,7 @@ def _wuxia_action_panel_prompt(text: str, shot: str = "", visual_subject: str = 
         "Visible sword/blade trails caught mid-swing, qi/spiritual-energy bursts in jade-cyan neon ink-wash palette, "
         "robes and long hair caught mid-flight by impact wind, debris/sparks/talismanic glyphs floating in mid-air, "
         "low-angle hero shot or dramatic over-the-shoulder framing, "
-        "dynamic motion blur on weapons and limbs, deep film grain, dramatic rim backlight. "
+        f"dynamic motion blur on weapons and limbs, {_active_texture_motion_phrase()}, dramatic rim backlight. "
         "Strictly forbidden: characters standing still and speaking, talking heads, calm portrait, "
         "speech bubbles, captions, subtitles, watermarks, modern clothing, contemporary urban backgrounds."
     )
@@ -1601,11 +1601,6 @@ _TEXTURE_SUFFIX_MAP = {
         "-- no digital noise, no oversharpen, no plastic smoothness, no modern HDR, no blotchy artifacts"
     ),
 }
-# 幂等去重 marker：每档后缀的首个独特短语（防 motion bridge 二次提交重复贴/漏贴）
-_TEXTURE_SUFFIX_MARKERS = (
-    "clean illustration", "analog film photograph", "ink-wash painting texture",
-    "aged paper and parchment", "vintage offset print",
-)
 # Stage0 收口：正文级纹理指令（替代散落的硬编码 sepia/老照片/film grain）
 _TEXTURE_BODY_DIRECTIVE = {
     "clean": "画风严格遵循制片人 STYLE_KEY，干净细腻、高清、无颗粒做旧",
@@ -1768,9 +1763,12 @@ def _inject_image2_quality_suffix(payload: dict) -> dict:
     if payload.get("model") != "GPT_IMAGE_2":
         return payload
     prompt = payload.get("prompt", "")
+    if not prompt:
+        return payload
     suffix = _active_texture_suffix()
-    # 幂等：任一档 marker 已在 prompt → 不重复贴（多档 marker 检测）
-    if not prompt or any(mk in prompt for mk in _TEXTURE_SUFFIX_MARKERS):
+    # 幂等：prompt 末尾已是任一档完整后缀 → 不重复贴。用完整后缀 endswith，零误判
+    # （正文不可能自然以 ~250 字后缀结尾；修 codex Med: 旧版裸短语匹配会被正文误触发跳过丢 negative）
+    if any(prompt.endswith(s) for s in _TEXTURE_SUFFIX_MAP.values()):
         return payload
     # GPT_IMAGE_2 prompt 上限 5000 字符。suffix ~250 → 留余量
     max_prompt = 5000 - len(suffix) - 10
@@ -2408,7 +2406,7 @@ def build_shot_blueprint(n: int) -> list[str]:
     for i in range(n):
         pos = i / max(n - 1, 1)
         if i == 0:
-            shot = "extreme close-up macro shot of a single symbolic object, shallow depth of field, hard key light carving deep shadows, anamorphic lens flare, 35mm film grain"
+            shot = f"extreme close-up macro shot of a single symbolic object, shallow depth of field, hard key light carving deep shadows, anamorphic lens flare, {_active_texture_motion_phrase()}"
         elif i == 1:
             shot = "extreme close-up of an eye or a trembling hand, rim light from side, razor-shallow depth, dramatic chiaroscuro, suspenseful spaghetti-western tension"
         elif pos < 0.3:
@@ -4237,7 +4235,7 @@ def step1_script(topic: str) -> list[dict]:
 请输出一份严格结构化的【制片准则】（全英文便于图片模型理解，每项 2~4 个短语，总计 ≤ 280 词）：
 
 AUDIENCE_AND_VALUES: 目标受众（年龄段、文化背景），传递的核心情感，必须规避的内容（如暴力/说教/刻板印象/历史虚无/消费苦难）
-STYLE_KEY: 视觉基调的 3~5 个关键词（bright childlike storybook / sepia documentary / traditional Chinese ink wash / high-key editorial / low-key cinematic 等）——这是压倒性风格锚
+STYLE_KEY: 视觉基调的 3~5 个关键词（bright childlike storybook / sepia documentary / traditional Chinese ink wash / high-key editorial / low-key cinematic 等）——这是压倒性风格锚。★B87 纹理权威：画面颗粒/做旧/胶片/sepia 等【质感】由系统 texture_mode 统一控制（当前档={_ACTIVE_TEXTURE_PROFILE}），STYLE_KEY 及下方所有描述里【不要】自行写 film grain / sepia / 颗粒 / 做旧 等质感词（除非当前档本就是该质感），只写构图/光线/色板/主体，避免与系统纹理后缀冲突
 PALETTE: 具体主色板（warm yellow + sky blue + cream / cold gray + muted blue / golden red + ink black 等）
 LIGHTING_AND_CAMERA: 光线与镜头语言（high-key soft front light / golden hour sidelight / low-key dramatic backlight，镜头以特写/中景/广角为主）
 SUBJECT_DETAILS: 人物、场景、物件的具体外观描述{'（历史题材：考证后的时代服饰/发型/建筑/器物具体外观，绝不说朝代名，只说外观）' if tone != '轻松' else '（现代题材：现场元素如现代校服/电子屏幕/校园环境/食堂器具，绝不使用历史服饰或器物）'}
@@ -4437,7 +4435,7 @@ THUMBNAIL_ANCHOR: Air Force One stairs, black leather jacket figure, glowing chi
 • **最后 1-2 句（金句/收尾）**：`extreme wide shot` + `silhouette against sky/sunset` + 大留白，给余韵
 
 ★ 根据题材锁定全片视觉风格（用纯描述词，**严禁提任何具体导演/艺术家/画家姓名**——OpenAI GPT Image 2 对"模仿艺术家风格"phrasing 强制拒绝触发版权 filter，必须用风格描述代替姓名）：
-• 历史悲剧 / 战争 / 死亡题材 → epic silhouette composition with storm backlighting / heavy film grain / cinemascope / dramatic shadow play
+• 历史悲剧 / 战争 / 死亡题材 → epic silhouette composition with storm backlighting / cinemascope / dramatic shadow play（颗粒质感由 texture_mode 管，勿写 film grain）
 • 帝王 / 政治 / 权谋题材 → saturated color-block composition / symmetric centered framing / red-gold palette / low-angle hero shots
 • 文人 / 诗意 / 禅意题材 → Zen contemplative cinematography / static deep focus / soft warm tones / horizontal natural composition
 • 悬疑 / 反转 / 黑色题材 → hard key light with smoke / low-angle dramatic / high saturation / pulpy retro tones
@@ -4622,7 +4620,7 @@ shot_type/camera_angle/lighting/camera_motion 必须从上述 enum 选, 不能�
         fb_prompt = "bright cheerful children's illustration, warm sunny colors, modern school cafeteria scene, smiling kids, high saturation, hopeful atmosphere"
     else:
         fb_emotion = "紧张"
-        fb_prompt = "cinematic historical documentary still, sepia tone, dramatic lighting"
+        fb_prompt = f"cinematic historical documentary still, {_active_texture_scene_phrase()}, dramatic lighting"
     while len(visuals) < num_lines:
         visuals.append({"emotion": fb_emotion, "prompt": fb_prompt})
     log(f"姜文输出 {len(visuals)} 个视觉描述（需要 {num_lines} 个）")
@@ -8989,9 +8987,11 @@ DIRECTOR_STYLE_ROUTES: dict[str, dict] = {
     },
     "classical_realism": {
         "label": "历史人物/教科书还原",
-        "anchor": "classical balanced composition, deep grayscale tones with selective sepia warmth, historically accurate period detail, archive-photograph texture",
-        "palette": "muted sepia, charcoal black, faded paper cream",
-        "rhythm": "deliberate static medium shots, archival-photograph stillness with subtle film grain animation",
+        # B87: 去掉硬编码 sepia/archive-photograph texture（质感归 texture_mode 统一控制，
+        # 民国/近代由 film_grain 档补摄影感、古代由 ink_wash 档走水墨），route 只管构图/景别
+        "anchor": "classical balanced composition, restrained tonal range, historically accurate period detail, formal documentary framing",
+        "palette": "charcoal black, faded paper cream, muted earth tones",
+        "rhythm": "deliberate static medium shots, archival stillness",
     },
     "modern_documentary": {
         "label": "现代纪录片/商业职场",
@@ -14529,7 +14529,7 @@ def _adsd_action_b_motion_prompt(scene: dict, safe_retry: bool = False) -> str:
         "Dust clouds, motion blur, impact frames, slow-motion flash on key beats. "
         "Sparks fly, fabric snaps, particles burst, environmental debris in air. "
         "Avoid slow contemplative pacing — every second packed with movement and visual energy. "
-        "Cinematic dramatic backlight, gritty film grain, high contrast, kinetic energy. "
+        f"Cinematic dramatic backlight, {_active_texture_motion_phrase()}, high contrast, kinetic energy. "
         f"{_sfx_directive}"
         f"{era_hint}"
     )
