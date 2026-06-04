@@ -4400,7 +4400,7 @@ THUMBNAIL_ANCHOR: Air Force One stairs, black leather jacket figure, glowing chi
 
 ★★★ 视觉一致性铁律（最高优先级，比所有其他条款都重要！违反 = 全片精分废掉）★★★
 
-全片 {num_lines} 张图**必须看起来是同一摄影师 / 同一镜头 / 同一日杂大片系列拍出来的**，像 Kinfolk 杂志一期 22 页大片。
+全片 {num_lines} 张图**必须看起来是同一种视觉风格 / 同一镜头语言 / 同一系列拍出来的**——统一成 producer STYLE_KEY 定义的那一种 medium 与色板（不锁定具体是摄影/插画/水墨/CG/卡通平涂/暗调电影感，由题材的 STYLE_KEY 决定，但全片自始至终必须是同一种、不中途切换）。
 严禁出现：
 ❌ 第 1 张真人摄影 + 第 5 张 CG concept art + 第 10 张水墨戏剧 + 第 15 张装饰金屏风（这就是精分）
 ❌ 不同分镜切换"摄影 / 插画 / 水墨 / 3D" 媒介（必须全部是同一种 medium）
@@ -4408,8 +4408,8 @@ THUMBNAIL_ANCHOR: Air Force One stairs, black leather jacket figure, glowing chi
 
 强制要求：
 ✅ 每条 prompt 头部第一句必须**完全相同**地引用 producer STYLE_KEY（一字不差）：定 medium + 定色板 + 定光源风格 + 定画质
-✅ 每张图都是同一种 medium（如 "editorial Kinfolk magazine photography, soft warm natural light"）
-✅ 全片色板一致（如 "warm cream paper / sage green / soft amber, never neon, never high-contrast cool blue"）
+✅ 每张图都是同一种 medium（由 STYLE_KEY 决定——写实摄影 / 插画 / 水墨 / 3D / 卡通平涂 / 暗调电影感 等皆可，关键是全片统一不切换 medium）
+✅ 全片色板一致（由 STYLE_KEY 与题材决定——冷峻霓虹、暖怀旧 sepia、高饱和明快、低调黑、未来金属冷调等都允许，只要一组镜头内不混搭、不中途换色板；不再强制暖奶油色、不再禁霓虹/冷蓝）
 ✅ 所有人物（即使不同分镜）必须共享相同的视觉处理（同一摄影师拍法、同一光线系统、同一色温）
 ✅ 即使是空镜 / 物件特写，也要保持与人物镜头**同一画风**
 
@@ -4808,13 +4808,27 @@ shot_type/camera_angle/lighting/camera_motion 必须从上述 enum 选, 不能�
     # ★ STYLE_KEY 锁全片画风（最高优先级，每条 prompt 头部强制引用，确保 22 张图视觉一致）
     # director 字段已改为返回纯描述词（无具体姓名）
     base_style = topic_meta.get("director", "Zen contemplative cinematography, deep focus, soft warm tones")
-    # 强化为全片 visual cohesion 锚——所有 22 张图都是这个 STYLE_KEY 系列大片
-    style_key = (
-        f"editorial magazine photography series, {base_style}, "
-        f"warm cream and sage green palette, soft natural daylight, "
-        f"4k photorealistic detail, consistent visual identity throughout series, "
-        f"shot by single photographer with single camera and lighting setup"
+    # B89 P0-1 (2026-06-04): 删无差别全局硬皮(原"editorial magazine photography series +
+    # warm cream and sage green palette + soft natural daylight + 4k photorealistic"——B87 去脏后缀的
+    # 放大版, 作 parts[0] 贴每张图把所有题材洗成杂志风+鼠尾草绿+强制写实, 连 tone 都不读)。
+    # 改: director_tag = 自适应 base_style(topic_meta.director, LLM 按题材产出) + 该片 route 的 palette
+    # (按题材路由自适应) + 题材无关的连贯性锚(合法护栏)。介质/颗粒交 STYLE_KEY/texture_mode(B87) 决定,
+    # 不再强制 photorealistic(儿童/水墨/卡通题材本不该写实)。
+    _route_palette = (
+        DIRECTOR_STYLE_ROUTES.get(_director_route, DIRECTOR_STYLE_ROUTES["modern_documentary"]).get("palette", "")
     )
+    # B89/codex Med: 轻松/儿童题材 parts[0] 别用中性 route palette 压暗尾部 bright 情绪色，
+    # 改用明快高调色（儿童/轻松是风格塌陷重灾区，B89.3/B89.4 会更彻底）
+    _palette_for_style = (
+        "bright high-key warm colors, cheerful saturated palette" if tone == "轻松" else _route_palette
+    )
+    style_key = ", ".join(p for p in (
+        base_style,
+        _palette_for_style,
+        "high detail, high clarity",
+        "consistent visual identity throughout the series",
+        "single cohesive camera and lighting setup",
+    ) if p)
     director_tag = style_key
     neg_tag = topic_meta.get("negative", "")
     culture_guard = _topic_culture_guard(topic_meta)
