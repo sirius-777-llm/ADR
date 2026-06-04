@@ -1558,6 +1558,10 @@ def _is_llm_rate_limited_error(exc: Exception | str) -> bool:
 
 # GPT_IMAGE_2 画质修正后缀（实测能有效消除颗粒感/脏感）
 # 大哥 2026-05-20 给的固定 suffix，避免逐处 prompt 都改
+# B87 (2026-06-04): 这条不再无差别碾压——它只是 clean 档。纹理由 LLM 美术总监
+# 在 _llm_topic_decomposition 提名 texture_mode、_texture_guardrail 代码终审决定，
+# _active_texture_suffix() 按全片档位选对应后缀。怀旧/民国/老照片要颗粒、唐诗水墨
+# 不许胶片——见 _TEXTURE_SUFFIX_MAP / _texture_guardrail。
 GPT_IMAGE2_QUALITY_SUFFIX = (
     " clean illustration, smooth shading, soft lighting, controlled details, "
     "minimal texture, high clarity, refined edges, smooth gradients "
@@ -1565,19 +1569,214 @@ GPT_IMAGE2_QUALITY_SUFFIX = (
     "oversharpen, blotchy, chaotic details"
 )
 
+# ── B87 纹理档系统：LLM 提名 + 代码护栏 + 确定性渲染 ──────────────────────────
+_TEXTURE_MODE_ENUM = ("clean", "film_grain", "ink_wash_aged", "aged_paper", "print_halftone")
+
+# 每档后缀：要的纹理 + 焊死的去数字脏噪 negative（image2 缺陷在每条路径都堵）；
+# 前摄影档（ink_wash_aged/aged_paper）显式否定 film grain/sepia photo 对抗正文残留。
+# clean = 现 GPT_IMAGE2_QUALITY_SUFFIX 原文逐字（现代/科技/儿童/轻松零回归）。
+_TEXTURE_SUFFIX_MAP = {
+    "clean": GPT_IMAGE2_QUALITY_SUFFIX,
+    "film_grain": (
+        " authentic analog film photograph, fine 35mm film grain, warm faded vintage color, "
+        "soft halation, period emulsion patina, organic texture, gentle vignette "
+        "-- no digital noise, no oversharpen, no plastic smoothness, no neon saturation, "
+        "no modern HDR, no blotchy artifacts"
+    ),
+    "ink_wash_aged": (
+        " traditional Chinese ink-wash painting texture, soft brush gradients, aged rice-paper tone, "
+        "elegant negative space, muted natural pigment "
+        "-- no film grain, no photographic emulsion, no sepia photo, no halation, "
+        "no digital noise, no oversharpen, no plastic smoothness"
+    ),
+    "aged_paper": (
+        " aged paper and parchment texture, faded ink, antique manuscript patina, warm cream tone, "
+        "subtle foxing and wear "
+        "-- no film grain, no photographic emulsion, no digital noise, no oversharpen, "
+        "no neon saturation, no plastic smoothness"
+    ),
+    "print_halftone": (
+        " vintage offset print texture, fine halftone dots, faded retro poster color, "
+        "slight misregistration, aged pulp paper tone "
+        "-- no digital noise, no oversharpen, no plastic smoothness, no modern HDR, no blotchy artifacts"
+    ),
+}
+# 幂等去重 marker：每档后缀的首个独特短语（防 motion bridge 二次提交重复贴/漏贴）
+_TEXTURE_SUFFIX_MARKERS = (
+    "clean illustration", "analog film photograph", "ink-wash painting texture",
+    "aged paper and parchment", "vintage offset print",
+)
+# Stage0 收口：正文级纹理指令（替代散落的硬编码 sepia/老照片/film grain）
+_TEXTURE_BODY_DIRECTIVE = {
+    "clean": "画风严格遵循制片人 STYLE_KEY，干净细腻、高清、无颗粒做旧",
+    "film_grain": "写实胶片质感、老照片做旧、暖色调、35mm film grain、高清",
+    "ink_wash_aged": "中国水墨写意质感、宣纸做旧、留白雅致、高清",
+    "aged_paper": "古籍纸张质感、泛黄做旧、淡墨、高清",
+    "print_halftone": "复古印刷质感、半调网点、怀旧海报色、高清",
+}
+_TEXTURE_SCENE_PHRASE = {
+    "clean": "clean natural color and even cinematic lighting",
+    "film_grain": "warm sepia film tones and subtle analog grain",
+    "ink_wash_aged": "soft ink-wash tones on aged rice paper",
+    "aged_paper": "warm aged-paper and parchment tones",
+    "print_halftone": "faded retro offset-print tones",
+}
+_TEXTURE_GRID_PHRASE = {
+    "clean": "clean cinematic clarity with smooth detail",
+    "film_grain": "cinematic film grain and analog texture",
+    "ink_wash_aged": "ink-wash painterly rendering",
+    "aged_paper": "aged-paper vintage rendering",
+    "print_halftone": "retro print texture",
+}
+# motion (WERYDANCE 视频) 用——后缀管不到视频，直接换 film grain 措辞
+_TEXTURE_MOTION_PHRASE = {
+    "clean": "clean natural lighting",
+    "film_grain": "mild film grain",
+    "ink_wash_aged": "soft painterly diffusion",
+    "aged_paper": "soft aged tint",
+    "print_halftone": "subtle retro print cast",
+}
+
+# 全片纹理档（step1 设定，每个 topic 入口重设 → 天然 per-film reset，防 batch 串档）
+_ACTIVE_TEXTURE_PROFILE = "clean"
+
+
+def _era_is_pre_photographic(era: str) -> bool:
+    """era 是否前摄影时代（约 <1850，无照片）→ 该走水墨而非胶片。
+    关键修正：晚清/清末/民国/近代/含 ≥1850 年份 = 真摄影年代，不判前摄影
+    （保住大哥要的老上海/民国怀旧颗粒）。复用 token 边界防 shanghai 里 han 误伤。"""
+    e = (era or "").strip().lower()
+    if not e:
+        return False  # 空 era 不在此强判，由 _texture_guardrail 的保守兜底处理
+    # 摄影年代逃生舱：明确近代/民国/晚清 或含 1850-2100 年份 → 不是前摄影
+    if any(h in e for h in (
+        "republic", "民国", "晚清", "清末", "late_qing", "late qing", "近代", "现代",
+        "modern", "contemporary", "post-war", "postwar", "老上海", "旧上海", "wwi", "wwii",
+    )):
+        return False
+    import re as _re
+    years = [int(y) for y in _re.findall(r"\d{4}", e)]
+    if any(1850 <= y <= 2100 for y in years):
+        return False
+    if any(1000 <= y < 1850 for y in years):
+        return True
+    tokens = set(_re.split(r"[_\s\-]+", e))
+    if tokens & {
+        "tang", "song", "ming", "yuan", "han", "qin", "qing", "zhou", "jin", "sui",
+        "ancient", "antiquity", "feudal", "imperial", "dynasty", "warring", "kingdoms",
+    }:
+        return True
+    return any(k in e for k in ("古代", "上古", "先秦", "春秋", "战国", "唐", "宋", "明", "元", "汉", "秦", "周", "魏晋"))
+
+
+def _texture_mode_fallback(tone: str, era: str) -> str:
+    """LLM 没给 texture_mode 时的规则兜底（提名，仍过 _texture_guardrail 终审）。"""
+    if tone == "轻松":
+        return "clean"
+    if tone == "诗词古文":
+        return "ink_wash_aged"
+    if tone == "怀旧":
+        return "film_grain"
+    if _era_is_pre_photographic(era):
+        return "ink_wash_aged"
+    e = (era or "").lower()
+    if any(k in e for k in ("modern", "contemporary", "corporate", "tech", "digital", "nba", "future")):
+        return "clean"
+    import re as _re
+    if any(int(y) >= 2000 for y in _re.findall(r"\d{4}", e)):
+        return "clean"
+    if e:
+        return "film_grain"  # 摄影年代历史纪实（前摄影已被上面拦掉）
+    return "clean"  # 空 era 保守
+
+
+def _texture_guardrail(mode: str, era: str, tone: str, culture: str = "", style_key: str = "") -> str:
+    """代码终审：对 LLM 提名做确定性否决/降级（只降到安全，绝不强行加颗粒）。
+    优先级：非法→clean / 轻松→clean / 近现代→clean / 诗词古文→水墨 /
+            前摄影 veto→水墨 / 空 era 保守兜底。"""
+    photographic = {"film_grain", "print_halftone"}
+    m = (mode or "").strip().lower()
+    if m not in _TEXTURE_MODE_ENUM:
+        m = "clean"
+    t = (tone or "").strip()
+    e = (era or "").lower()
+    # 1. 轻松 → 永不做旧（合 L4027 既有 taboo：儿童/轻松禁 sepia/老照片）
+    if t == "轻松":
+        return "clean"
+    # 2. 明确近现代（≥2000 或 modern/tech token）→ clean，覆盖误选的颗粒
+    import re as _re
+    is_recent = any(k in e for k in ("modern", "contemporary", "tech", "future", "corporate", "digital", "nba")) \
+        or any(int(y) >= 2000 for y in _re.findall(r"\d{4}", e))
+    if is_recent and m in photographic:
+        log(f"[B87] texture veto: era={era} 近现代, {m}→clean")
+        return "clean"
+    # 3. 诗词古文 → 水墨，永不胶片
+    if t == "诗词古文" and m in photographic:
+        log(f"[B87] texture veto: 诗词古文, {m}→ink_wash_aged")
+        return "ink_wash_aged"
+    # 4. 前摄影时代 veto（最后一道墙，LLM 抽风也兜得住）
+    if _era_is_pre_photographic(e) and m in photographic:
+        log(f"[B87] texture veto: era={era} 前摄影时代, {m}→ink_wash_aged")
+        return "ink_wash_aged"
+    # 5. 空 era + 选了 photographic → 保守：并看水墨证据，宁清勿糊（怀旧除外，怀旧本是摄影年代）
+    if not e and m in photographic and t != "怀旧":
+        ctx = f"{culture} {style_key}".lower()
+        if any(k in ctx for k in ("ink", "水墨", "scroll", "卷轴", "calligraphy", "诗", "wash")):
+            log(f"[B87] texture: era 空 + 水墨证据, {m}→ink_wash_aged")
+            return "ink_wash_aged"
+        log(f"[B87] texture: era 空 + 无 photo 证据, {m}→clean 保守兜底")
+        return "clean"
+    return m
+
+
+def _set_active_texture_profile(mode: str) -> str:
+    """设全片纹理档（step1 调用）。env ADR_TEXTURE_PROFILE 可强制覆盖（回归基线/手动拍板）。"""
+    global _ACTIVE_TEXTURE_PROFILE
+    override = os.environ.get("ADR_TEXTURE_PROFILE", "").strip().lower()
+    if override in _TEXTURE_MODE_ENUM:
+        mode = override
+    m = (mode or "clean").strip().lower()
+    if m not in _TEXTURE_MODE_ENUM:
+        m = "clean"
+    _ACTIVE_TEXTURE_PROFILE = m
+    return m
+
+
+def _active_texture_suffix() -> str:
+    return _TEXTURE_SUFFIX_MAP.get(_ACTIVE_TEXTURE_PROFILE, GPT_IMAGE2_QUALITY_SUFFIX)
+
+
+def _active_texture_body_directive() -> str:
+    return _TEXTURE_BODY_DIRECTIVE.get(_ACTIVE_TEXTURE_PROFILE, _TEXTURE_BODY_DIRECTIVE["clean"])
+
+
+def _active_texture_scene_phrase() -> str:
+    return _TEXTURE_SCENE_PHRASE.get(_ACTIVE_TEXTURE_PROFILE, _TEXTURE_SCENE_PHRASE["clean"])
+
+
+def _active_texture_grid_phrase() -> str:
+    return _TEXTURE_GRID_PHRASE.get(_ACTIVE_TEXTURE_PROFILE, _TEXTURE_GRID_PHRASE["clean"])
+
+
+def _active_texture_motion_phrase() -> str:
+    return _TEXTURE_MOTION_PHRASE.get(_ACTIVE_TEXTURE_PROFILE, _TEXTURE_MOTION_PHRASE["clean"])
+
 
 def _inject_image2_quality_suffix(payload: dict) -> dict:
-    """所有 GPT_IMAGE_2 prompt 自动追加画质修正后缀（去颗粒感/去脏感）。"""
+    """所有 GPT_IMAGE_2 prompt 自动追加当前纹理档后缀（B87：clean 档=去颗粒，
+    film_grain/ink_wash 等档=保对应纹理 + 焊死去数字脏噪 negative）。"""
     if payload.get("model") != "GPT_IMAGE_2":
         return payload
     prompt = payload.get("prompt", "")
-    if not prompt or "clean illustration" in prompt:
+    suffix = _active_texture_suffix()
+    # 幂等：任一档 marker 已在 prompt → 不重复贴（多档 marker 检测）
+    if not prompt or any(mk in prompt for mk in _TEXTURE_SUFFIX_MARKERS):
         return payload
     # GPT_IMAGE_2 prompt 上限 5000 字符。suffix ~250 → 留余量
-    max_prompt = 5000 - len(GPT_IMAGE2_QUALITY_SUFFIX) - 10
+    max_prompt = 5000 - len(suffix) - 10
     if len(prompt) > max_prompt:
         prompt = prompt[:max_prompt]
-    return {**payload, "prompt": prompt + GPT_IMAGE2_QUALITY_SUFFIX}
+    return {**payload, "prompt": prompt + suffix}
 
 
 def submit_text_to_image(payload: dict, label: str, timeout: int = 45, max_attempts: int | None = None) -> dict:
@@ -3698,6 +3897,25 @@ def step1_script(topic: str) -> list[dict]:
         tone = "中性"
     log(f"题材基调判断：{tone}")
 
+    # B87: 全片纹理档（LLM 美术总监提名 + 代码护栏终审 → 设模块级全局，所有出图点读）
+    try:
+        if almanac_data:
+            _final_texture = "clean"  # 黄历=工笔/水墨（L4249 已专项处理），后缀走 clean 不做旧
+        else:
+            _decomp_tex = _llm_topic_decomposition(topic) or {}
+            _raw_texture = str(_decomp_tex.get("texture_mode", "") or "").strip().lower()
+            _era_for_tex = str(_decomp_tex.get("era", "") or topic_meta.get("era", "") or "").strip()
+            _culture_for_tex = str(topic_meta.get("culture", "") or _decomp_tex.get("culture", "") or "")
+            _style_for_tex = f"{topic_meta.get('period_visual', '')} {topic_meta.get('director', '')}"
+            if not _raw_texture:
+                _raw_texture = _texture_mode_fallback(tone, _era_for_tex)
+            _final_texture = _texture_guardrail(_raw_texture, _era_for_tex, tone, _culture_for_tex, _style_for_tex)
+            log(f"[B87] 纹理档: LLM提名={_raw_texture or '(空)'} → 护栏={_final_texture} (tone={tone}, era={_era_for_tex})")
+        _set_active_texture_profile(_final_texture)
+    except Exception as _tex_e:
+        _set_active_texture_profile("clean")
+        log(f"[B87] 纹理档判定异常，兜底 clean: {_tex_e}")
+
     # 风格指南
     if tone == "庄重":
         style_guide = """• 语言风格：朴素、克制、有分量，让60岁老人一听就懂
@@ -4246,7 +4464,7 @@ THUMBNAIL_ANCHOR: Air Force One stairs, black leather jacket figure, glowing chi
   - {'★★ 1919 专项禁令：每条英文 prompt 必须显式包含 "1919 Republican-era Beijing or post-WWI global setting; no Mao portrait, no PRC flag, no People Heroes Monument, no post-1949 Tiananmen decorations, no modern propaganda slogans"。' if is_1919_global_topic(topic) else ''}
   - 每张图必须使用制片人 PALETTE 指定的主色板，不得偏离
   - {'严格按照每句台词方括号内的板块主题设计画面' if almanac_data else '画面聚焦台词中的现代/校园/童趣场景，不使用历史元素' if tone == '轻松' else '严格符合上述历史参考中的年代、服饰、建筑、器物特征'}
-  - {'中国传统美术风格，工笔画或水墨画质感，暖色调，高清' if almanac_data else '画风严格遵循制片人 STYLE_KEY，高清细腻' if tone == '轻松' else '写实老照片风格，sepia tone，高清'}
+  - {'中国传统美术风格，工笔画或水墨画质感，暖色调，高清' if almanac_data else _active_texture_body_directive()}
   - {'竖版构图（9:16）：人物特写为主，上留天空下留地面，主体居中偏上' if IS_VERTICAL else '横版构图（16:9）：注重场景纵深和环境氛围'}，包含具体的光线、景别描述
   - {'每张画面必须包含该板块的核心视觉元素' if almanac_data else '人物描述与制片人 Hero Anchor 完全一致（同一主角、同一发型、同一服饰）；场景取自 Setting Anchor' if tone == '轻松' else '人物的穿着、发型、体态必须符合该历史时期'}
   - ★ 中文元素渲染：如果制片人 VISUAL_CONTINUITY 里指定了 Chinese Text Anchors，在对应分镜号里，必须在画面自然位置（校牌 / 门楣 / 勋章 / 墙面 / 校徽）渲染这些中文字串。英文 prompt 里要用 `render the exact Chinese text "..."` 明确指令 Nano Banana 2
@@ -7894,7 +8112,7 @@ def _topic_cache_path(topic: str) -> Path:
 # v2: 2026-05-21 加 is_action_topic / action_density_hint / recommended_action_b_count
 # v3: 2026-05-25 加 director_style_route (PR-2)
 # v4: 2026-05-25 加 audit_risk_score (达尔文 R2 阶段 C)
-TOPIC_DECOMPOSITION_CACHE_VERSION = 5  # B64: 加 mode 字段, v4 cache 自动失效重推
+TOPIC_DECOMPOSITION_CACHE_VERSION = 6  # B87: 加 texture_mode 字段, v5 cache 自动失效重推
 
 
 def _load_topic_decomposition_cache(topic: str) -> dict | None:
@@ -8657,6 +8875,7 @@ def _llm_topic_decomposition(topic: str, use_cache: bool = True) -> dict:
   "role_candidates": ["4-6 个现场角色名 中文短语，符合 topic 时代和性质"],
   "director_style": "导演风格 英文短语 (e.g. corporate clean handheld documentary / epic dramatic backlight)",
   "director_style_route": "intimate_wuxia | imax_war_epic | saturated_folk | slow_poetic | gritty_kinetic | classical_realism | modern_documentary",
+  "texture_mode": "clean | film_grain | ink_wash_aged | aged_paper | print_halftone",
   "cover_art_direction": "封面美术方向 中文短语 (e.g. 极简金融感冷色调 / 史诗水墨卷轴)",
   "is_action_topic": false,
   "mode": "ads | adsd | adr — B64自决: adsd=多人对话/访谈/辩论(双人+对白); ads=单旁白纪录片(默认,旁白讲述+动态画面); adr=极简静态(罕用). 绝大多数纪录片=ads",
@@ -8691,6 +8910,13 @@ def _llm_topic_decomposition(topic: str, use_cache: bool = True) -> dict:
    · gritty_kinetic     体育/动作/快剪 (昆汀调): 快剪辑 + 低角度 + 紧凑张力
    · classical_realism  历史人物/教科书 (黑泽明调): 黑白对比 + 古典构图 + 历史还原
    · modern_documentary 现代纪录片/商业职场 (默认): 手持纪实 + 自然光 + 静观
+8. texture_mode 必填 (B87 画面纹理档 · 5 选 1，决定颗粒/做旧/水墨质感):
+   · film_grain     近现代纪实/老照片/老上海/民国/晚清/七八十年代/怀旧/老电影/战争历史照片 (摄影年代 ≥1850) → 要胶片颗粒做旧
+   · ink_wash_aged  唐诗宋词/古典文学赏析/水墨/古代史(唐宋元明盛清宫廷·前摄影年代)/书法/禅意 → 水墨写意，绝不胶片
+   · aged_paper     古籍善本/手稿/古地图/族谱/碑帖 → 泛黄纸张做旧
+   · print_halftone 复古海报/连环画/报刊/老广告/波普 → 半调印刷做旧
+   · clean          现代/科技/商业/职场/美食/儿童/卡通/校园/治愈/轻松/未来 → 干净无颗粒 (默认)
+   判据：题材是不是摄影年代(1850后)?是→film_grain；前摄影古典→ink_wash_aged；现代/轻松→clean
 
 只输出 JSON。"""
     try:
@@ -9739,7 +9965,7 @@ def generate_character_meta_grid_gpt_image2(speaker: str, visual_subject: str, v
         f"   Treat this as a luxury fashion editorial spread where panels speak through image alone.\n\n"
         f"Layout ({layout_aspect}, evenly spaced grid):\n{chr(10).join(cell_lines)}\n\n"
         f"Style continuity: same character identity / face / body type across all character panels; "
-        f"era={era_label} consistent wardrobe; cinematic film grain, motivated lighting, "
+        f"era={era_label} consistent wardrobe; {_active_texture_grid_phrase()}, motivated lighting, "
         f"editorial composition. Scene panels are pure environment, no people facing camera.\n"
         f"Strictly era={era_label} — no anachronistic clothing / props / lighting."
     )
@@ -11145,7 +11371,7 @@ def step6_parallel(script: list[dict], topic: str, pregenerated_bgm_path: str | 
                             elif tone_active == "轻松":
                                 style_req = "明亮鲜艳的卡通/插画风格，高饱和暖色调，阳光感、治愈系、适合儿童"
                             else:
-                                style_req = "写实老照片风格，sepia tone"
+                                style_req = _active_texture_body_directive()  # B87: 收口硬编码 sepia
                             if hist:
                                 hist_block = f"【制片人准则（最高优先级，必须严格遵循）】\n{hist}\n\n"
                                 ref_req = "• 严格遵守制片人准则中的 STYLE_KEY / PALETTE / LIGHTING_AND_CAMERA / SUBJECT_DETAILS / TABOOS，不得越界\n"
@@ -11725,7 +11951,7 @@ def _build_motion_video_prompt(scene: dict, motion_prompt: str, safe_retry: bool
             )
         return (
             "Historically grounded period dialogue scene, neutral archival realism, "
-            "warm sepia paper tones, period clothing and topic-accurate props. "
+            f"{_active_texture_scene_phrase()}, period clothing and topic-accurate props. "
             f"{contract}. "
             f"Scene action: {shot}. "
             f"{action_block}. "
@@ -14222,7 +14448,7 @@ def _adsd_lip_sync_prompt(scene: dict, safe_retry: bool = False) -> str:
         f"Active speaker expression: {expr}. Avoid generic neutral documentary mask — let mood read on the face. "
         f"Scene action: {shot}. "
         "Camera style: handheld documentary realism — subtle organic shake, slight breathing in framing, natural lens micro-drift, gentle parallax. "
-        "Lighting: practical real-world lighting with motivated shadows; mild film grain; subtle lens vignette. "
+        f"Lighting: practical real-world lighting with motivated shadows; {_active_texture_motion_phrase()}; subtle lens vignette. "
         "Avoid synthetic-looking smooth interpolation; let small imperfections (eye blinks, micro head adjustments, breath movement, cloth ripple) read as real-world capture. "
         "Keep the same face and period clothing, keep framing immersive for its topic era. "
         f"{_werydance_caption_instruction(scene)} No speaker labels, logos, or watermarks."
@@ -14254,7 +14480,7 @@ def _adsd_broll_motion_prompt(scene: dict, safe_retry: bool = False) -> str:
         f"Character expression and body language matching mood: {expr}. Avoid blank serious face — let mood read in eyes, brow, posture. "
         "Camera style: handheld documentary realism with organic shake and breathing framing; or smooth gimbal dolly when emphasizing motion direction. "
         "Subjects move with full-body engagement: walking, gesturing, working, reacting — NOT subtle micro-twitches alone. "
-        "Lighting: practical real-world sources with motivated shadows; film grain; mild lens vignette; depth of field. "
+        f"Lighting: practical real-world sources with motivated shadows; {_active_texture_motion_phrase()}; mild lens vignette; depth of field. "
         "All visible elements (characters, objects, environment) carry kinetic life: garment ripple, hair flow, ambient particles, foliage drift, water ripple. "
         "Avoid synthetic smooth interpolation — let small imperfections read as real capture. "
         f"{action_boost}"
@@ -14340,7 +14566,7 @@ def _adsd_silent_b_motion_prompt(scene: dict, safe_retry: bool = False) -> str:
         "Cinematic documentary breathing shot — pure atmospheric mood, no spoken dialogue, no lip-sync, no character close-up. "
         f"{rule_emphasis} "
         "Slow contemplative camera move (glide / slow push / hold). "
-        "Lighting: practical real-world sources with motivated shadows; mild film grain; lens vignette; soft depth of field. "
+        f"Lighting: practical real-world sources with motivated shadows; {_active_texture_motion_phrase()}; lens vignette; soft depth of field. "
         "Ambient kinetic life: dust motes, light flicker, water ripple, foliage drift, fabric breath, particles in air. "
         "No synthetic smoothness — let it read as captured reality. "
     )
