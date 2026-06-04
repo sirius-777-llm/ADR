@@ -12101,6 +12101,41 @@ def _validate_enum_field(value: object, enum_set: set, default: str, max_len: in
     return default
 
 
+# B91.1 (2026-06-05): WERYDANCE_2_0 = Seedance 2.0, 原生支持结构化运镜语法
+# (Camera: [move]+[speed]+[subject-lock]+[stability]). 把单值 camera_motion enum
+# 升级成 Seedance 导演级指令 + 情绪门控复合运镜 (dolly-zoom 眩晕)。零 API 参数改动, 纯 prompt。
+_SEEDANCE_CAMERA_GRAMMAR = {
+    "static": "Camera: locked static shot, steady tripod, no movement, composed deliberate framing",
+    "slow push-in": "Camera: slow dolly push-in toward the subject, smooth gimbal, steady, subject locked in frame",
+    "pull-back reveal": "Camera: slow dolly pull-back reveal, smooth crane, steady, gradually revealing the wider environment",
+    "dolly right": "Camera: lateral dolly tracking right, smooth gimbal, steady glide, subject tracked",
+    "dolly left": "Camera: lateral dolly tracking left, smooth gimbal, steady glide, subject tracked",
+    "crane up": "Camera: crane boom rising upward, smooth, steady, revealing scale from a higher vantage",
+    "crane down": "Camera: crane boom descending downward, smooth, steady, settling onto the subject",
+    "whip pan": "Camera: fast whip pan, quick kinetic horizontal sweep, motion-blur transition",
+    "orbit": "Camera: slow orbital arc circling around the subject, smooth gimbal, steady, subject centered",
+    "handheld shake": "Camera: handheld documentary, subtle organic shake, breathing framing, natural lens micro-drift",
+    "rack focus": "Camera: rack focus pull between foreground and subject, locked framing, shallow depth of field",
+}
+_DOLLY_ZOOM_EMOTIONS = (  # codex Low: 收窄为强情绪多字词, 去"惊/恐/崩/眩"单字防过触发
+    "紧张", "压抑", "震撼", "眩晕", "悬疑", "悬念", "惊悚", "恐惧", "高潮", "崩溃", "窒息",
+    "tense", "climax", "vertigo", "dread", "shock",
+)
+
+
+def _seedance_camera_directive(scene: dict, base_move: str = "") -> str:
+    """B91.1: camera_motion enum → Seedance 结构化运镜指令 + 情绪门控复合运镜。"""
+    move = str(base_move or scene.get("camera_motion") or "").strip().lower()  # codex Med: 防非str崩
+    if move not in _SEEDANCE_CAMERA_GRAMMAR:
+        move = "slow push-in"
+    emotion = str(scene.get("emotion", "")).lower()
+    # 复合运镜: 紧张/震撼/高潮 + 推近/静止 → dolly-zoom 眩晕 (Seedance 招牌复合镜)
+    if move in ("slow push-in", "static") and any(k in emotion for k in _DOLLY_ZOOM_EMOTIONS):
+        return ("Camera: dolly-zoom vertigo effect (dolly backward while zooming in), "
+                "unsettling perspective warp, subject locked center, dramatic and tense")
+    return _SEEDANCE_CAMERA_GRAMMAR[move]
+
+
 def _build_motion_video_prompt(scene: dict, motion_prompt: str, safe_retry: bool = False) -> str:
     action_block = _motion_action_block(scene, 520)
     if ADS_DIALOGUE_MODE:
@@ -12116,13 +12151,16 @@ def _build_motion_video_prompt(scene: dict, motion_prompt: str, safe_retry: bool
                 f"{action_block}. Natural light, realistic motion.{pov} "
                 "Keep the scene immersive for its topic era, no famous style, no branded references, no movie references, no text, no logos, no watermark."
             )
+        # B91.1/codex Med: 用 _validate_enum_field (防 list/dict 给 in-set 崩 + 校验空白/大小写)
+        _adsd_move = _validate_enum_field(scene.get("camera_motion"), _PR3B1_CAMERA_MOTION_ENUM, "")
+        _adsd_cam = _seedance_camera_directive(scene, _adsd_move) if _adsd_move else f"Camera motion: {motion_prompt}"
         return (
             "Historically grounded period dialogue scene, neutral archival realism, "
             f"{_active_texture_scene_phrase()}, period clothing and topic-accurate props. "
             f"{contract}. "
             f"Scene action: {shot}. "
             f"{action_block}. "
-            f"Camera motion: {motion_prompt}. "
+            f"{_adsd_cam}. "
             "Avoid branded style references, artist names, movie-title references, copyrighted characters, modern devices, subtitles, logos, watermarks."
         )
     scene_prompt = scene.get("prompt", "")
@@ -12131,10 +12169,6 @@ def _build_motion_video_prompt(scene: dict, motion_prompt: str, safe_retry: bool
     # Stage 3 Medium fix: scene 字段加白名单校验 + 限长 (raw LLM 输出可能含注入式/非法值)
     # Stage 3 Low2 fix: scene.camera_motion == 'static' 时不覆盖 motion_prompt (static 不如自由文本丰富)
     _validated_motion = _validate_enum_field(scene.get("camera_motion"), _PR3B1_CAMERA_MOTION_ENUM, "")
-    if _validated_motion and _validated_motion != "static":
-        effective_motion = _validated_motion
-    else:
-        effective_motion = motion_prompt or _validated_motion or "static"
     # 追加 PR-3b.1 其他 3 enum 当 cinema 标签 (shot_type/camera_angle/lighting) 让 WERYDANCE 看见
     cinema_tags = []
     for tag_key, label, enum_set in (
@@ -12146,9 +12180,16 @@ def _build_motion_video_prompt(scene: dict, motion_prompt: str, safe_retry: bool
         if val:
             cinema_tags.append(f"{label}: {val}")
     cinema_tail = (". Cinema: " + " | ".join(cinema_tags)) if cinema_tags else ""
+    # B91.1: enum 运镜 → Seedance 结构化导演指令; LLM 自由文本运镜(更丰富时)保留
+    if _validated_motion and _validated_motion != "static":
+        camera_clause = _seedance_camera_directive(scene, _validated_motion)
+    elif motion_prompt:
+        camera_clause = f"Camera motion: {motion_prompt}"
+    else:
+        camera_clause = _seedance_camera_directive(scene, "static")
     if scene_prompt:
-        return f"{scene_prompt}. {action_block}. Camera motion: {effective_motion}{cinema_tail}"
-    return f"{action_block}. Camera motion: {effective_motion}{cinema_tail}" if action_block else f"{effective_motion}{cinema_tail}"
+        return f"{scene_prompt}. {action_block}. {camera_clause}{cinema_tail}"
+    return f"{action_block}. {camera_clause}{cinema_tail}" if action_block else f"{camera_clause}{cinema_tail}"
 
 
 def _short_board_text(value: object, limit: int = 170) -> str:
