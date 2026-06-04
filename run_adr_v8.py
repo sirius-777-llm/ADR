@@ -4374,8 +4374,8 @@ THUMBNAIL_ANCHOR: Air Force One stairs, black leather jacket figure, glowing chi
         _director_route = str(_brief_field(topic, "brief.visual.director_route",
             _decomp_for_director.get("director_style_route") or "modern_documentary") or "modern_documentary").strip().lower()
     else:
-        _director_route = (_decomp_for_director.get("director_style_route") or "modern_documentary").strip().lower()
-    director_route_block = _director_route_block(_director_route)
+        _director_route = str(_decomp_for_director.get("director_style_route") or "modern_documentary").strip().lower()
+    director_route_block = _director_route_block(_director_route, _decomp_for_director)
     log(f"PR-2 导演路由: topic={topic[:30]} → route={_director_route}")
 
     jiangwen_prompt = f"""你是顶级电影画面导演。任务: 为给定台词设计统一的电影镜头。
@@ -4814,9 +4814,8 @@ shot_type/camera_angle/lighting/camera_motion 必须从上述 enum 选, 不能�
     # 改: director_tag = 自适应 base_style(topic_meta.director, LLM 按题材产出) + 该片 route 的 palette
     # (按题材路由自适应) + 题材无关的连贯性锚(合法护栏)。介质/颗粒交 STYLE_KEY/texture_mode(B87) 决定,
     # 不再强制 photorealistic(儿童/水墨/卡通题材本不该写实)。
-    _route_palette = (
-        DIRECTOR_STYLE_ROUTES.get(_director_route, DIRECTOR_STYLE_ROUTES["modern_documentary"]).get("palette", "")
-    )
+    # B89.4: 用 _resolve_route_style(含 custom 逃生口) 取 palette，custom 题材也拿 LLM 自拟色板
+    _route_palette = _resolve_route_style(_director_route, _decomp_for_director).get("palette", "")
     # B89/codex Med: 轻松/儿童题材 parts[0] 别用中性 route palette 压暗尾部 bright 情绪色，
     # 改用明快高调色（儿童/轻松是风格塌陷重灾区，B89.3/B89.4 会更彻底）
     _palette_for_style = (
@@ -8987,7 +8986,8 @@ def _llm_topic_decomposition(topic: str, use_cache: bool = True) -> dict:
   "bgm_mood": "BGM 情绪短语 (e.g. 稳健进取 / 史诗激昂 / 静谧沉思)",
   "role_candidates": ["4-6 个现场角色名 中文短语，符合 topic 时代和性质"],
   "director_style": "导演风格 英文短语 (e.g. corporate clean handheld documentary / epic dramatic backlight)",
-  "director_style_route": "intimate_wuxia | imax_war_epic | saturated_folk | slow_poetic | gritty_kinetic | classical_realism | modern_documentary",
+  "director_style_route": "intimate_wuxia | imax_war_epic | saturated_folk | slow_poetic | gritty_kinetic | classical_realism | modern_documentary | custom",
+  "custom_visual_style": {{"anchor": "仅当 director_style_route=custom 时填(否则给空串): 该题材最合适的镜头语言/构图/光线 英文短语 15-40 词, 禁具体导演/画家实名", "palette": "3-5 个色板关键词(英文)", "rhythm": "镜头节奏/剪辑 英文短语"}},
   "texture_mode": "clean | film_grain | ink_wash_aged | aged_paper | print_halftone",
   "cover_art_direction": "封面美术方向 中文短语 (e.g. 极简金融感冷色调 / 史诗水墨卷轴)",
   "is_action_topic": false,
@@ -9023,6 +9023,7 @@ def _llm_topic_decomposition(topic: str, use_cache: bool = True) -> dict:
    · gritty_kinetic     体育/动作/快剪 (昆汀调): 快剪辑 + 低角度 + 紧凑张力
    · classical_realism  历史人物/教科书 (黑泽明调): 黑白对比 + 古典构图 + 历史还原
    · modern_documentary 现代纪录片/商业职场 (默认): 手持纪实 + 自然光 + 静观
+   · custom              ★以上 7 种都【不贴合】题材时(如 恐怖惊悚/科幻赛博朋克/美食微距/儿童动画/MV音乐/奇幻/喜剧/悬疑推理/太空科幻)→ 选 custom, 并在 custom_visual_style 里【自拟】最贴该题材的 anchor(镜头语言/构图/光线 15-40词)+ palette(色板)+ rhythm(节奏)。禁具体导演/画家实名。宁可 custom 自拟也别硬塞进不贴合的预设桶——这是让风格适应各种题材的关键
 8. texture_mode 必填 (B87 画面纹理档 · 5 选 1，决定颗粒/做旧/水墨质感):
    · film_grain     近现代纪实/老照片/老上海/民国/晚清/七八十年代/怀旧/老电影/战争历史照片 (摄影年代 ≥1850) → 要胶片颗粒做旧
    · ink_wash_aged  唐诗宋词/古典文学赏析/水墨/古代史(唐宋元明盛清宫廷·前摄影年代)/书法/禅意 → 水墨写意，绝不胶片
@@ -9117,15 +9118,66 @@ DIRECTOR_STYLE_ROUTES: dict[str, dict] = {
 }
 
 
-def _director_route_block(route: str) -> str:
-    """PR-2: 取 director_style_route 路由后的英文风格关键词块, 注入 jiangwen_prompt."""
-    route = (route or "modern_documentary").strip().lower()
-    if route not in DIRECTOR_STYLE_ROUTES:
-        route = "modern_documentary"
-    r = DIRECTOR_STYLE_ROUTES[route]
+_CUSTOM_STYLE_BANNED_NAMES = (
+    "nolan", "tarantino", "wong kar", "kurosawa", "zhang yimou", "ang lee", "spielberg",
+    "kubrick", "fincher", "wes anderson", "scorsese", "villeneuve", "miyazaki", "宫崎",
+    "诺兰", "昆汀", "王家卫", "黑泽明", "张艺谋", "李安", "斯皮尔伯格", "库布里克",
+)
+
+
+def _validate_custom_visual_style(cvs: dict) -> tuple[bool, str]:
+    """B89.4 护栏: LLM 自拟 custom 风格须有 anchor+palette、无导演/画家实名、长度合理。"""
+    if not isinstance(cvs, dict):
+        return False, "非 dict"
+    anchor_raw = cvs.get("anchor", "")
+    palette_raw = cvs.get("palette", "")
+    # codex Low: anchor/palette 必须是字符串(防 list/dict 被 str() 后误过校验产出脏 prompt)
+    if not isinstance(anchor_raw, str) or not isinstance(palette_raw, str):
+        return False, "anchor/palette 非字符串"
+    anchor = anchor_raw.strip()
+    palette = palette_raw.strip()
+    if len(anchor) < 8 or len(palette) < 4:
+        return False, "anchor/palette 缺失或过短"
+    if len(anchor) > 400 or len(palette) > 200:
+        return False, "过长"
+    blob = f"{anchor} {palette} {cvs.get('rhythm', '')}".lower()
+    for n in _CUSTOM_STYLE_BANNED_NAMES:
+        if n in blob:
+            return False, f"含导演/画家实名 {n}"
+    return True, "ok"
+
+
+def _resolve_route_style(route: str, decomp: dict | None = None) -> dict:
+    """B89.4: 返回该片的有效风格 {name,label,anchor,palette,rhythm}。
+    route ∈ 7 预设 → 用预设; route=custom/未知 且 LLM 给了合法 custom_visual_style → 用 LLM 自拟(逃生口);
+    否则 → modern_documentary 兜底(可观测 log)。让任意题材(恐怖/科幻/美食/儿童/MV)都能拿到 LLM 作曲的风格。"""
+    route = str(route or "").strip().lower()  # codex High: 防 LLM/cache 给非字符串 route 崩
+    if route in DIRECTOR_STYLE_ROUTES:
+        d = DIRECTOR_STYLE_ROUTES[route]
+        return {"name": route, "label": d["label"], "anchor": d["anchor"], "palette": d["palette"], "rhythm": d["rhythm"]}
+    cvs = (decomp or {}).get("custom_visual_style") or {}
+    ok, reason = _validate_custom_visual_style(cvs)
+    if ok:
+        log(f"[B89.4] custom 风格逃生口启用: route={route or '(空)'} → LLM 自拟 anchor={str(cvs.get('anchor',''))[:48]}")
+        return {
+            "name": "custom",
+            "label": "LLM 自拟题材风格",
+            "anchor": str(cvs.get("anchor", "")).strip(),
+            "palette": str(cvs.get("palette", "")).strip(),
+            "rhythm": str(cvs.get("rhythm", "")).strip() or "deliberate cohesive pacing matched to the topic",
+        }
+    if route and route != "modern_documentary":
+        log(f"[B89.4] route={route} 非预设且 custom_visual_style 无效({reason}) → 兜底 modern_documentary")
+    d = DIRECTOR_STYLE_ROUTES["modern_documentary"]
+    return {"name": "modern_documentary", "label": d["label"], "anchor": d["anchor"], "palette": d["palette"], "rhythm": d["rhythm"]}
+
+
+def _director_route_block(route: str, decomp: dict | None = None) -> str:
+    """PR-2 + B89.4: 取 director_style_route(含 custom 逃生口)风格关键词块, 注入 jiangwen_prompt."""
+    r = _resolve_route_style(route, decomp)
     return (
         f"★★★ DIRECTOR STYLE ROUTE (题材路由 · 全片必须严格统一这一种风格) ★★★\n"
-        f"路由: {route} ({r['label']})\n"
+        f"路由: {r['name']} ({r['label']})\n"
         f"VISUAL ANCHOR: {r['anchor']}\n"
         f"PALETTE: {r['palette']}\n"
         f"RHYTHM: {r['rhythm']}\n"
