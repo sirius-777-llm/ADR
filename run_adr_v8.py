@@ -5214,6 +5214,22 @@ _ADSD_POLICY_REWRITE_TERMS = {
     "开战": "扩大冲突",
     "战争": "战事",
     "军事": "军务",
+    # B88: 战争/灾难题材触发 weryai TTS 1002 的军事/暴力专有词（规则兜底，LLM 分级改写为主）
+    "日军": "那支军队",
+    "日本军队": "那支军队",
+    "敌军": "对方",
+    "侵略": "进犯",
+    "侵华": "那场冲突",
+    "炮火": "战火",
+    "炮击": "隆隆声响",
+    "轰炸": "空中袭扰",
+    "空袭": "空中袭扰",
+    "屠杀": "重大伤亡",
+    "杀戮": "伤亡",
+    "血腥": "惨烈",
+    "尸体": "罹难者",
+    "沦陷": "陷落",
+    "占领": "进入",
 }
 
 def _sanitize_for_external_api(text: str) -> str:
@@ -5239,18 +5255,29 @@ def _is_content_policy_error(err: Exception) -> bool:
     )
 
 
-def _rewrite_adsd_tts_text_for_policy(text: str, speaker: str, err: Exception) -> str:
-    """Rewrite only the blocked ADSD TTS line into neutral historical wording."""
+def _rewrite_adsd_tts_text_for_policy(text: str, speaker: str, err: Exception, level: int = 1) -> str:
+    """把撞 weryai TTS 审核(1002)的那句旁白改写成可过审措辞。
+    B88: level 逐级加狠——每一档都【绝不新增任何事实/数字/人物/地点】，只弱化或抽象现有内容。
+      L1 软化语气(去控诉/暴力/煽动词)
+      L2 删军队番号/武器/具体暴力动作(日军/炮火/轰炸)，保时间地点+史实框架
+      L3 抽象历史化(去掉一切军事/国家/政治专有名词，只留时间感+地点+情绪)
+      L4 极中性(完全不提任何军事/暴力/国家/政治/灾难细节，只一句平和的历史回望)
+    """
     original = text or ""
     sanitized = _sanitize_for_external_api(original)
-    prompt = f"""把下面这句短视频对白改写成更中性、可播报的历史说明，用于 TTS。
+    lv = max(1, min(4, int(level)))
+    anti_hallucination = "★铁律：绝不新增、不夸大、不编造任何事实/数字/人物/地点，只能弱化或抽象【原句已有】的内容。"
+    level_rule = {
+        1: "把语气改中性可播报：去掉强烈控诉、暴力、威胁、仇恨、煽动词，保留事实含义。",
+        2: "删掉所有军队番号/国别军队称谓/武器/具体暴力动作词(如 日军/炮火/轰炸/空袭/屠杀)，用中性历史措辞替代(战火/那场战事/动荡)，仍保留时间、地点与史实框架。",
+        3: "抽象历史化：去掉一切军事、武器、国别、政治专有名词，只保留时间感、地点与情绪氛围，写成一句克制的历史叙述。",
+        4: "极度中性：完全不提任何军事/暴力/武器/国别/政治/灾难细节，只用一句平和、抽象的历史回望来承接情绪，可以很概括。",
+    }[lv]
+    prompt = f"""把下面这句短视频旁白/对白改写成能通过内容审核、可用于 TTS 播报的措辞。
 
-要求：
-1. 保留事实含义，不新增事件。
-2. 避免强烈控诉、暴力、威胁、仇恨、煽动词。
-3. 仍然像人物对白，不要写成论文。
-4. 不超过 {max(28, min(70, len(original) + 8))} 个汉字。
-5. 只输出改写后的这一句，不加引号、不加解释。
+本档要求(第 {lv} 级)：{level_rule}
+{anti_hallucination}
+其它：仍像口播的一句话不要写成论文；不超过 {max(24, min(70, len(original) + 8))} 个汉字；只输出改写后的这一句，不加引号不加解释。
 
 角色：{speaker}
 原句：{sanitized}
@@ -5260,23 +5287,74 @@ def _rewrite_adsd_tts_text_for_policy(text: str, speaker: str, err: Exception) -
     try:
         rewritten = chat(
             "GEMINI_25_FLASH",
-            "你是历史短视频对白编辑，只输出一行可播报中文。",
+            "你是历史短视频旁白编辑，只输出一行可播报、能过内容审核的中文。",
             prompt,
             max_tokens=180,
             timeout=90,
         ).strip()
     except Exception as e:
-        log(f"ADSD TTS policy 改写 LLM 失败，走规则兜底：{e}")
+        log(f"ADSD TTS policy 改写 LLM 失败(level={lv})，走规则兜底：{e}")
     rewritten = re.sub(r'^[「"“”]+|[」"“”]+$', "", rewritten).strip()
     rewritten = rewritten.splitlines()[0].strip() if rewritten else ""
     if not rewritten or rewritten == original:
+        # 规则兜底：军事/暴力词典替换
         rewritten = sanitized
         for k, v in _ADSD_POLICY_REWRITE_TERMS.items():
             rewritten = rewritten.replace(k, v)
     rewritten = _sanitize_for_external_api(rewritten)[:500]
     if not rewritten:
-        rewritten = "这件事需要放回当年的国际形势里看。"
+        rewritten = "这段往事，值得放回当年的时代背景里慢慢回看。"
     return rewritten
+
+
+# B88: 全部分级改写都耗尽时的极中性兜底句（保证过审，按 tone 取，保 turn 不崩管线）
+_TTS_SAFE_FALLBACK_LINE = {
+    "庄重": "这段历史，值得我们认真地记住与回望。",
+    "怀旧": "那些旧时光，静静留在了人们的记忆里。",
+    "诗词古文": "千百年来，这样的情怀始终被人们传诵。",
+    "轻松": "这件事，如今想来还挺有意思的。",
+    "中性": "这段往事，值得我们放回当年慢慢回看。",
+}
+
+
+def _tts_safe_fallback_line(tone: str | None) -> str:
+    """B88 graceful degradation: 永不崩管线的最后兜底句（content-safe，足够时长不漂时间轴）。"""
+    return _TTS_SAFE_FALLBACK_LINE.get((tone or "").strip(), _TTS_SAFE_FALLBACK_LINE["中性"])
+
+
+def _tts_silent_placeholder(turn: dict, idx: int) -> tuple[str, float, dict]:
+    """B88 终极 backstop: 连中性兜底句都被审核拒(极罕见)时返回短静音，保管线绝不崩。
+    codex High fix: ffmpeg 失败时用纯 Python wave 兜底写合法 wav，绝不返回不存在/空文件
+    (否则下游 concat 会崩，反而破坏"永不崩")。"""
+    speaker = turn.get("speaker", "speaker")
+    safe_sp = re.sub(r"[^一-龥A-Za-z0-9_]", "_", speaker)[:30] or "speaker"
+    wav_path = str(OUTPUT_DIR / f"turn_{idx+1:02d}_{safe_sp}_silent.wav")
+    dur = 2.0
+    sr = 44100
+    try:
+        ffmpeg("-f", "lavfi", "-i", f"anullsrc=r={sr}:cl=mono", "-t", f"{dur}",
+               "-c:a", "pcm_s16le", wav_path, timeout=30)
+    except Exception as e:
+        log(f"ADSD TTS {idx+1} 静音占位 ffmpeg 失败，转 wave 兜底：{e}")
+    # 强校验文件真实存在且非空，否则纯 Python wave 兜底（绝不返回坏路径）
+    if not os.path.exists(wav_path) or os.path.getsize(wav_path) < 1024:
+        try:
+            import wave
+            with wave.open(wav_path, "wb") as wf:
+                wf.setnchannels(1)
+                wf.setsampwidth(2)
+                wf.setframerate(sr)
+                wf.writeframes(b"\x00\x00" * int(sr * dur))
+        except Exception as e2:
+            log(f"ADSD TTS {idx+1} 静音占位 wave 兜底也失败（极异常）：{e2}")
+    try:
+        probed = ffprobe_duration(wav_path)
+        if probed and probed > 0:
+            dur = probed
+    except Exception:
+        pass
+    turn["tts_silent_placeholder"] = True
+    return wav_path, dur, {"tts_policy_rewritten": True, "tts_silent_placeholder": True}
 
 
 def _record_adsd_tts_rewrite(idx: int, speaker: str, before: str, after: str, err: Exception):
@@ -5707,7 +5785,10 @@ def _tts_turn_to_audio(turn: dict, idx: int, max_retries: int = 3) -> tuple[str,
         _record_adsd_tts_rewrite(idx, speaker, original_text, text, RuntimeError("initial external-api sanitization"))
     last_err = None
     rewrite_count = 0
-    for attempt in range(max_retries):
+    max_rewrites = max(1, int(os.environ.get("ADR_TTS_MAX_REWRITES", "4") or "4"))
+    safe_fallback_used = False
+    network_attempt = 0
+    while True:
         try:
             payload = {
                 "text": text,
@@ -5736,27 +5817,47 @@ def _tts_turn_to_audio(turn: dict, idx: int, max_retries: int = 3) -> tuple[str,
                 "cost_credits": data.get("cost_credits"),
                 "mp3_path": mp3_path,
                 "tts_policy_rewritten": bool(turn.get("tts_policy_rewritten")),
+                "tts_safe_fallback": bool(turn.get("tts_safe_fallback")),
             }
         except Exception as e:
             last_err = e
-            if _is_content_policy_error(e) and rewrite_count < 2:
-                before = turn.get("text", text)
-                after = _rewrite_adsd_tts_text_for_policy(before, speaker, e)
-                rewrite_count += 1
-                turn["text"] = after
-                turn["tts_policy_rewritten"] = True
-                text = _sanitize_for_external_api(after)[:500]
-                _record_adsd_tts_rewrite(idx, speaker, before, after, e)
-                tg(f"⚠️ ADSD TTS {idx+1} 触发内容审查，已自动改写为中性历史表述后重试")
-                log(f"ADSD TTS {idx+1} policy rewrite: {before} -> {after}")
-                continue
-            if attempt < max_retries - 1:
-                wait_s = 2 * (attempt + 1)
-                log(f"ADSD TTS {idx+1} 失败（第 {attempt+1}/{max_retries} 次）：{e}，{wait_s}s 后重试")
+            # ── B88: 内容审核(1002) → 分级软化 → 中性兜底句 → 静音 backstop，绝不崩管线 ──
+            if _is_content_policy_error(e):
+                if rewrite_count < max_rewrites:
+                    rewrite_count += 1
+                    before = turn.get("text", text)
+                    after = _rewrite_adsd_tts_text_for_policy(before, speaker, e, level=rewrite_count)
+                    turn["text"] = after
+                    turn["tts_policy_rewritten"] = True
+                    text = _sanitize_for_external_api(after)[:500]
+                    _record_adsd_tts_rewrite(idx, speaker, before, after, e)
+                    tg(f"⚠️ ADSD TTS {idx+1} 触发内容审查，已分级改写(第{rewrite_count}级)后重试")
+                    log(f"ADSD TTS {idx+1} policy rewrite L{rewrite_count}: {before} -> {after}")
+                    continue
+                if not safe_fallback_used:
+                    safe_fallback_used = True
+                    before = turn.get("text", text)
+                    safe_line = _tts_safe_fallback_line(turn.get("tone"))
+                    turn["text"] = safe_line
+                    turn["tts_policy_rewritten"] = True
+                    turn["tts_safe_fallback"] = True
+                    text = _sanitize_for_external_api(safe_line)[:500]
+                    _record_adsd_tts_rewrite(idx, speaker, before, safe_line, e)
+                    tg(f"⚠️ ADSD TTS {idx+1} 多级改写仍被审核，降级中性兜底句保出片(绝不崩管线)")
+                    log(f"ADSD TTS {idx+1} graceful fallback: {before} -> {safe_line}")
+                    continue
+                # 连中性兜底句都被审核拒(极罕见): 静音占位，仍不崩
+                _record_adsd_tts_rewrite(idx, speaker, turn.get("text", text), "(silent placeholder 静音占位)", e)
+                log(f"ADSD TTS {idx+1} 兜底句仍被审核拒，返回静音占位防崩：{last_err}")
+                return _tts_silent_placeholder(turn, idx)
+            # ── 非内容审核(网络/transient): 有限退避重试，耗尽才抛 ──
+            network_attempt += 1
+            if network_attempt < max_retries:
+                wait_s = 2 * network_attempt
+                log(f"ADSD TTS {idx+1} 失败(网络/transient 第 {network_attempt}/{max_retries} 次)：{e}，{wait_s}s 后重试")
                 time.sleep(wait_s)
                 continue
-            raise RuntimeError(f"ADSD TTS {idx+1} 重试失败：{last_err}")
-    raise RuntimeError(f"ADSD TTS {idx+1} 重试失败：{last_err}")
+            raise RuntimeError(f"ADSD TTS {idx+1} 重试失败(非内容审核)：{last_err}")
 
 
 def _asr_verify_dialogue_audio(audio_path: str, label: str = "ADSD ASR", result_name: str = "speech_recognize_result.json") -> dict | None:
