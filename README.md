@@ -14,6 +14,8 @@ ADR 是一套自动纪录片生成管线。输入一个主题或带时间戳的�
 | `VADR` | 9:16 | `v --no-motion` | 竖屏静态分镜叙述（罕用） |
 | `HADSD` | 16:9 | `h --ads-dialogue` | 横屏多角色对话纪录片 |
 | `VADSD` | 9:16 | `v --ads-dialogue` | 竖屏多角色对话纪录片 |
+| `HMTV` | 16:9 | `hmtv` 或 `h --mtv` | 横屏原创音乐 MTV，WeryAI VOCAL_SONG + WeryDance |
+| `VMTV` | 9:16 | `vmtv` 或 `v --mtv` | 竖屏原创音乐 MTV，WeryAI VOCAL_SONG + WeryDance |
 
 重要边界：
 
@@ -21,6 +23,8 @@ ADR 是一套自动纪录片生成管线。输入一个主题或带时间戳的�
 - 只有显式传 `--ads-reporter`，或用户明确说"拟现场记者 / 战地记者 / dispatch / 第一人称记者 / POV 记者"，才进入记者 POV。
 - `--ads-dialogue` 和 `--ads-reporter` 互斥；多角色对话优先。
 - ADSD 走 step66 lip_sync，不参与 step65 motion；`--no-motion` 对 ADSD 无效。
+- MTV 是独立音乐视频管线，不走普通旁白 TTS / Whisper 字幕时间轴；主音轨来自 WeryAI `VOCAL_SONG`。
+- MTV 主唱通过 `--singer <名字>` 指定；如果主唱已存在于 `voice_assets/speaker_ips/`，直接复用人物卡和绑定音色；如果不存在，自动孵化人物卡并写入人物库。
 
 ## 默认策略
 
@@ -95,6 +99,7 @@ python3 run_adr_v8.py "黄仁勋CMU毕业演讲核心内容" h
 python3 run_adr_v8.py "1915年二十一条最后通牒" v --ads-reporter
 python3 run_adr_v8.py "AI时代就业市场访谈" h --ads-dialogue
 python3 run_adr_v8.py "江南春日风物" v --bgm-only
+python3 run_adr_v8.py "曹操的短歌行" hmtv --singer 曹操
 python3 run_adr_v8.py "唐宋八大家" h --no-motion          # 罕用：HADR 静态分镜
 ```
 
@@ -108,6 +113,9 @@ python3 run_adr_v8.py "唐宋八大家" h --no-motion          # 罕用：HADR �
 | `--no-ads-reporter` | 强制禁止 reporter |
 | `--ads-dialogue` | 开启多角色对话纪录片 |
 | `--adsd-lip-sync` | ADSD 口型同步实验 |
+| `hmtv` / `vmtv` | 横屏 / 竖屏原创音乐 MTV |
+| `--mtv` | 在 `h` / `v` 画幅下开启 MTV 模式 |
+| `--singer <name>` | MTV 主唱；命中人物库则复用，否则自动创建人物卡 |
 | `--bgm-only` | 无旁白，仅画面、字幕、BGM |
 | `--skip-approval` | 跳过 Telegram 图片审批 |
 | `--speaker <id:name>` | 指定 Podcast 音色 |

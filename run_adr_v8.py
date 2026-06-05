@@ -140,7 +140,17 @@ HEADERS = {
 BASE_URL = "https://api.weryai.com/v1"
 
 TOPIC = sys.argv[1] if len(sys.argv) > 1 else "历史上的今天"
-VIDEO_FORMAT = (sys.argv[2] if len(sys.argv) > 2 else "h").lower()  # "h" = 横屏 16:9, "v" = 竖屏 9:16
+VIDEO_FORMAT_RAW = (sys.argv[2] if len(sys.argv) > 2 else "h").lower()
+MTV_MODE = (
+    VIDEO_FORMAT_RAW in ("hmtv", "vmtv", "mtv")
+    or "--mtv" in sys.argv
+    or os.environ.get("ADR_MTV_MODE", "").strip().lower() in ("1", "true", "yes", "on")
+)
+VIDEO_FORMAT = (
+    "v" if VIDEO_FORMAT_RAW == "vmtv"
+    else "h" if VIDEO_FORMAT_RAW in ("hmtv", "mtv")
+    else VIDEO_FORMAT_RAW
+)  # "h" = 横屏 16:9, "v" = 竖屏 9:16
 IS_VERTICAL = VIDEO_FORMAT == "v"
 # 审核默认 OFF（自动免审快速产出）；传 --with-approval 强制审核（仍兼容旧的 --skip-approval flag）
 # 异常自动触发审核：封面 OCR DUPLICATED / 分镜 fallback / 等异常会单独推审（已内建）
@@ -155,7 +165,8 @@ ADS_DIALOGUE_MODE_EARLY_CHECK = (
 # B12 (2026-05-26): h/v 默认 = HADS/VADS 动态化, ADSD 走 step66 不参与, --no-motion 显式关
 # B12.1 (2026-05-26): 删除冗余 --with-motion (默认就 ON, flag 无意义), 老脚本传它自然 no-op
 WITH_MOTION = (
-    not ADS_DIALOGUE_MODE_EARLY_CHECK
+    not MTV_MODE
+    and not ADS_DIALOGUE_MODE_EARLY_CHECK
     and "--no-motion" not in sys.argv
 )  # 每分镜走 WERYDANCE_2_0 生成带运动视频，~2x 时长 + $0.3/scene
 BGM_ONLY_REQUESTED = (
@@ -166,9 +177,12 @@ BGM_ONLY_REQUESTED = (
     or os.environ.get("ADR_BGM_ONLY", "").strip().lower() in ("1", "true", "yes", "on")
 )
 ADS_DIALOGUE_MODE = (
-    "--ads-dialogue" in sys.argv
-    or "--adsd" in sys.argv
-    or os.environ.get("ADR_ADS_DIALOGUE", "").strip().lower() in ("1", "true", "yes", "on")
+    not MTV_MODE
+    and (
+        "--ads-dialogue" in sys.argv
+        or "--adsd" in sys.argv
+        or os.environ.get("ADR_ADS_DIALOGUE", "").strip().lower() in ("1", "true", "yes", "on")
+    )
 )
 if ADS_DIALOGUE_MODE and BGM_ONLY_REQUESTED:
     print("ERROR: --bgm-only/--no-tts/--no-voice 目前只支持 ADR/ADS，不支持 ADSD 对白模式。", file=sys.stderr)
@@ -1037,7 +1051,9 @@ ADSD_MODE_NAME = ("VADSD" if IS_VERTICAL else "HADSD") if ADS_DIALOGUE_MODE else
 
 # B12.2 (2026-05-26): 模式短标统一 helper, 让显示/文件名/QA json 都吃同一份命名
 # 映射: ADSD → HADSD/VADSD; WITH_MOTION → HADS/VADS; 否则 → HADR/VADR
-if ADS_DIALOGUE_MODE:
+if MTV_MODE:
+    CURRENT_MODE_LABEL = "VMTV" if IS_VERTICAL else "HMTV"
+elif ADS_DIALOGUE_MODE:
     CURRENT_MODE_LABEL = ADSD_MODE_NAME
 elif WITH_MOTION:
     CURRENT_MODE_LABEL = "VADS" if IS_VERTICAL else "HADS"
@@ -11196,6 +11212,363 @@ def generate_bgm(topic: str, tone: str = "中性") -> str | None:
     return None
 
 
+# ── MTV：原创歌曲 + 主唱人物库 + WeryDance MV ─────────────────────────────
+_DUANGE_XING_TEXT = (
+    "对酒当歌，人生几何？譬如朝露，去日苦多。\n"
+    "慨当以慷，忧思难忘。何以解忧？唯有杜康。\n"
+    "青青子衿，悠悠我心。但为君故，沉吟至今。\n"
+    "呦呦鹿鸣，食野之苹。我有嘉宾，鼓瑟吹笙。\n"
+    "明明如月，何时可掇？忧从中来，不可断绝。\n"
+    "越陌度阡，枉用相存。契阔谈讌，心念旧恩。\n"
+    "月明星稀，乌鹊南飞。绕树三匝，何枝可依？\n"
+    "山不厌高，海不厌深。周公吐哺，天下归心。"
+)
+
+
+def _arg_value(name: str) -> str:
+    for i, arg in enumerate(sys.argv):
+        if arg == name and i + 1 < len(sys.argv):
+            return sys.argv[i + 1].strip()
+        if arg.startswith(name + "="):
+            return arg.split("=", 1)[1].strip()
+    return ""
+
+
+def _infer_mtv_singer(topic: str) -> str:
+    explicit = _arg_value("--singer") or os.environ.get("ADR_MTV_SINGER", "").strip()
+    if explicit:
+        return explicit
+    m = re.search(r"([\u4e00-\u9fffA-Za-z0-9_]{2,12})(?:负责)?主唱", topic)
+    if m:
+        return m.group(1)
+    for ip_name, ip in _list_speaker_ips().items():
+        aliases = [ip_name] + list(ip.get("aliases") or [])
+        if any(a and a in topic for a in aliases):
+            return ip_name
+    return "主唱"
+
+
+def _ensure_mtv_singer_ip(singer: str, topic: str) -> dict:
+    ip = _match_speaker_ip(singer)
+    if ip:
+        return ip
+    if os.environ.get("ADR_AUTO_INCUBATE_IP", "1").strip().lower() in ("0", "false", "no", "off"):
+        return {
+            "speaker": singer,
+            "voice_gender": "male",
+            "voice_asset_id": ADSD_DEFAULT_MALE_VOICE_ASSET,
+            "visual_subject": "a charismatic Chinese vocalist in cinematic stage lighting",
+            "era": "原创 MTV",
+            "qa_status": "fallback_not_saved",
+        }
+    skeleton = _llm_infer_ip_skeleton(singer, f"作为原创音乐 MTV《{topic}》的主唱登场")
+    if not skeleton:
+        return {
+            "speaker": singer,
+            "voice_gender": "male",
+            "voice_asset_id": ADSD_DEFAULT_MALE_VOICE_ASSET,
+            "visual_subject": "a charismatic Chinese vocalist in cinematic stage lighting",
+            "era": "原创 MTV",
+            "qa_status": "fallback_not_saved",
+        }
+    gender = str(skeleton.get("voice_gender") or "male").strip().lower()
+    if gender not in ("male", "female"):
+        gender = "male"
+    voice_asset_id = _llm_pick_voice_asset_for_ip(gender, str(skeleton.get("voice_tone_hint") or "音乐主唱，清晰有情绪"))
+    ip = {
+        "speaker": singer,
+        "aliases": skeleton.get("aliases", []),
+        "voice_asset_id": voice_asset_id,
+        "voice_gender": gender,
+        "visual_subject": skeleton.get("visual_subject", ""),
+        "meta_grid": f"voice_assets/character_meta_grids/{singer}.png",
+        "era": skeleton.get("era", "原创 MTV"),
+        "accent": "mandarin",
+        "personality": skeleton.get("personality", []),
+        "catchphrases": skeleton.get("catchphrases", []),
+        "costume_variants": skeleton.get("costume_variants", []),
+        "poses": skeleton.get("poses", []),
+        "emotion_palette": skeleton.get("emotion_palette", []),
+        "scenes": skeleton.get("scenes", []),
+        "note": skeleton.get("note", "MTV 主唱人物卡，自动孵化后待人工复核"),
+        "created_at": f"auto_incubated_from_mtv:{topic}",
+        "qa_status": "auto_generated_pending_review",
+        "usage_count": 0,
+        "usage_history": [],
+    }
+    _save_speaker_ip(singer, ip)
+    global _VOICE_ASSETS_CACHE
+    _VOICE_ASSETS_CACHE = None
+    tg(f"🪺 MTV 主唱人物库新增：{singer} · voice={voice_asset_id} · qa=auto_generated_pending_review")
+    return ip
+
+
+def _mtv_source_lyrics(topic: str) -> str:
+    override = _arg_value("--lyrics-file")
+    if override and os.path.exists(override):
+        return Path(override).read_text(encoding="utf-8").strip()
+    inline = _arg_value("--lyrics") or os.environ.get("ADR_MTV_LYRICS", "").strip()
+    if inline:
+        return inline.replace("\\n", "\n")
+    if "短歌行" in topic:
+        return _DUANGE_XING_TEXT
+    return ""
+
+
+def _mtv_build_plan(topic: str, singer: str, singer_ip: dict) -> dict:
+    lyrics = _mtv_source_lyrics(topic)
+    visual_subject = singer_ip.get("visual_subject") or "a charismatic Chinese vocalist"
+    ip_context = {
+        "speaker": singer_ip.get("speaker", singer),
+        "aliases": singer_ip.get("aliases", []),
+        "era": singer_ip.get("era", ""),
+        "visual_subject": visual_subject,
+        "personality": singer_ip.get("personality", []),
+        "costume_variants": singer_ip.get("costume_variants", []),
+        "poses": singer_ip.get("poses", []),
+        "scenes": singer_ip.get("scenes", []),
+        "note": singer_ip.get("note", ""),
+    }
+    prompt = f"""你是 ADR MTV 导演和作词作曲统筹。为主题生成原创音乐 MTV 制作计划。
+
+主题: {topic}
+主唱: {singer}
+主唱人物档案:
+{json.dumps(ip_context, ensure_ascii=False)}
+
+原始文本/歌词素材（可为空；若是古诗词，允许作为歌词主体进行编曲演唱）:
+{lyrics}
+
+输出严格 JSON 对象:
+{{
+  "song_title": "中文歌名，12字内",
+  "music_style": "中文风格概括",
+  "song_description": "给 WeryAI VOCAL_SONG 的英文描述，必须包含 Mandarin Chinese male/female vocal, arrangement, mood, tempo, and clear lyrics instruction",
+  "lyrics": "最终中文歌词，保留换行，适合 30-90 秒演唱",
+  "visual_style": "英文 MTV 视觉总风格",
+  "scenes": [
+    {{"lyric": "对应歌词片段", "visual": "英文画面提示词 35-65 词", "motion": "英文运镜/动作 15-30 词", "emotion": "solemn|heroic|melancholy|intense|poetic"}}
+  ]
+}}
+
+要求:
+- scenes 生成 6-8 个。
+- 每个 visual 都要让主唱作为第一视觉主体出现，身份锁定为 {visual_subject}。
+- 这是音乐 MTV，不是纪录片旁白；画面要有舞台/诗意/叙事蒙太奇，允许古今融合但不得穿帮。
+- song_description 不能提真实现代歌手名，不能要求模仿任何在世歌手。
+- 若主题是《短歌行》，歌词应以曹操原诗为主体，可以加极少量副歌式重复，但不要改坏原文。
+只输出 JSON。"""
+    try:
+        raw = chat("GEMINI_25_FLASH", "你只输出严格 JSON 对象。", prompt, max_tokens=3500, timeout=120)
+        plan = _extract_json_object(raw)
+    except Exception as e:
+        log(f"MTV plan LLM 失败，使用 fallback: {e}")
+        stanza_lines = [x.strip() for x in (lyrics or topic).splitlines() if x.strip()]
+        if not stanza_lines:
+            stanza_lines = [topic]
+        scenes = []
+        for i, line in enumerate(stanza_lines[:8]):
+            scenes.append({
+                "lyric": line,
+                "visual": (
+                    f"{visual_subject}, cinematic Chinese historical music video frame, late Han poetic stage, "
+                    "moonlight, bronze wine vessel, wind moving dark robes, dramatic low-key lighting, no text"
+                ),
+                "motion": "slow dolly push-in, robe and banners moving in wind, singer performs with restrained intensity",
+                "emotion": "poetic",
+            })
+        plan = {
+            "song_title": "短歌行" if "短歌行" in topic else topic[:12],
+            "music_style": "古风史诗摇滚",
+            "song_description": (
+                f"Original Mandarin Chinese vocal song for a cinematic historical MTV. Lead singer: {singer}, "
+                "adult male vocal, heroic melancholy late-Han warlord mood, guqin, pipa, taiko-like drums, "
+                "low strings, epic rock pulse, clear sung Chinese lyrics, no imitation of any modern artist.\n"
+                f"Lyrics:\n{lyrics or topic}"
+            ),
+            "lyrics": lyrics or topic,
+            "visual_style": "cinematic historical Chinese MTV, moonlit battlefield stage, poetic epic realism",
+            "scenes": scenes,
+        }
+    scenes = plan.get("scenes") if isinstance(plan, dict) else []
+    if not isinstance(scenes, list) or not scenes:
+        raise RuntimeError("MTV plan 缺 scenes")
+    plan["scenes"] = scenes[: max(1, min(8, int(os.environ.get("ADR_MTV_SCENES", str(len(scenes))))))]
+    if lyrics and "Lyrics:" not in str(plan.get("song_description", "")):
+        plan["song_description"] = str(plan.get("song_description", "")).rstrip() + f"\nLyrics:\n{lyrics}"
+    (OUTPUT_DIR / "mtv_plan.json").write_text(json.dumps(plan, ensure_ascii=False, indent=2), encoding="utf-8")
+    return plan
+
+
+def _generate_mtv_song(plan: dict, singer: str, singer_ip: dict) -> str:
+    song_path = str(OUTPUT_DIR / "mtv_song.mp3")
+    desc = str(plan.get("song_description") or "").strip()
+    lyrics = str(plan.get("lyrics") or "").strip()
+    gender = str(singer_ip.get("voice_gender") or "male").lower()
+    if lyrics and lyrics not in desc:
+        desc += f"\nLyrics:\n{lyrics}"
+    desc += (
+        f"\nMode: VOCAL_SONG. Lead singer is {singer}; use a clear Mandarin Chinese "
+        f"{gender} vocal performance, original melody and arrangement, no artist imitation."
+    )
+    for attempt in range(1, 4):
+        try:
+            tg(f"🎵 MTV 原创歌曲生成：VOCAL_SONG 尝试 {attempt}/3（主唱：{singer}）")
+            r = req_post("/generation/music/generate", {
+                "type": "VOCAL_SONG",
+                "description": desc,
+            }, timeout=30)
+            tid = (r.get("data") or {}).get("task_id") or ((r.get("data") or {}).get("task_ids") or [None])[0]
+            if not tid:
+                log(f"MTV VOCAL_SONG 无 task_id: {json.dumps(r, ensure_ascii=False)[:240]}")
+                continue
+            data = poll(tid, "MTV VOCAL_SONG")
+            audios = data.get("audios") or (data.get("task_result") or {}).get("audios") or []
+            audio_url = audios[0] if audios else ""
+            if not audio_url:
+                log(f"MTV VOCAL_SONG 成功但无 audios: {json.dumps(data, ensure_ascii=False)[:240]}")
+                continue
+            urllib.request.urlretrieve(audio_url, song_path)
+            if os.path.exists(song_path) and os.path.getsize(song_path) > 10000:
+                tg(f"✅ MTV 原创歌曲完成：{ffprobe_duration(song_path):.1f}s")
+                return song_path
+        except Exception as e:
+            log(f"MTV VOCAL_SONG 失败 {attempt}/3: {e}")
+            if attempt < 3:
+                time.sleep(8)
+    raise RuntimeError("MTV VOCAL_SONG 生成失败")
+
+
+def _trim_mtv_song(song_path: str) -> str:
+    max_dur = float(os.environ.get("ADR_MTV_MAX_DURATION", "75"))
+    dur = ffprobe_duration(song_path)
+    if dur <= 0:
+        return song_path
+    if dur <= max_dur + 0.2:
+        return song_path
+    out = str(OUTPUT_DIR / "mtv_song_trimmed.mp3")
+    ffmpeg("-i", song_path, "-t", f"{max_dur:.3f}", "-af", "afade=t=out:st={:.3f}:d=2".format(max(0.0, max_dur - 2)),
+           "-c:a", "libmp3lame", "-b:a", "192k", out, timeout=120)
+    return out if os.path.exists(out) and os.path.getsize(out) > 10000 else song_path
+
+
+def _mtv_generate_visual_segments(plan: dict, song_path: str, singer: str, singer_ip: dict) -> list[dict]:
+    song_dur = max(12.0, ffprobe_duration(song_path))
+    scenes_in = plan.get("scenes") or []
+    n = max(1, len(scenes_in))
+    per = max(4.0, min(15.0, song_dur / n))
+    visual_subject = singer_ip.get("visual_subject") or f"{singer}, Chinese lead singer"
+    script: list[dict] = []
+    for i, item in enumerate(scenes_in):
+        lyric = str((item or {}).get("lyric") or "").strip()
+        visual = str((item or {}).get("visual") or "").strip()
+        motion = str((item or {}).get("motion") or "").strip()
+        prompt = (
+            f"{visual}. Lead singer identity lock: {visual_subject}. "
+            f"Chinese cinematic MTV still, no on-screen lyrics, no subtitles, no logos, no watermarks. "
+            f"Visual style: {plan.get('visual_style', '')}"
+        )[:1800]
+        scene = {
+            "dialogue_turn": i + 1,
+            "turn_type": "mtv",
+            "speaker": singer,
+            "voice_gender": singer_ip.get("voice_gender", "male"),
+            "voice_asset_id": singer_ip.get("voice_asset_id", ""),
+            "visual_subject": visual_subject,
+            "text": lyric,
+            "shot": visual,
+            "prompt": prompt,
+            "emotion": str((item or {}).get("emotion") or "poetic"),
+            "tone": "音乐",
+            "dur": per,
+            "vid_duration": per,
+            "img_path": str(OUTPUT_DIR / f"img_{i}.jpg"),
+            "vid_path": str(OUTPUT_DIR / f"seg_{i}.mp4"),
+            "mtv_motion": motion,
+        }
+        script.append(scene)
+    tg(f"🎬 MTV 分镜：{len(script)} 镜 × {per:.1f}s，开始生成主唱画面")
+    for i, scene in enumerate(script):
+        generate_image(scene, i)
+        motion_prompt = (
+            f"Music video performance shot. {scene.get('mtv_motion') or 'cinematic singer performance with moving camera'}. "
+            "Keep the lead singer visually dominant and expressive. No generated audio, no captions."
+        )
+        try:
+            if _rescue_motion_image_to_video(scene, scene["img_path"], scene["vid_path"], scene["vid_duration"], ASPECT_RATIO):
+                scene["mtv_motion_path"] = "image-to-video"
+                continue
+        except Exception as e:
+            log(f"MTV i2v 失败 scene {i+1}: {e}")
+        scene["prompt"] = (scene["prompt"] + " " + motion_prompt)[:2000]
+        try:
+            if _rescue_motion_text_to_video(scene, scene["vid_path"], scene["vid_duration"], ASPECT_RATIO):
+                scene["mtv_motion_path"] = "text-to-video"
+                continue
+        except Exception as e:
+            log(f"MTV t2v 失败 scene {i+1}: {e}")
+        scene["mtv_motion_path"] = "still_fallback"
+        tg(f"⚠️ MTV 第 {i+1} 镜 WeryDance 失败，保留静态兜底片段")
+    return script
+
+
+def _mtv_concat_and_render(script: list[dict], song_path: str, topic: str) -> str:
+    concat_txt = OUTPUT_DIR / "mtv_concat.txt"
+    valid = [s for s in script if s.get("vid_path") and os.path.exists(s["vid_path"]) and os.path.getsize(s["vid_path"]) > 1000]
+    if not valid:
+        raise RuntimeError("MTV 无可用视频片段")
+    with open(concat_txt, "w", encoding="utf-8") as f:
+        for s in valid:
+            f.write(f"file '{s['vid_path']}'\n")
+    raw_path = str(OUTPUT_DIR / "mtv_raw_concat.mp4")
+    ffmpeg("-f", "concat", "-safe", "0", "-i", str(concat_txt), "-c", "copy", raw_path, timeout=180)
+    final_path = str(OUTPUT_DIR / "final_mtv.mp4")
+    vf = f"scale={VIDEO_W}:{VIDEO_H}:force_original_aspect_ratio=increase,crop={VIDEO_W}:{VIDEO_H},setsar=1,setdar={ASPECT_RATIO},fps=24"
+    ffmpeg(
+        "-i", raw_path,
+        "-i", song_path,
+        "-map", "0:v",
+        "-map", "1:a",
+        "-vf", vf,
+        "-c:v", "libx264", "-crf", "20", "-preset", "medium",
+        "-c:a", "aac", "-b:a", "192k",
+        "-shortest",
+        "-aspect", ASPECT_RATIO,
+        "-movflags", "+faststart",
+        final_path,
+        timeout=300,
+    )
+    qa = {
+        "mode": CURRENT_MODE_LABEL,
+        "topic": topic,
+        "song_path": song_path,
+        "raw_path": raw_path,
+        "final_path": final_path,
+        "scene_count": len(valid),
+        "motion_paths": {k: sum(1 for s in valid if s.get("mtv_motion_path") == k) for k in ("image-to-video", "text-to-video", "still_fallback")},
+        "duration": ffprobe_duration(final_path),
+        "created_at": datetime.now().isoformat(timespec="seconds"),
+    }
+    (OUTPUT_DIR / "mtv_qa.json").write_text(json.dumps(qa, ensure_ascii=False, indent=2), encoding="utf-8")
+    tg(f"✅ {CURRENT_MODE_LABEL} 成片合成完成：{qa['duration']:.1f}s · {final_path}")
+    return final_path
+
+
+def run_mtv_pipeline(topic: str) -> None:
+    singer = _infer_mtv_singer(topic)
+    tg(f"🎤 {CURRENT_MODE_LABEL} MTV 启动：主题「{topic}」· 主唱「{singer}」")
+    singer_ip = _ensure_mtv_singer_ip(singer, topic)
+    plan = _mtv_build_plan(topic, singer, singer_ip)
+    song_path = _trim_mtv_song(_generate_mtv_song(plan, singer, singer_ip))
+    script = _mtv_generate_visual_segments(plan, song_path, singer, singer_ip)
+    final_path = _mtv_concat_and_render(script, song_path, topic)
+    try:
+        _record_speaker_usage_history(script, topic, OUTPUT_DIR.name)
+    except Exception as e:
+        log(f"MTV Speaker IP usage 回写失败（不影响）：{e}")
+    step10_deliver(final_path, topic, script)
+
+
 # ── B68 (2026-05-30) WERYDANCE 段长合规 gate ────────────────────────────────
 # cap 18→30 后, LLM 偶发会给个别 scene dur > 15 或 < 4 (WERYDANCE [4, 15] 硬限).
 # Codex Stage 1 推荐: fail-fast clamp 不自动拆合 (拆合 PT 2-3h 留 B68.2 长期).
@@ -20275,7 +20648,7 @@ def step10_deliver(final_path: str, topic: str, script: list[dict]):
     #     document_first : 直接 sendDocument 原片 (画质 100% 保留, 但 TG 端要点开下载)
     #   任一策略失败 → 自动回退 compress, 不破坏现有 fallback 链
     # B70 fix: split/document_first 需要 short_caption, 必须提前到 router 之前定义
-    delivery_tag = ADSD_MODE_NAME if ADS_DIALOGUE_MODE else "ADR V8"
+    delivery_tag = CURRENT_MODE_LABEL if MTV_MODE else (ADSD_MODE_NAME if ADS_DIALOGUE_MODE else "ADR V8")
     short_caption = f"{short_title} — {delivery_tag}"
     try:
         _size_mb = os.path.getsize(final_path) / (1024 * 1024)
@@ -20532,7 +20905,18 @@ def _print_execution_plan() -> None:
     目的：开 mode flag 时让"无消费方但仍激活的浪费"立刻可见，避免我（PM）忘记 short-circuit。"""
     fmt = CURRENT_MODE_WITH_ASPECT
     # (模块名, 是否激活, 预估时间 min, 预估 credits, 说明)
-    plan: list[tuple[str, bool, str, str, str]] = [
+    if MTV_MODE:
+        plan: list[tuple[str, bool, str, str, str]] = [
+            ("MTV 主唱人物库解析/孵化", True, "0.2-1", "0", "speaker_ips 存在则复用，不存在自动创建"),
+            ("MTV 歌词/分镜计划", True, "0.5-1", "0", "LLM 生成 VOCAL_SONG 描述 + 6-8 镜 MTV"),
+            ("VOCAL_SONG 原创歌曲", True, "2-8", "~10", "weryai music VOCAL_SONG"),
+            ("MTV 主唱图像", True, "3-8", "~80", "GPT Image 2 / text-to-image"),
+            ("MTV WeryDance 动态化", True, "8-20", "~120", "image-to-video 优先，text-to-video 兜底"),
+            ("MTV 歌曲合成", True, "0.5-1", "0", "ffmpeg 拼接视频 + 原创歌曲"),
+            ("Step10 推送 Telegram", True, "0.1-0.3", "0", "上传成片 + 封面"),
+        ]
+    else:
+        plan = [
         ("Step1 剧本+视觉规划", True, "1-2", "0", "LLM 链 (Gemini/Claude)"),
         ("Step2 text-to-audio 时间轴锚定音轨", not NO_VOICE and not ADS_DIALOGUE_MODE, "1-3", "~25", "时间轴锚定 + audio_dub 不可用时 fallback (B27 校正: voice_asset 克隆才是首选听感, 走 step66/step65)"),
         ("Step2 BGM-only 静音轨", NO_VOICE, "0.1", "0", "ffmpeg 生成静音占位"),
@@ -20553,7 +20937,7 @@ def _print_execution_plan() -> None:
         ("Step8 字幕生成 (ASS)", not NO_VOICE or BGM_ONLY_REQUESTED, "0.5-1", "0", "LLM 断句 + ASS 生成"),
         ("Step9 最终合成", True, "0.5-1", "0", "ffmpeg 烧字幕 + 音轨"),
         ("Step10 推送 Telegram", True, "0.1-0.3", "0", "上传成片 + 封面"),
-    ]
+        ]
     active = [p for p in plan if p[1]]
     skipped = [p for p in plan if not p[1]]
     total_min_lo = sum(float(p[2].split("-")[0]) for p in active)
@@ -20609,6 +20993,22 @@ def main():
     log(f"开始处理：{topic}")
     log(f"输出目录：{OUTPUT_DIR}")
     _print_execution_plan()
+
+    if MTV_MODE:
+        t_start = time.time()
+        try:
+            run_mtv_pipeline(topic)
+            _write_run_timings({"MTV 全流程": time.time() - t_start}, t_start, ok=True)
+            total_min = (time.time() - t_start) / 60
+            tg(f"⏱ {CURRENT_MODE_LABEL} 耗时统计：总计 {total_min:.1f} min")
+        except Exception as e:
+            import traceback
+            err = traceback.format_exc()
+            _write_run_timings({"MTV 失败前耗时": time.time() - t_start}, t_start, ok=False)
+            log(f"MTV 管线异常:\n{err}")
+            tg(f"❌ {CURRENT_MODE_LABEL} MTV 管线异常：{e}\n详情已写入日志")
+            sys.exit(1)
+        return
 
     t_start = time.time()
     timings = {}
