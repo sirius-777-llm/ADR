@@ -12810,14 +12810,44 @@ def _b92_draw_path(img_path: str, points: list, out_path: str) -> str | None:
                 curve.append((x * W, y * H))
         if len(curve) < 2:
             return None
-        # 大哥实测 + A/B(粗红/绿/品红同镜对比): 细线模型识别不稳→红痕残留; 粗线(W//150)半透明
-        # 被清楚识别为引导层→可靠跟随轨迹 + 可靠去线。故加粗 W//480→W//150, alpha 105→190。
-        dr.line(curve, fill=(255, 60, 60, 190), width=max(8, W // 150), joint="curve")
+        # 大哥逐帧实测定论: i2v 把输入图当第0帧→红线必在早期帧, 粗细/prompt 都治不了。
+        # 淡线(W//400 alpha110)清得快(~第8帧≈0.33s 已干净), 粗线赖到第16帧+。故用淡线,
+        # 真正根治靠 _b92_trim_lead_frames 裁掉开头带线的 ~10 帧(见下游 motion 后处理)。
+        dr.line(curve, fill=(255, 70, 70, 110), width=max(3, W // 400), joint="curve")
         Image.alpha_composite(im.convert("RGBA"), overlay).convert("RGB").save(out_path, quality=92)
         return out_path
     except Exception as e:
         log(f"[B92] 画线失败(跳过): {e}")
         return None
+
+
+def _b92_trim_lead_frames(clip_path: str, n_frames: int = 12, keep_duration: bool = False) -> bool:
+    """B92 根治红线: 裁掉开头带引导线的 ~n 帧 (i2v 把输入图当第0帧→线必在早期帧,
+    淡线 ~第8帧已清, 裁 12 帧≈0.5s 留余量)。原地替换 clip。大哥逐帧实测确认。
+    keep_duration=True: 裁后重新拉伸回原时长(live 管线保时间轴不漂, 起手运动略慢可忽略)。"""
+    try:
+        orig = ffprobe_duration(clip_path) if keep_duration else None
+        tmp = clip_path + ".trim.mp4"
+        ffmpeg("-y", "-i", clip_path, "-vf", f"select=gte(n\\,{int(n_frames)}),setpts=PTS-STARTPTS",
+               "-an", "-c:v", "libx264", "-preset", "veryfast", "-crf", "18", tmp, timeout=120)
+        if not (os.path.exists(tmp) and os.path.getsize(tmp) > 1000):
+            return False
+        if keep_duration and orig:
+            new = ffprobe_duration(tmp)
+            if new and new > 0.1 and orig > new:
+                tmp2 = clip_path + ".strch.mp4"
+                ffmpeg("-y", "-i", tmp, "-vf", f"setpts={orig / new:.4f}*PTS",
+                       "-an", "-c:v", "libx264", "-preset", "veryfast", "-crf", "18", tmp2, timeout=120)
+                if os.path.exists(tmp2) and os.path.getsize(tmp2) > 1000:
+                    os.replace(tmp2, clip_path)
+                    if os.path.exists(tmp):
+                        os.remove(tmp)
+                    return True
+        os.replace(tmp, clip_path)
+        return True
+    except Exception as e:
+        log(f"[B92] 裁帧失败(保留原clip): {e}")
+    return False
 
 
 def _b92_trajectory_prompt(scene: dict, flight: str) -> str:
@@ -12944,6 +12974,12 @@ def _try_motion_reference_video(idx: int, scene: dict, motion_prompt: str, aspec
 
     _save_motion_task(idx, task_id)
     ok = _motion_poll_and_download(idx, task_id, scene["vid_path"], target_dur=target_dur)
+    # B92 根治: 轨迹镜裁掉开头带引导线的帧 + 拉伸回原时长(保时间轴)。大哥逐帧实测确认线在早期帧。
+    if ok and scene.get("_b92_active"):
+        try:
+            _b92_trim_lead_frames(scene["vid_path"], int(os.environ.get("ADR_B92_TRIM_FRAMES", "12") or "12"), keep_duration=True)
+        except Exception as _bt:
+            log(f"[B92] live 裁帧异常(保留原clip): {_bt}")
     timed_out_or_reusable = str(idx) in _load_motion_tasks()
     output_qa = _motion_output_qa(scene["vid_path"], target_dur) if ok else None
     _append_motion_qa({
