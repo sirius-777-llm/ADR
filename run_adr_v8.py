@@ -12810,7 +12810,9 @@ def _b92_draw_path(img_path: str, points: list, out_path: str) -> str | None:
                 curve.append((x * W, y * H))
         if len(curve) < 2:
             return None
-        dr.line(curve, fill=(255, 60, 60, 105), width=max(3, W // 480), joint="curve")
+        # 大哥实测 + A/B(粗红/绿/品红同镜对比): 细线模型识别不稳→红痕残留; 粗线(W//150)半透明
+        # 被清楚识别为引导层→可靠跟随轨迹 + 可靠去线。故加粗 W//480→W//150, alpha 105→190。
+        dr.line(curve, fill=(255, 60, 60, 190), width=max(8, W // 150), joint="curve")
         Image.alpha_composite(im.convert("RGBA"), overlay).convert("RGB").save(out_path, quality=92)
         return out_path
     except Exception as e:
