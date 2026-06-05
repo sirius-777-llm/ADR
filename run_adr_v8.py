@@ -12435,20 +12435,24 @@ def _werydance_caption_instruction(scene: dict) -> str:
 
 def _werydance_negative_prompt(scene: dict) -> str:
     if _werydance_caption_request(scene).get("requested"):
-        return "watermark, logo, extra text, misspelled text, garbled characters, duplicate captions"
-    # 强化：WERYDANCE 模型偶尔会自作主张在画面下方烧中文字幕，跟我们的 ASS 字幕双重叠
-    # 用多重否定关键词压制 (single negative prompt 力度不够，扩到所有 text-related artifact)
-    # B2 fix (2026-05-21): 加 grid/split/panel/contact_sheet ban，防 meta_grid 4×3 grid 被 WERYDANCE 直接复刻
-    return (
-        "no subtitles, no captions, no on-screen text, no burned-in text, no Chinese subtitles, "
-        "no English subtitles, no text overlay, no caption bar, no chyron, no lower-third graphic, "
-        "no speech bubbles, no thought bubbles, no signage text, no UI labels, no character name tags, "
-        "no watermark, no logo, no studio mark, no copyright mark, "
-        "no random Chinese characters anywhere in the frame, no garbled glyphs, no floating text, "
-        "no grid layout, no 4x3 grid, no contact sheet, no split screen, no multi-panel, no collage, "
-        "no panel divisions, no frame borders, no thumbnail grid, no character sheet layout, "
-        "no storyboard frame numbers, no casting card overlay"
-    )
+        base = "watermark, logo, extra text, misspelled text, garbled characters, duplicate captions"
+    else:
+        # 强化：WERYDANCE 模型偶尔会自作主张在画面下方烧中文字幕，跟我们的 ASS 字幕双重叠
+        # 用多重否定关键词压制 (single negative prompt 力度不够，扩到所有 text-related artifact)
+        # B2 fix (2026-05-21): 加 grid/split/panel/contact_sheet ban，防 meta_grid 4×3 grid 被 WERYDANCE 直接复刻
+        base = (
+            "no subtitles, no captions, no on-screen text, no burned-in text, no Chinese subtitles, "
+            "no English subtitles, no text overlay, no caption bar, no chyron, no lower-third graphic, "
+            "no speech bubbles, no thought bubbles, no signage text, no UI labels, no character name tags, "
+            "no watermark, no logo, no studio mark, no copyright mark, "
+            "no random Chinese characters anywhere in the frame, no garbled glyphs, no floating text, "
+            "no grid layout, no 4x3 grid, no contact sheet, no split screen, no multi-panel, no collage, "
+            "no panel divisions, no frame borders, no thumbnail grid, no character sheet layout, "
+            "no storyboard frame numbers, no casting card overlay"
+        )
+    if scene.get("_b92_active"):  # B92: 强化藏掉画上去的相机路径红线
+        base = base + ", " + _B92_HIDE_NEGATIVES
+    return base
 
 
 def _motion_reference_prompt(scene: dict, motion_prompt: str, safe_retry: bool = False, annotated: bool = False) -> str:
@@ -12736,6 +12740,113 @@ def _try_motion_audio_dub_video(idx: int, scene: dict, motion_prompt: str, aspec
     return ok, ok
 
 
+# ── B92 (2026-06-05): 轨迹标记运镜 (Seedance 红线技法) ──────────────────────────
+# WERYDANCE_2_0=Seedance 原生认"图上画的相机路径线"。PoC 实证(珠峰): 半透明淡线 + 强负向
+# → 相机沿线飞 + 红线藏掉。给广角/揭示型 hero 镜头画无人机路径。env ADR_B92_TRAJECTORY_CAMERA 默认关。
+_B92_HIDE_NEGATIVES = (
+    "red line, red curve, red streak, red glow, drawn line, guide line, overlay line, sketch line, painted line, "
+    "arrow, annotation, scribble, graphic line, neon line, laser line, on-screen path, drawn path"
+)
+
+
+def _b92_enabled() -> bool:
+    return os.environ.get("ADR_B92_TRAJECTORY_CAMERA", "0").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _b92_propose_path(scene: dict) -> dict | None:
+    """LLM 按镜头内容提议相机飞行路径(归一化坐标)。不适合的镜头(口播/特写)返回 None。"""
+    desc = _short_board_text(scene.get("prompt") or scene.get("text") or "", 220)
+    shot = str(scene.get("shot_type") or scene.get("shot") or "")
+    emotion = str(scene.get("emotion") or "")
+    prompt = (
+        "判断这个镜头适不适合电影级\"无人机/相机沿路径飞\"的运镜, 并设计飞行路径。\n"
+        f"镜头描述: {desc}\n景别: {shot} | 情绪: {emotion}\n\n"
+        "适合: 广角/远景/风景/全景/揭示镜 (drone sweep / reveal / fly-through 能加分)。\n"
+        "不适合: 人物特写/口播头像/对话正脸/紧凑静物 (这些不要路径运镜)。\n\n"
+        "严格输出 JSON:\n"
+        '{"suitable": true/false, "path": [[x,y],[x,y],[x,y]], "flight": "一句英文: 相机沿路怎么飞(从哪到哪,揭示什么)"}\n'
+        "path: 3-5 个归一化坐标点 [x,y] (0~1, x=左到右, y=上到下), 描出相机视点移动轨迹"
+        "(如前景细节→扫升到远景主体)。不适合就 {\"suitable\": false}。只输出 JSON。"
+    )
+    try:
+        raw = chat("GEMINI_25_FLASH", "你是电影摄影指导, 只输出严格 JSON。", prompt, max_tokens=300, timeout=40)
+        a = raw.find("{"); b = raw.rfind("}")
+        if a < 0 or b <= a:
+            return None
+        d = json.loads(raw[a:b + 1])
+    except Exception as e:
+        log(f"[B92] 路径提议失败(跳过): {e}")
+        return None
+    if not isinstance(d, dict) or not d.get("suitable"):
+        return None
+    clean = []
+    for p in (d.get("path") or []):
+        if isinstance(p, (list, tuple)) and len(p) >= 2:
+            try:
+                x = min(0.97, max(0.03, float(p[0]))); y = min(0.97, max(0.03, float(p[1])))
+                clean.append((x, y))
+            except Exception:
+                continue
+    if len(clean) < 2:
+        return None
+    return {"path": clean[:6], "flight": str(d.get("flight") or "")[:200]}
+
+
+def _b92_draw_path(img_path: str, points: list, out_path: str) -> str | None:
+    """PIL 在分镜图上画半透明淡红引导线(PoC 验证的藏线参数)。返回带线图路径。"""
+    try:
+        from PIL import Image, ImageDraw
+        im = Image.open(img_path).convert("RGB")
+        W, H = im.size
+        overlay = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+        dr = ImageDraw.Draw(overlay)
+
+        def lerp(a, b, t):
+            return (a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t)
+        curve = []
+        for i in range(len(points) - 1):
+            for sstep in range(21):
+                x, y = lerp(points[i], points[i + 1], sstep / 20)
+                curve.append((x * W, y * H))
+        if len(curve) < 2:
+            return None
+        dr.line(curve, fill=(255, 60, 60, 105), width=max(3, W // 480), joint="curve")
+        Image.alpha_composite(im.convert("RGBA"), overlay).convert("RGB").save(out_path, quality=92)
+        return out_path
+    except Exception as e:
+        log(f"[B92] 画线失败(跳过): {e}")
+        return None
+
+
+def _b92_trajectory_prompt(scene: dict, flight: str) -> str:
+    """B92 沿线飞 + 藏线 prompt(PoC 验证)。codex Med2: 补场景内容 + 强化 no-text 防丢原约束。"""
+    subj = _short_board_text(scene.get("prompt") or scene.get("text") or "", 160)
+    return (
+        "IMPORTANT: the faint red line in the input image is ONLY a camera flight-path guide overlay — it is NOT a "
+        "real object in the scene. Do NOT render or draw it; the final video must show the clean natural scene with "
+        "absolutely no red line, no overlay, no marks. "
+        + (f"Scene: {subj}. " if subj else "")
+        + f"Cinematic one continuous smooth shot: the camera flies along that guide path. {flight}. "
+        "Smooth gimbal/drone motion, natural motion blur, strong sense of movement and depth, cinematic lighting, "
+        "keep the same subject identity and setting as the input image. "
+        "No text, no subtitles, no captions, no on-screen Chinese characters, no burned-in text, no logos, no watermark."
+    )
+
+
+def _b92_apply_trajectory(scene: dict, idx: int, img_path: str) -> tuple[str, str] | None:
+    """编排: 提议路径→画线→返回 (带线图路径, 沿线飞 prompt)。不适合返回 None。"""
+    proposal = _b92_propose_path(scene)
+    if not proposal:
+        return None
+    out_path = str(OUTPUT_DIR / f"b92_traj_{idx + 1:02d}.jpg")
+    drawn = _b92_draw_path(img_path, proposal["path"], out_path)
+    if not drawn:
+        return None
+    scene["_b92_active"] = True
+    log(f"[B92] 轨迹运镜 turn {idx + 1}: {len(proposal['path'])}点路径 · {proposal['flight'][:50]}")
+    return drawn, _b92_trajectory_prompt(scene, proposal["flight"])
+
+
 def _try_motion_reference_video(idx: int, scene: dict, motion_prompt: str, aspect_ratio: str, dur: int, target_dur: float | None = None, safe_retry: bool = False) -> tuple[bool, bool]:
     """Try storyboard image-to-video first.
 
@@ -12766,6 +12877,15 @@ def _try_motion_reference_video(idx: int, scene: dict, motion_prompt: str, aspec
         safe_retry=safe_retry,
         annotated=(reference_mode == "annotated_storyboard"),
     )
+    # B92: 轨迹标记运镜 (env-gated) — 适合的 hero 镜头画相机路径红线 + 沿线飞 prompt (覆盖上面)
+    if _b92_enabled() and not safe_retry:
+        try:
+            _b92 = _b92_apply_trajectory(scene, idx, img_path)
+            if _b92:
+                reference_path, full_prompt = _b92
+                reference_mode = "b92_trajectory"
+        except Exception as _b92e:
+            log(f"[B92] 轨迹运镜异常(回退常规 motion): {_b92e}")
     caption_info = _werydance_caption_request(scene)
     try:
         image_url = _upload_to_weryai(reference_path or img_path)
