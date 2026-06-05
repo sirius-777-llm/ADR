@@ -12775,10 +12775,12 @@ def _b92_propose_path(scene: dict) -> dict | None:
             return None
         d = json.loads(raw[a:b + 1])
     except Exception as e:
-        log(f"[B92] 路径提议失败(跳过): {e}")
+        log(f"[B92] 路径提议失败(瞬时, 不标 unsuitable): {e}")
+        return None  # codex Med: 瞬时错误返 None(不永久禁用), 留 apply 重试
+    if not isinstance(d, dict):
         return None
-    if not isinstance(d, dict) or not d.get("suitable"):
-        return None
+    if d.get("suitable") is False:  # 仅【显式 false】才永久标 unsuitable; 缺字段/None 当瞬时(留重试)
+        return {"unsuitable": True}
     clean = []
     for p in (d.get("path") or []):
         if isinstance(p, (list, tuple)) and len(p) >= 2:
@@ -12866,10 +12868,17 @@ def _b92_trajectory_prompt(scene: dict, flight: str) -> str:
 
 
 def _b92_apply_trajectory(scene: dict, idx: int, img_path: str) -> tuple[str, str] | None:
-    """编排: 提议路径→画线→返回 (带线图路径, 沿线飞 prompt)。不适合返回 None。"""
-    proposal = _b92_propose_path(scene)
-    if not proposal:
-        return None
+    """编排: 提议路径→画线→返回 (带线图路径, 沿线飞 prompt)。不适合返回 None。
+    B92.1: 优先用规划阶段预提议的 scene['b92_path'](省每镜 LLM), 没有才现场提议。"""
+    if scene.get("b92_path"):
+        proposal = {"path": scene["b92_path"], "flight": str(scene.get("b92_flight") or "")}
+    elif scene.get("b92_unsuitable"):
+        return None  # 规划阶段已判不适合, 不重复调 LLM
+    else:
+        prop = _b92_propose_path(scene)
+        if not (prop and prop.get("path")):  # None(瞬时) 或 {"unsuitable"} 都不画
+            return None
+        proposal = prop
     out_path = str(OUTPUT_DIR / f"b92_traj_{idx + 1:02d}.jpg")
     drawn = _b92_draw_path(img_path, proposal["path"], out_path)
     if not drawn:
@@ -12877,6 +12886,30 @@ def _b92_apply_trajectory(scene: dict, idx: int, img_path: str) -> tuple[str, st
     scene["_b92_active"] = True
     log(f"[B92] 轨迹运镜 turn {idx + 1}: {len(proposal['path'])}点路径 · {proposal['flight'][:50]}")
     return drawn, _b92_trajectory_prompt(scene, proposal["flight"])
+
+
+def _b92_preplan_paths(script: list) -> None:
+    """B92.1: 规划阶段批量预提议各镜轨迹 (一次性, 省 motion 期每镜 LLM + 可检视)。
+    结果存 scene['b92_path']/['b92_flight'](适合) 或 ['b92_unsuitable']=True(不适合)。env-gated。"""
+    if not _b92_enabled():
+        return
+    suited = 0
+    for sc in script:
+        if not isinstance(sc, dict) or sc.get("b92_path") or sc.get("b92_unsuitable"):
+            continue
+        try:
+            prop = _b92_propose_path(sc)
+        except Exception as e:
+            log(f"[B92.1] 预提议异常(跳过该镜): {e}")
+            continue
+        if prop and prop.get("path"):
+            sc["b92_path"] = prop["path"]
+            sc["b92_flight"] = prop.get("flight", "")
+            suited += 1
+        elif prop and prop.get("unsuitable"):
+            sc["b92_unsuitable"] = True  # LLM 明确判不适合才永久标
+        # else None (瞬时错误) → 不标记, 留 motion 期 apply 重试 (codex Med)
+    log(f"[B92.1] 规划阶段预提议轨迹: {suited}/{len(script)} 镜适合 drone 运镜")
 
 
 def _try_motion_reference_video(idx: int, scene: dict, motion_prompt: str, aspect_ratio: str, dur: int, target_dur: float | None = None, safe_retry: bool = False) -> tuple[bool, bool]:
@@ -16589,6 +16622,7 @@ def step65_motion(script: list[dict]):
     _b68_clamp_scene_durations_to_werydance_bounds(script, origin="step65_motion")
     _ensure_motion_action_plan(script)
     _write_motion_action_plan_qa(script)
+    _b92_preplan_paths(script)  # B92.1: 规划阶段批量预提议轨迹 (省 motion 期每镜 LLM)
     n = len(script)
     reporter_tag = " · ADS拟现场记者" if ADS_REPORTER_MODE else ""
     if STORYBOARD_REFERENCE_MOTION and STORYBOARD_ANNOTATED_MOTION and not ADS_DIALOGUE_MODE:
@@ -19895,6 +19929,17 @@ def _b70_split_and_deliver(src_path: str, base_caption: str) -> bool:
             seg_caption = f"{base_caption} ({i}/{n_parts})"
             seg_ok = False
             seg_msg_id: int | None = None
+            # B93: 探实际宽高传给 sendVideo, 否则 TG 读不到尺寸→按 1:1 方形渲染把 16:9 压变形
+            _seg_w, _seg_h = VIDEO_W, VIDEO_H
+            try:
+                _pr = _sp.run(["ffprobe", "-v", "error", "-select_streams", "v:0",
+                               "-show_entries", "stream=width,height", "-of", "csv=p=0:s=x", seg_path],
+                              capture_output=True, text=True, timeout=20)
+                _wh = _pr.stdout.strip().split("x")
+                if len(_wh) == 2 and _wh[0].isdigit() and _wh[1].isdigit():
+                    _seg_w, _seg_h = int(_wh[0]), int(_wh[1])
+            except Exception:
+                pass
             for attempt in range(2):
                 try:
                     curl_cmd = [
@@ -19903,6 +19948,8 @@ def _b70_split_and_deliver(src_path: str, base_caption: str) -> bool:
                         "-F", f"chat_id={TG_CHAT_ID}",
                         "-F", f"caption={seg_caption}",
                         "-F", "supports_streaming=true",
+                        "-F", f"width={_seg_w}",
+                        "-F", f"height={_seg_h}",
                         "-F", f"video=@{seg_path}",
                     ]
                     r = _sp.run(curl_cmd, capture_output=True, text=True, timeout=660)
