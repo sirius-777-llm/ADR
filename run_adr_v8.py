@@ -12126,23 +12126,40 @@ _GRAND_EMOTIONS = (
     "辉煌", "史诗", "壮阔", "磅礴", "豪迈", "激昂", "崇高", "宏大", "苍茫",
     "epic", "grand", "majestic", "awe", "sweeping",
 )
+# B91.2 grid_multiref 用: 紧凑版运镜 (18 panel 共享 2000 字 cap, 不能用全句)
+_SEEDANCE_CAMERA_COMPACT = {
+    "static": "locked static shot",
+    "slow push-in": "slow dolly push-in (smooth, steady)",
+    "pull-back reveal": "dolly pull-back reveal",
+    "dolly right": "dolly tracking right",
+    "dolly left": "dolly tracking left",
+    "crane up": "crane boom up",
+    "crane down": "crane boom down",
+    "whip pan": "fast whip pan",
+    "orbit": "orbital arc around subject",
+    "handheld shake": "handheld organic shake",
+    "rack focus": "rack focus pull",
+}
 
 
-def _seedance_camera_directive(scene: dict, base_move: str = "") -> str:
-    """B91.1/.3: camera_motion enum → Seedance 结构化运镜指令 + 情绪门控复合运镜。"""
+def _seedance_camera_directive(scene: dict, base_move: str = "", compact: bool = False) -> str:
+    """B91.1/.3: camera_motion enum → Seedance 结构化运镜指令 + 情绪门控复合运镜。
+    compact=True 返回紧凑短语 (grid_multiref 多 panel 省 prompt cap)。"""
     move = str(base_move or scene.get("camera_motion") or "").strip().lower()  # codex Med: 防非str崩
     if move not in _SEEDANCE_CAMERA_GRAMMAR:
         move = "slow push-in"
     emotion = str(scene.get("emotion", "")).lower()
     # 复合运镜 1: 紧张/震撼/高潮 + 推近/静止 → dolly-zoom 眩晕 (Seedance 招牌复合镜)
     if move in ("slow push-in", "static") and any(k in emotion for k in _DOLLY_ZOOM_EMOTIONS):
-        return ("Camera: dolly-zoom vertigo effect (dolly backward while zooming in), "
+        return ("dolly-zoom vertigo (dolly back + zoom in), tense" if compact else
+                "Camera: dolly-zoom vertigo effect (dolly backward while zooming in), "
                 "unsettling perspective warp, subject locked center, dramatic and tense")
     # 复合运镜 2 (B91.3): 壮阔/史诗 + 升/拉/推 → epic crane reveal
     if move in ("crane up", "pull-back reveal", "slow push-in") and any(k in emotion for k in _GRAND_EMOTIONS):
-        return ("Camera: sweeping epic crane reveal, rising up and pulling back to unveil vast scale, "
+        return ("epic crane reveal, rising and pulling back to vast scale" if compact else
+                "Camera: sweeping epic crane reveal, rising up and pulling back to unveil vast scale, "
                 "smooth majestic boom, grand cinematic vista")
-    return _SEEDANCE_CAMERA_GRAMMAR[move]
+    return _SEEDANCE_CAMERA_COMPACT[move] if compact else _SEEDANCE_CAMERA_GRAMMAR[move]
 
 
 def _build_motion_video_prompt(scene: dict, motion_prompt: str, safe_retry: bool = False) -> str:
@@ -13244,8 +13261,14 @@ def _grid_multiref_prompt(
         # 之前 _grid_multiref_prompt 漏嵌入台词 → almighty generate_audio=true 自由发挥说跟字幕无关内容
         # 仿 _motion_audio_dub_prompt L10569 'speaking exactly this line' 嵌入真台词
         visual = _short_board_text(scene.get("prompt") or scene.get("text"), 50)
-        motion = _short_board_text(motion_prompts[idx] if idx < len(motion_prompts) else "", 80)
-        if _is_action_scene(scene.get("text", ""), scene.get("prompt", "")):
+        # B91.2: 非武戏 panel 用 Seedance 紧凑运镜 (有合法 camera_motion); 武戏保留自由文本 kinetic 编排(codex Low)
+        _gm_bm = _validate_enum_field(scene.get("camera_motion"), _PR3B1_CAMERA_MOTION_ENUM, "")
+        _gm_is_action = _is_action_scene(scene.get("text", ""), scene.get("prompt", ""))
+        if _gm_bm and not _gm_is_action:
+            motion = _short_board_text(_seedance_camera_directive(scene, _gm_bm, compact=True), 60)
+        else:
+            motion = _short_board_text(motion_prompts[idx] if idx < len(motion_prompts) else "", 80)
+        if _gm_is_action:
             action_mode = True
         # B34.2: 每 panel line 强调 distinct (Shot N + 简短标签)
         lines.append(f"{offset + 1}. Shot {idx + 1}: {visual} | Cam: {motion}")
