@@ -11512,6 +11512,95 @@ def _mtv_generate_visual_segments(plan: dict, song_path: str, singer: str, singe
     return script
 
 
+def _mtv_ass_time(sec: float) -> str:
+    sec = max(0.0, float(sec or 0.0))
+    h = int(sec // 3600)
+    m = int((sec % 3600) // 60)
+    s = int(sec % 60)
+    cs = int((sec % 1) * 100)
+    return f"{h}:{m:02d}:{s:02d}.{cs:02d}"
+
+
+def _mtv_ass_escape(text: str) -> str:
+    text = re.sub(r"\s+", " ", str(text or "")).strip()
+    text = text.replace("{", "").replace("}", "")
+    return text
+
+
+def _mtv_wrap_lyric(text: str) -> str:
+    text = _mtv_ass_escape(text)
+    text = re.sub(r"[，。；、：,.;:]", " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    if not text:
+        return ""
+    max_chars = 12 if IS_VERTICAL else 18
+    chunks: list[str] = []
+    buf = ""
+    for part in text.split():
+        if not buf:
+            buf = part
+        elif len(buf) + len(part) <= max_chars:
+            buf += part
+        else:
+            chunks.append(buf)
+            buf = part
+    if buf:
+        chunks.append(buf)
+    if len(chunks) == 1 and len(chunks[0]) > max_chars:
+        line = chunks[0]
+        chunks = [line[i:i + max_chars] for i in range(0, len(line), max_chars)]
+    return r"\N".join(chunks[:2])
+
+
+def _write_mtv_subtitles(script: list[dict]) -> str:
+    ass_path = OUTPUT_DIR / "mtv_subs.ass"
+    margin_l = 60 if not IS_VERTICAL else 48
+    margin_r = margin_l
+    margin_v = 56 if not IS_VERTICAL else 110
+    font_size = 52 if not IS_VERTICAL else 74
+    header = f"""[Script Info]
+ScriptType: v4.00+
+PlayResX: {VIDEO_W}
+PlayResY: {VIDEO_H}
+ScaledBorderAndShadow: yes
+
+[V4+ Styles]
+Format: Name,Fontname,Fontsize,PrimaryColour,SecondaryColour,OutlineColour,BackColour,Bold,Italic,Underline,StrikeOut,ScaleX,ScaleY,Spacing,Angle,BorderStyle,Outline,Shadow,Alignment,MarginL,MarginR,MarginV,Encoding
+Style: Default,Arial Unicode MS,{font_size},&H00FFFFFF,&H000000FF,&H00101010,&H99000000,-1,0,0,0,100,100,0,0,1,4,1,2,{margin_l},{margin_r},{margin_v},1
+
+[Events]
+Format: Layer,Start,End,Style,Name,MarginL,MarginR,MarginV,Effect,Text
+"""
+    lines = [header]
+    cursor = 0.0
+    records = []
+    for idx, scene in enumerate(script):
+        vid_path = scene.get("vid_path") or ""
+        dur = ffprobe_duration(vid_path) if vid_path and os.path.exists(vid_path) else float(scene.get("vid_duration") or scene.get("dur") or 0)
+        dur = max(0.5, float(dur or 0.0))
+        text = _mtv_wrap_lyric(scene.get("text") or scene.get("lyric") or "")
+        if text:
+            start = cursor + 0.15
+            end = max(start + 0.5, cursor + dur - 0.15)
+            lines.append(f"Dialogue: 0,{_mtv_ass_time(start)},{_mtv_ass_time(end)},Default,,0,0,0,,{text}\n")
+            records.append({"scene": idx + 1, "start": round(start, 3), "end": round(end, 3), "text": text})
+        cursor += dur
+    ass_path.write_text("".join(lines), encoding="utf-8")
+    (OUTPUT_DIR / "mtv_subtitle_qa.json").write_text(
+        json.dumps({
+            "mode": CURRENT_MODE_LABEL,
+            "subtitle_path": str(ass_path),
+            "total_scenes": len(script),
+            "subtitle_count": len(records),
+            "records": records,
+            "created_at": datetime.now().isoformat(timespec="seconds"),
+        }, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    tg(f"✅ MTV 歌词字幕生成：{len(records)}/{len(script)} 段 → {ass_path.name}")
+    return str(ass_path)
+
+
 def _mtv_concat_and_render(script: list[dict], song_path: str, topic: str) -> str:
     concat_txt = OUTPUT_DIR / "mtv_concat.txt"
     valid = [s for s in script if s.get("vid_path") and os.path.exists(s["vid_path"]) and os.path.getsize(s["vid_path"]) > 1000]
@@ -11523,7 +11612,13 @@ def _mtv_concat_and_render(script: list[dict], song_path: str, topic: str) -> st
     raw_path = str(OUTPUT_DIR / "mtv_raw_concat.mp4")
     ffmpeg("-f", "concat", "-safe", "0", "-i", str(concat_txt), "-c", "copy", raw_path, timeout=180)
     final_path = str(OUTPUT_DIR / "final_mtv.mp4")
+    ass_path = ""
+    if os.environ.get("ADR_MTV_SUBTITLES", "1").strip().lower() not in ("0", "false", "no", "off"):
+        ass_path = _write_mtv_subtitles(valid)
     vf = f"scale={VIDEO_W}:{VIDEO_H}:force_original_aspect_ratio=increase,crop={VIDEO_W}:{VIDEO_H},setsar=1,setdar={ASPECT_RATIO},fps=24"
+    if ass_path:
+        ass_escaped = ass_path.replace("\\", "/").replace(":", "\\:")
+        vf = f"{vf},ass={ass_escaped}"
     ffmpeg(
         "-i", raw_path,
         "-i", song_path,
@@ -11544,6 +11639,8 @@ def _mtv_concat_and_render(script: list[dict], song_path: str, topic: str) -> st
         "song_path": song_path,
         "raw_path": raw_path,
         "final_path": final_path,
+        "subtitle_path": ass_path,
+        "subtitles_enabled": bool(ass_path),
         "scene_count": len(valid),
         "motion_paths": {k: sum(1 for s in valid if s.get("mtv_motion_path") == k) for k in ("image-to-video", "text-to-video", "still_fallback")},
         "duration": ffprobe_duration(final_path),

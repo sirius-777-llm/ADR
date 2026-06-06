@@ -25,6 +25,7 @@ ADR 是一套自动纪录片生成管线。输入一个主题或带时间戳的�
 - ADSD 走 step66 lip_sync，不参与 step65 motion；`--no-motion` 对 ADSD 无效。
 - MTV 是独立音乐视频管线，不走普通旁白 TTS / Whisper 字幕时间轴；主音轨来自 WeryAI `VOCAL_SONG`。
 - MTV 主唱通过 `--singer <名字>` 指定；如果主唱已存在于 `voice_assets/speaker_ips/`，直接复用人物卡和绑定音色；如果不存在，自动孵化人物卡并写入人物库。
+- MTV 默认烧录歌词字幕；可用环境变量 `ADR_MTV_SUBTITLES=0` 关闭。
 
 ## 默认策略
 
