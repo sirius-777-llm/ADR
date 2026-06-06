@@ -22,6 +22,7 @@ import threading
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
+from difflib import SequenceMatcher
 from pathlib import Path
 
 import requests
@@ -11608,6 +11609,86 @@ def _mtv_split_lyric_clauses(text: str) -> list[str]:
     return clauses or ([str(text).strip()] if str(text or "").strip() else [])
 
 
+def _mtv_split_lyric_phrases(text: str) -> list[str]:
+    text = str(text or "").strip()
+    if not text:
+        return []
+    phrases = []
+    for item in re.split(r"[，。；、：,.;:\n]\s*", text):
+        item = item.strip()
+        if not item:
+            continue
+        phrases.extend(x.strip() for x in re.split(r"(?<=[？！?！])\s*", item) if x.strip())
+    return phrases or [text]
+
+
+def _mtv_norm_zh(text: str) -> str:
+    return re.sub(r"[^\u4e00-\u9fffA-Za-z0-9]", "", str(text or ""))
+
+
+def _mtv_best_phrase_offset(phrases: list[tuple[int, str]], asr_records: list[dict]) -> tuple[int, float]:
+    if not phrases or not asr_records:
+        return 0, 0.0
+    asr_text = _mtv_norm_zh("".join(str(r.get("text") or "") for r in asr_records))
+    if len(asr_text) < 8:
+        return 0, 0.0
+    best_offset = 0
+    best_score = 0.0
+    max_offset = min(len(phrases) - 1, 12)
+    for offset in range(max_offset + 1):
+        lyric_text = _mtv_norm_zh("".join(text for _idx, text in phrases[offset:]))
+        if not lyric_text:
+            continue
+        score = SequenceMatcher(None, asr_text, lyric_text).ratio()
+        if score > best_score:
+            best_offset = offset
+            best_score = score
+    return best_offset, best_score
+
+
+def _mtv_asr_phrase_records(phrases: list[tuple[int, str]], asr_records: list[dict]) -> list[dict]:
+    if len(phrases) < 4 or len(asr_records) < 3:
+        return []
+    offset, score = _mtv_best_phrase_offset(phrases, asr_records)
+    if offset <= 0 or score < 0.24:
+        return []
+    usable = phrases[offset:]
+    if len(usable) < len(asr_records):
+        return []
+    records: list[dict] = []
+    cursor = 0
+    avg_phrase_len = max(3.0, sum(max(1, len(_mtv_norm_zh(text))) for _idx, text in usable) / max(1, len(usable)))
+    for seg_i, seg in enumerate(asr_records):
+        start = float(seg.get("start") or 0.0)
+        end = float(seg.get("end") or start)
+        if end <= start:
+            continue
+        remaining_segments = len(asr_records) - seg_i
+        remaining_phrases = len(usable) - cursor
+        if remaining_phrases <= 0:
+            break
+        target_chars = max(1, len(_mtv_norm_zh(seg.get("text") or "")))
+        take = max(1, int(round(target_chars / avg_phrase_len)))
+        take = min(take, max(1, remaining_phrases - max(0, remaining_segments - 1)))
+        take = min(take, remaining_phrases)
+        chunk = usable[cursor:cursor + take]
+        cursor += take
+        text = r"\N".join(_mtv_ass_escape(part) for _idx, part in chunk if _mtv_ass_escape(part))
+        if not text:
+            continue
+        scene_idx = chunk[0][0]
+        records.append({
+            "scene": scene_idx + 1,
+            "start": round(max(0.0, start + 0.02), 3),
+            "end": round(end, 3),
+            "text": text,
+            "source": "song_asr_phrase_segments",
+            "phrase_offset": offset,
+            "match_score": round(score, 3),
+        })
+    return records
+
+
 def _write_mtv_subtitles(script: list[dict], song_path: str | None = None) -> str:
     ass_path = OUTPUT_DIR / "mtv_subs.ass"
     margin_l = 60 if not IS_VERTICAL else 48
@@ -11633,27 +11714,38 @@ Format: Layer,Start,End,Style,Name,MarginL,MarginR,MarginV,Effect,Text
     asr_start, asr_end, asr_records = _mtv_vocal_span_from_asr(song_path or "") if song_path else (0.0, 0.0, [])
     use_asr_span = bool(asr_end > asr_start and asr_end - asr_start >= 5)
     if use_asr_span:
-        lyric_units: list[tuple[int, str]] = []
+        phrase_units: list[tuple[int, str]] = []
         for idx, scene in enumerate(script):
-            for clause in _mtv_split_lyric_clauses(scene.get("text") or scene.get("lyric") or ""):
-                if clause.strip():
-                    lyric_units.append((idx, clause.strip()))
-        weights = [max(4, len(re.sub(r"\s+", "", unit))) for _idx, unit in lyric_units]
-        total_weight = sum(weights) or 1
-        vocal_dur = asr_end - asr_start
-        cursor = asr_start
-        for (idx, unit), weight in zip(lyric_units, weights):
-            dur = max(1.2, vocal_dur * weight / total_weight)
-            start = cursor + 0.05
-            end = min(asr_end, max(start + 0.7, cursor + dur - 0.05))
-            text = _mtv_wrap_lyric(unit)
-            if text:
-                lines.append(f"Dialogue: 0,{_mtv_ass_time(start)},{_mtv_ass_time(end)},Default,,0,0,0,,{text}\n")
-                records.append({"scene": idx + 1, "start": round(start, 3), "end": round(end, 3), "text": text, "source": "song_asr_vocal_span"})
-            cursor = cursor + dur
-            if cursor >= asr_end:
-                break
-        log(f"MTV 字幕使用歌曲 ASR 人声区间：{asr_start:.2f}-{asr_end:.2f}s，{len(records)} 条")
+            for phrase in _mtv_split_lyric_phrases(scene.get("text") or scene.get("lyric") or ""):
+                if phrase.strip():
+                    phrase_units.append((idx, phrase.strip()))
+        records = _mtv_asr_phrase_records(phrase_units, asr_records)
+        for rec in records:
+            lines.append(f"Dialogue: 0,{_mtv_ass_time(rec['start'])},{_mtv_ass_time(rec['end'])},Default,,0,0,0,,{rec['text']}\n")
+        if records:
+            log(f"MTV 字幕使用 ASR 片段对齐歌词：{len(records)} 条")
+        lyric_units: list[tuple[int, str]] = []
+        if not records:
+            for idx, scene in enumerate(script):
+                for clause in _mtv_split_lyric_clauses(scene.get("text") or scene.get("lyric") or ""):
+                    if clause.strip():
+                        lyric_units.append((idx, clause.strip()))
+            weights = [max(4, len(re.sub(r"\s+", "", unit))) for _idx, unit in lyric_units]
+            total_weight = sum(weights) or 1
+            vocal_dur = asr_end - asr_start
+            cursor = asr_start
+            for (idx, unit), weight in zip(lyric_units, weights):
+                dur = max(1.2, vocal_dur * weight / total_weight)
+                start = cursor + 0.05
+                end = min(asr_end, max(start + 0.7, cursor + dur - 0.05))
+                text = _mtv_wrap_lyric(unit)
+                if text:
+                    lines.append(f"Dialogue: 0,{_mtv_ass_time(start)},{_mtv_ass_time(end)},Default,,0,0,0,,{text}\n")
+                    records.append({"scene": idx + 1, "start": round(start, 3), "end": round(end, 3), "text": text, "source": "song_asr_vocal_span"})
+                cursor = cursor + dur
+                if cursor >= asr_end:
+                    break
+            log(f"MTV 字幕使用歌曲 ASR 人声区间：{asr_start:.2f}-{asr_end:.2f}s，{len(records)} 条")
     else:
         for idx, scene in enumerate(script):
             vid_path = scene.get("vid_path") or ""
@@ -11673,7 +11765,7 @@ Format: Layer,Start,End,Style,Name,MarginL,MarginR,MarginV,Effect,Text
             "subtitle_path": str(ass_path),
             "total_scenes": len(script),
             "subtitle_count": len(records),
-            "alignment_mode": "song_asr_vocal_span" if use_asr_span else "scene_duration_fallback",
+            "alignment_mode": records[0].get("source") if records else ("song_asr_vocal_span" if use_asr_span else "scene_duration_fallback"),
             "asr_vocal_start": round(asr_start, 3) if use_asr_span else None,
             "asr_vocal_end": round(asr_end, 3) if use_asr_span else None,
             "asr_records": asr_records[:20],
