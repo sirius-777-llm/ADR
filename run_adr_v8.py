@@ -11457,9 +11457,9 @@ def _mtv_generate_visual_segments(plan: dict, song_path: str, singer: str, singe
     song_dur = max(12.0, ffprobe_duration(song_path))
     scenes_in = plan.get("scenes") or []
     n = max(1, len(scenes_in))
-    per = max(4.0, min(15.0, song_dur / n))
     visual_subject = singer_ip.get("visual_subject") or f"{singer}, Chinese lead singer"
-    script: list[dict] = []
+
+    seed_script: list[dict] = []
     for i, item in enumerate(scenes_in):
         lyric = str((item or {}).get("lyric") or "").strip()
         visual = str((item or {}).get("visual") or "").strip()
@@ -11481,22 +11481,123 @@ def _mtv_generate_visual_segments(plan: dict, song_path: str, singer: str, singe
             "prompt": prompt,
             "emotion": str((item or {}).get("emotion") or "poetic"),
             "tone": "音乐",
-            "dur": per,
-            "vid_duration": per,
+            "dur": max(4.0, min(15.0, song_dur / n)),
+            "vid_duration": max(4.0, min(15.0, song_dur / n)),
             "img_path": str(OUTPUT_DIR / f"img_{i}.jpg"),
             "vid_path": str(OUTPUT_DIR / f"seg_{i}.mp4"),
             "mtv_motion": motion,
         }
-        script.append(scene)
-    tg(f"🎬 MTV 分镜：{len(script)} 镜 × {per:.1f}s，开始生成主唱画面")
+        seed_script.append(scene)
+
+    alignment = _mtv_alignment_from_script(seed_script, song_path)
+    records = alignment.get("records") or []
+    timeline: list[dict] = []
+
+    def _clone_timeline_scene(
+        src_idx: int,
+        start: float,
+        end: float,
+        role: str,
+        text: str = "",
+        subtitle_text: str = "",
+        subtitle_start: float | None = None,
+        subtitle_end: float | None = None,
+    ) -> None:
+        src = seed_script[max(0, min(src_idx, len(seed_script) - 1))]
+        idx = len(timeline)
+        dur = max(0.3, float(end) - float(start))
+        scene = dict(src)
+        scene.update({
+            "dialogue_turn": idx + 1,
+            "text": text,
+            "dur": dur,
+            "vid_duration": dur,
+            "timeline_start": round(float(start), 3),
+            "timeline_end": round(float(end), 3),
+            "mtv_source_start": round(float(start), 3),
+            "mtv_source_end": round(float(end), 3),
+            "mtv_subtitle_source_start": round(float(subtitle_start if subtitle_start is not None else start), 3),
+            "mtv_subtitle_source_end": round(float(subtitle_end if subtitle_end is not None else end), 3),
+            "mtv_role": role,
+            "mtv_subtitle_text": subtitle_text,
+            "mtv_timeline_locked": True,
+            "img_path": str(OUTPUT_DIR / f"img_{idx}.jpg"),
+            "vid_path": str(OUTPUT_DIR / f"seg_{idx}.mp4"),
+        })
+        if role == "instrumental":
+            scene["prompt"] = (
+                f"{src.get('shot', '')}. Lead singer identity lock: {visual_subject}. "
+                "Instrumental music video montage beat: no visible singing, no readable mouth performance, "
+                "poetic atmosphere, expressive body language, cinematic camera movement, no text. "
+                f"Visual style: {plan.get('visual_style', '')}"
+            )[:1800]
+            scene["mtv_motion"] = "instrumental cinematic montage, slow expressive camera motion, no singing mouth close-up"
+        timeline.append(scene)
+
+    if records:
+        first_vocal = max(0.0, float(records[0]["start"]))
+        last_vocal = min(song_dur, max(float(records[-1]["end"]), float(alignment.get("asr_end") or 0.0)))
+        for a, b in _mtv_split_span(0.0, first_vocal, max_dur=12.0):
+            _clone_timeline_scene(0, a, b, "instrumental")
+        for rec_i, rec in enumerate(records):
+            src_idx = max(0, int(rec.get("scene") or 1) - 1)
+            text = str(rec.get("text") or "").replace(r"\N", " ")
+            seg_start = float(rec["start"])
+            seg_end = float(records[rec_i + 1]["start"]) if rec_i < len(records) - 1 else last_vocal
+            _clone_timeline_scene(
+                src_idx,
+                seg_start,
+                seg_end,
+                "vocal",
+                text=text,
+                subtitle_text=str(rec.get("text") or ""),
+                subtitle_start=float(rec["start"]),
+                subtitle_end=float(rec["end"]),
+            )
+        for a, b in _mtv_split_span(last_vocal, song_dur, max_dur=12.0):
+            _clone_timeline_scene(len(seed_script) - 1, a, b, "instrumental")
+    else:
+        per = song_dur / n
+        cursor = 0.0
+        for i, src in enumerate(seed_script):
+            end = song_dur if i == n - 1 else cursor + per
+            _clone_timeline_scene(i, cursor, end, "vocal", text=src.get("text") or "", subtitle_text=_mtv_wrap_lyric(src.get("text") or ""))
+            cursor = end
+
+    # Rebase the video timeline to be continuous after any ASR start/end rounding.
+    cursor = 0.0
+    for scene in timeline:
+        dur = max(0.3, float(scene.get("vid_duration") or scene.get("dur") or 0.0))
+        scene["timeline_start"] = round(cursor, 3)
+        scene["timeline_end"] = round(cursor + dur, 3)
+        cursor += dur
+
+    script = timeline
+    lip_sync_enabled = os.environ.get("ADR_MTV_LIP_SYNC", "1").strip().lower() not in ("0", "false", "no", "off")
+    tg(f"🎬 MTV 同步时间轴：{len(script)} 段 · 歌曲 {song_dur:.1f}s · 人声段 {sum(1 for s in script if s.get('mtv_role') == 'vocal')} · lip-sync={'on' if lip_sync_enabled else 'off'}")
+    lip_records: list[dict] = []
     for i, scene in enumerate(script):
         generate_image(scene, i)
         motion_prompt = (
             f"Music video performance shot. {scene.get('mtv_motion') or 'cinematic singer performance with moving camera'}. "
             "Keep the lead singer visually dominant and expressive. No generated audio, no captions."
         )
+        if lip_sync_enabled and scene.get("mtv_role") == "vocal":
+            try:
+                slice_path = _mtv_song_slice(song_path, float(scene["mtv_source_start"]), float(scene["mtv_source_end"]), i)
+                scene["dialogue_audio_mp3"] = slice_path
+                ok, info = _mtv_lip_sync_segment(i, scene, slice_path, float(scene.get("vid_duration") or scene.get("dur") or 0.0))
+                lip_records.append(info)
+                if ok:
+                    scene["mtv_motion_path"] = "song-audio-lip-sync"
+                    continue
+                log(f"MTV lip-sync 失败 scene {i+1}: {info.get('reason')}")
+            except Exception as e:
+                lip_records.append({"turn": i + 1, "pass": False, "reason": str(e), "mode": "mtv_song_audio_lip_sync"})
+                log(f"MTV lip-sync 异常 scene {i+1}: {e}")
         try:
             if _rescue_motion_image_to_video(scene, scene["img_path"], scene["vid_path"], scene["vid_duration"], ASPECT_RATIO):
+                _mtv_normalize_segment_duration(scene, float(scene.get("vid_duration") or scene.get("dur") or 0.0))
                 scene["mtv_motion_path"] = "image-to-video"
                 continue
         except Exception as e:
@@ -11504,12 +11605,48 @@ def _mtv_generate_visual_segments(plan: dict, song_path: str, singer: str, singe
         scene["prompt"] = (scene["prompt"] + " " + motion_prompt)[:2000]
         try:
             if _rescue_motion_text_to_video(scene, scene["vid_path"], scene["vid_duration"], ASPECT_RATIO):
+                _mtv_normalize_segment_duration(scene, float(scene.get("vid_duration") or scene.get("dur") or 0.0))
                 scene["mtv_motion_path"] = "text-to-video"
                 continue
         except Exception as e:
             log(f"MTV t2v 失败 scene {i+1}: {e}")
         scene["mtv_motion_path"] = "still_fallback"
         tg(f"⚠️ MTV 第 {i+1} 镜 WeryDance 失败，保留静态兜底片段")
+    sync_qa = {
+        "mode": CURRENT_MODE_LABEL,
+        "song_path": song_path,
+        "song_duration": round(song_dur, 3),
+        "timeline_locked": True,
+        "alignment_mode": alignment.get("alignment_mode"),
+        "asr_vocal_start": round(alignment.get("asr_start") or 0.0, 3) if alignment.get("use_asr_span") else None,
+        "asr_vocal_end": round(alignment.get("asr_end") or 0.0, 3) if alignment.get("use_asr_span") else None,
+        "segment_count": len(script),
+        "vocal_segment_count": sum(1 for s in script if s.get("mtv_role") == "vocal"),
+        "instrumental_segment_count": sum(1 for s in script if s.get("mtv_role") == "instrumental"),
+        "lip_sync_enabled": lip_sync_enabled,
+        "lip_sync_success_count": sum(1 for r in lip_records if r.get("pass")),
+        "lip_sync_attempt_count": len(lip_records),
+        "records": [
+            {
+                "turn": i + 1,
+                "role": s.get("mtv_role"),
+                "timeline_start": s.get("timeline_start"),
+                "timeline_end": s.get("timeline_end"),
+                "source_start": s.get("mtv_source_start"),
+                "source_end": s.get("mtv_source_end"),
+                "subtitle_source_start": s.get("mtv_subtitle_source_start"),
+                "subtitle_source_end": s.get("mtv_subtitle_source_end"),
+                "subtitle": s.get("mtv_subtitle_text"),
+                "motion_path": s.get("mtv_motion_path"),
+                "vid_path": s.get("vid_path"),
+                "vid_duration": ffprobe_duration(s.get("vid_path") or "") if s.get("vid_path") else None,
+            }
+            for i, s in enumerate(script)
+        ],
+        "lip_sync_records": lip_records,
+        "created_at": datetime.now().isoformat(timespec="seconds"),
+    }
+    (OUTPUT_DIR / "mtv_sync_qa.json").write_text(json.dumps(sync_qa, ensure_ascii=False, indent=2), encoding="utf-8")
     return script
 
 
@@ -11689,6 +11826,178 @@ def _mtv_asr_phrase_records(phrases: list[tuple[int, str]], asr_records: list[di
     return records
 
 
+def _mtv_alignment_from_script(script: list[dict], song_path: str | None = None) -> dict:
+    asr_start, asr_end, asr_records = _mtv_vocal_span_from_asr(song_path or "") if song_path else (0.0, 0.0, [])
+    use_asr_span = bool(asr_end > asr_start and asr_end - asr_start >= 5)
+    records: list[dict] = []
+    if use_asr_span:
+        phrase_units: list[tuple[int, str]] = []
+        for idx, scene in enumerate(script):
+            for phrase in _mtv_split_lyric_phrases(scene.get("text") or scene.get("lyric") or ""):
+                if phrase.strip():
+                    phrase_units.append((idx, phrase.strip()))
+        records = _mtv_asr_phrase_records(phrase_units, asr_records)
+        if not records:
+            lyric_units: list[tuple[int, str]] = []
+            for idx, scene in enumerate(script):
+                for clause in _mtv_split_lyric_clauses(scene.get("text") or scene.get("lyric") or ""):
+                    if clause.strip():
+                        lyric_units.append((idx, clause.strip()))
+            weights = [max(4, len(re.sub(r"\s+", "", unit))) for _idx, unit in lyric_units]
+            total_weight = sum(weights) or 1
+            vocal_dur = asr_end - asr_start
+            cursor = asr_start
+            for (idx, unit), weight in zip(lyric_units, weights):
+                dur = max(1.2, vocal_dur * weight / total_weight)
+                start = cursor + 0.05
+                end = min(asr_end, max(start + 0.7, cursor + dur - 0.05))
+                text = _mtv_wrap_lyric(unit)
+                if text:
+                    records.append({"scene": idx + 1, "start": round(start, 3), "end": round(end, 3), "text": text, "source": "song_asr_vocal_span"})
+                cursor = cursor + dur
+                if cursor >= asr_end:
+                    break
+    else:
+        cursor = 0.0
+        for idx, scene in enumerate(script):
+            vid_path = scene.get("vid_path") or ""
+            dur = ffprobe_duration(vid_path) if vid_path and os.path.exists(vid_path) else float(scene.get("vid_duration") or scene.get("dur") or 0)
+            dur = max(0.5, float(dur or 0.0))
+            text = _mtv_wrap_lyric(scene.get("text") or scene.get("lyric") or "")
+            if text:
+                start = cursor + 0.15
+                end = max(start + 0.5, cursor + dur - 0.15)
+                records.append({"scene": idx + 1, "start": round(start, 3), "end": round(end, 3), "text": text, "source": "scene_duration_fallback"})
+            cursor += dur
+    return {
+        "use_asr_span": use_asr_span,
+        "asr_start": asr_start,
+        "asr_end": asr_end,
+        "asr_records": asr_records,
+        "records": records,
+        "alignment_mode": records[0].get("source") if records else ("song_asr_vocal_span" if use_asr_span else "scene_duration_fallback"),
+    }
+
+
+def _mtv_split_span(start: float, end: float, max_dur: float = 12.0) -> list[tuple[float, float]]:
+    start = max(0.0, float(start or 0.0))
+    end = max(start, float(end or start))
+    if end - start <= 0.05:
+        return []
+    n = max(1, int(math.ceil((end - start) / max(1.0, max_dur))))
+    dur = (end - start) / n
+    return [(start + i * dur, end if i == n - 1 else start + (i + 1) * dur) for i in range(n)]
+
+
+def _mtv_song_slice(song_path: str, start: float, end: float, idx: int) -> str:
+    out = str(OUTPUT_DIR / f"mtv_song_slice_{idx}.mp3")
+    dur = max(0.2, float(end) - float(start))
+    ffmpeg("-ss", f"{max(0.0, start):.3f}", "-i", song_path, "-t", f"{dur:.3f}",
+           "-c:a", "libmp3lame", "-b:a", "192k", out, timeout=120)
+    return out
+
+
+def _mtv_normalize_segment_duration(scene: dict, target_dur: float) -> bool:
+    """Force an MTV segment back onto the locked song timeline after motion fallback.
+
+    WeryDance has a minimum API duration, so a 3s lyric beat may return a 4s video.
+    The locked MTV timeline must remain authoritative; trim or pad the local file.
+    """
+    vid_path = str(scene.get("vid_path") or "")
+    if not vid_path or not os.path.exists(vid_path):
+        return False
+    target = max(0.3, float(target_dur or 0.0))
+    current = ffprobe_duration(vid_path)
+    if current > 0 and abs(current - target) <= 0.08:
+        return True
+    tmp = vid_path + ".mtvnorm.mp4"
+    vf = f"scale={VIDEO_W}:{VIDEO_H}:force_original_aspect_ratio=increase,crop={VIDEO_W}:{VIDEO_H},setsar=1,setdar={ASPECT_RATIO},fps=24"
+    if current > 0 and current < target - 0.04:
+        vf += f",tpad=stop_mode=clone:stop_duration={target - current:.3f}"
+    vf += f",trim=duration={target:.3f},setpts=PTS-STARTPTS"
+    try:
+        ffmpeg(
+            "-i", vid_path,
+            "-vf", vf,
+            "-an",
+            "-c:v", "libx264", "-crf", "20", "-preset", "medium",
+            "-pix_fmt", "yuv420p",
+            tmp,
+            timeout=180,
+        )
+        if os.path.exists(tmp) and os.path.getsize(tmp) > 1000:
+            os.replace(tmp, vid_path)
+            return True
+    except Exception as e:
+        log(f"MTV segment normalize 失败（保留原片段）：{e}")
+    return False
+
+
+def _mtv_lip_sync_segment(idx: int, scene: dict, audio_path: str, target_dur: float) -> tuple[bool, dict]:
+    info = {
+        "turn": idx + 1,
+        "interface": "almighty-reference-to-video",
+        "mode": "mtv_song_audio_lip_sync",
+        "source_audio": audio_path,
+        "target_duration": round(float(target_dur or 0.0), 3),
+    }
+    if not audio_path or not os.path.exists(audio_path):
+        info.update({"pass": False, "reason": "missing_audio_slice"})
+        return False, info
+    try:
+        image_url = _upload_to_weryai(scene["img_path"])
+        audio_url = _upload_to_weryai(audio_path)
+        scene["_almighty_reference_audio"] = audio_path
+        scene["_almighty_reference_audio_role"] = "mtv_song_vocal_slice"
+        scene["_almighty_audio_dub_attempt"] = False
+        lyric = re.sub(r"\s+", " ", str(scene.get("text") or "")).strip()[:180]
+        prompt = (
+            "Chinese cinematic music video lead singer performance. "
+            "Use the uploaded audio as the exact sung vocal/music timing reference; synchronize the singer mouth and jaw movement to that audio. "
+            "Keep the lead singer face stable, expressive, and visible enough for lip movement, with natural head and body performance. "
+            f"Sung lyric meaning for performance context: 「{lyric}」. "
+            f"Scene action: {scene.get('shot', '')}. "
+            "No generated subtitles, no captions, no text overlays, no logos, no watermark."
+        )[:2000]
+        api_dur = int(round(max(4, min(15, float(target_dur or 4) + 0.3))))
+        response = None
+        task_id = None
+        for submit_attempt in range(3):
+            try:
+                _wait_motion_submit_slot(f"mtv lip-sync {idx+1}")
+                response = req_post("/generation/almighty-reference-to-video", {
+                    "model": "WERYDANCE_2_0",
+                    "images": [image_url],
+                    "audios": [audio_url],
+                    "prompt": prompt,
+                    "negative_prompt": _werydance_negative_prompt(scene),
+                    "duration": api_dur,
+                    "aspect_ratio": ASPECT_RATIO,
+                    "resolution": "720p",
+                    "generate_audio": "false",
+                    "video_number": 1,
+                }, timeout=30)
+                task_id = response.get("data", {}).get("task_id") or (response.get("data", {}).get("task_ids") or [None])[0]
+                if task_id:
+                    break
+            except Exception as e:
+                if submit_attempt < 2:
+                    wait_s = 5 * (submit_attempt + 1)
+                    log(f"[mtv lip-sync {idx}] submit 失败（第 {submit_attempt+1}/3 次）：{e}，{wait_s}s 后重试")
+                    time.sleep(wait_s)
+                    continue
+                raise
+        if not task_id:
+            info.update({"pass": False, "reason": "submit_without_task_id", "response": response})
+            return False, info
+        ok, poll_info = _lip_sync_poll_download_and_process(idx, task_id, scene, float(target_dur or 0.0))
+        poll_info.update({"interface": "almighty-reference-to-video", "mode": "mtv_song_audio_lip_sync", "submit_duration": api_dur})
+        return ok, poll_info
+    except Exception as e:
+        info.update({"pass": False, "reason": str(e)})
+        return False, info
+
+
 def _write_mtv_subtitles(script: list[dict], song_path: str | None = None) -> str:
     ass_path = OUTPUT_DIR / "mtv_subs.ass"
     margin_l = 60 if not IS_VERTICAL else 48
@@ -11709,55 +12018,38 @@ Style: Default,Arial Unicode MS,{font_size},&H00FFFFFF,&H000000FF,&H00101010,&H9
 Format: Layer,Start,End,Style,Name,MarginL,MarginR,MarginV,Effect,Text
 """
     lines = [header]
-    cursor = 0.0
-    records = []
-    asr_start, asr_end, asr_records = _mtv_vocal_span_from_asr(song_path or "") if song_path else (0.0, 0.0, [])
-    use_asr_span = bool(asr_end > asr_start and asr_end - asr_start >= 5)
-    if use_asr_span:
-        phrase_units: list[tuple[int, str]] = []
+    if any(s.get("mtv_timeline_locked") for s in script):
+        asr_start = min((float(s.get("mtv_source_start")) for s in script if s.get("mtv_role") == "vocal"), default=0.0)
+        asr_end = max((float(s.get("mtv_source_end")) for s in script if s.get("mtv_role") == "vocal"), default=0.0)
+        asr_records = []
+        use_asr_span = bool(asr_end > asr_start)
+        records = []
         for idx, scene in enumerate(script):
-            for phrase in _mtv_split_lyric_phrases(scene.get("text") or scene.get("lyric") or ""):
-                if phrase.strip():
-                    phrase_units.append((idx, phrase.strip()))
-        records = _mtv_asr_phrase_records(phrase_units, asr_records)
+            text = str(scene.get("mtv_subtitle_text") or "").strip()
+            if not text:
+                continue
+            scene_start = float(scene.get("timeline_start") or 0.0)
+            source_start = float(scene.get("mtv_source_start") or 0.0)
+            sub_source_start = float(scene.get("mtv_subtitle_source_start") or source_start)
+            sub_source_end = float(scene.get("mtv_subtitle_source_end") or scene.get("mtv_source_end") or sub_source_start)
+            start = scene_start + max(0.0, sub_source_start - source_start) + 0.03
+            end = max(start + 0.3, scene_start + max(0.0, sub_source_end - source_start) - 0.03)
+            lines.append(f"Dialogue: 0,{_mtv_ass_time(start)},{_mtv_ass_time(end)},Default,,0,0,0,,{text}\n")
+            records.append({"scene": idx + 1, "start": round(start, 3), "end": round(end, 3), "text": text, "source": "mtv_timeline_locked"})
+        log(f"MTV 字幕使用锁定时间轴：{len(records)} 条")
+    else:
+        alignment = _mtv_alignment_from_script(script, song_path)
+        records = alignment["records"]
+        asr_start = alignment["asr_start"]
+        asr_end = alignment["asr_end"]
+        asr_records = alignment["asr_records"]
+        use_asr_span = alignment["use_asr_span"]
         for rec in records:
             lines.append(f"Dialogue: 0,{_mtv_ass_time(rec['start'])},{_mtv_ass_time(rec['end'])},Default,,0,0,0,,{rec['text']}\n")
-        if records:
+        if records and records[0].get("source") == "song_asr_phrase_segments":
             log(f"MTV 字幕使用 ASR 片段对齐歌词：{len(records)} 条")
-        lyric_units: list[tuple[int, str]] = []
-        if not records:
-            for idx, scene in enumerate(script):
-                for clause in _mtv_split_lyric_clauses(scene.get("text") or scene.get("lyric") or ""):
-                    if clause.strip():
-                        lyric_units.append((idx, clause.strip()))
-            weights = [max(4, len(re.sub(r"\s+", "", unit))) for _idx, unit in lyric_units]
-            total_weight = sum(weights) or 1
-            vocal_dur = asr_end - asr_start
-            cursor = asr_start
-            for (idx, unit), weight in zip(lyric_units, weights):
-                dur = max(1.2, vocal_dur * weight / total_weight)
-                start = cursor + 0.05
-                end = min(asr_end, max(start + 0.7, cursor + dur - 0.05))
-                text = _mtv_wrap_lyric(unit)
-                if text:
-                    lines.append(f"Dialogue: 0,{_mtv_ass_time(start)},{_mtv_ass_time(end)},Default,,0,0,0,,{text}\n")
-                    records.append({"scene": idx + 1, "start": round(start, 3), "end": round(end, 3), "text": text, "source": "song_asr_vocal_span"})
-                cursor = cursor + dur
-                if cursor >= asr_end:
-                    break
+        elif use_asr_span:
             log(f"MTV 字幕使用歌曲 ASR 人声区间：{asr_start:.2f}-{asr_end:.2f}s，{len(records)} 条")
-    else:
-        for idx, scene in enumerate(script):
-            vid_path = scene.get("vid_path") or ""
-            dur = ffprobe_duration(vid_path) if vid_path and os.path.exists(vid_path) else float(scene.get("vid_duration") or scene.get("dur") or 0)
-            dur = max(0.5, float(dur or 0.0))
-            text = _mtv_wrap_lyric(scene.get("text") or scene.get("lyric") or "")
-            if text:
-                start = cursor + 0.15
-                end = max(start + 0.5, cursor + dur - 0.15)
-                lines.append(f"Dialogue: 0,{_mtv_ass_time(start)},{_mtv_ass_time(end)},Default,,0,0,0,,{text}\n")
-                records.append({"scene": idx + 1, "start": round(start, 3), "end": round(end, 3), "text": text, "source": "scene_duration_fallback"})
-            cursor += dur
     ass_path.write_text("".join(lines), encoding="utf-8")
     (OUTPUT_DIR / "mtv_subtitle_qa.json").write_text(
         json.dumps({

@@ -25,7 +25,7 @@ ADR 是一套自动纪录片生成管线。输入一个主题或带时间戳的�
 - ADSD 走 step66 lip_sync，不参与 step65 motion；`--no-motion` 对 ADSD 无效。
 - MTV 是独立音乐视频管线，不走普通旁白 TTS / Whisper 字幕时间轴；主音轨来自 WeryAI `VOCAL_SONG`。
 - MTV 主唱通过 `--singer <名字>` 指定；如果主唱已存在于 `voice_assets/speaker_ips/`，直接复用人物卡和绑定音色；如果不存在，自动孵化人物卡并写入人物库。
-- MTV 默认烧录歌词字幕；优先用歌曲 ASR 人声区间对齐歌词节奏，失败时按分镜时长兜底；可用环境变量 `ADR_MTV_SUBTITLES=0` 关闭。
+- MTV 默认烧录歌词字幕；先用歌曲 ASR 建立“声音/字幕/视频”共享时间轴，再按该时间轴生成前奏、歌词和尾奏镜头；人声段默认尝试歌曲音频驱动 lip-sync（`ADR_MTV_LIP_SYNC=0` 可关闭），失败时降级普通动效；可用 `ADR_MTV_SUBTITLES=0` 关闭字幕。
 
 ## 默认策略
 
@@ -101,6 +101,7 @@ python3 run_adr_v8.py "1915年二十一条最后通牒" v --ads-reporter
 python3 run_adr_v8.py "AI时代就业市场访谈" h --ads-dialogue
 python3 run_adr_v8.py "江南春日风物" v --bgm-only
 python3 run_adr_v8.py "曹操的短歌行" hmtv --singer 曹操
+python3 tools/mtv_sync_audit.py /tmp/adr_v8_xxx
 python3 run_adr_v8.py "唐宋八大家" h --no-motion          # 罕用：HADR 静态分镜
 ```
 
