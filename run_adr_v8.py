@@ -11552,7 +11552,63 @@ def _mtv_wrap_lyric(text: str) -> str:
     return r"\N".join(chunks[:2])
 
 
-def _write_mtv_subtitles(script: list[dict]) -> str:
+def _mtv_vocal_span_from_asr(song_path: str) -> tuple[float, float, list[dict]]:
+    """Detect the sung/vocal region in a generated MTV song.
+
+    VOCAL_SONG often has a long instrumental intro. Scene-duration subtitles start too early,
+    so use Whisper timestamps to find where the singer actually enters. Singing ASR text may be
+    inaccurate, but start/end timing is still useful.
+    """
+    if not song_path or not os.path.exists(song_path):
+        return 0.0, 0.0, []
+    try:
+        from faster_whisper import WhisperModel
+        model = WhisperModel("base", compute_type="int8")
+        segs, _info = model.transcribe(
+            song_path,
+            language="zh",
+            word_timestamps=True,
+            beam_size=5,
+            vad_filter=False,
+        )
+        records = []
+        for seg in segs:
+            text = str(getattr(seg, "text", "") or "").strip()
+            start = float(getattr(seg, "start", 0.0) or 0.0)
+            end = float(getattr(seg, "end", start) or start)
+            if text and end > start:
+                records.append({"start": start, "end": end, "text": text})
+        if not records:
+            return 0.0, 0.0, []
+        first = min(r["start"] for r in records)
+        last = max(r["end"] for r in records)
+        song_dur = ffprobe_duration(song_path)
+        # Guard against hallucinated tiny early segments in instrumental intros.
+        if song_dur > 20 and first < 2 and len(records) >= 3:
+            later = [r for r in records if r["start"] >= 5]
+            if later:
+                first = min(r["start"] for r in later)
+        if last <= first or last - first < 5:
+            return 0.0, 0.0, records
+        return first, min(last, song_dur or last), records
+    except Exception as e:
+        log(f"MTV 字幕 ASR 人声区间检测失败，回退镜头均分：{e}")
+        return 0.0, 0.0, []
+
+
+def _mtv_split_lyric_clauses(text: str) -> list[str]:
+    raw = re.split(r"[。；;]\s*", str(text or "").strip())
+    clauses: list[str] = []
+    for item in raw:
+        item = item.strip()
+        if not item:
+            continue
+        sub = [x.strip() for x in re.split(r"(?<=[？！?！])", item) if x.strip()]
+        clauses.extend(sub or [item])
+    return clauses or ([str(text).strip()] if str(text or "").strip() else [])
+
+
+def _write_mtv_subtitles(script: list[dict], song_path: str | None = None) -> str:
     ass_path = OUTPUT_DIR / "mtv_subs.ass"
     margin_l = 60 if not IS_VERTICAL else 48
     margin_r = margin_l
@@ -11574,17 +11630,42 @@ Format: Layer,Start,End,Style,Name,MarginL,MarginR,MarginV,Effect,Text
     lines = [header]
     cursor = 0.0
     records = []
-    for idx, scene in enumerate(script):
-        vid_path = scene.get("vid_path") or ""
-        dur = ffprobe_duration(vid_path) if vid_path and os.path.exists(vid_path) else float(scene.get("vid_duration") or scene.get("dur") or 0)
-        dur = max(0.5, float(dur or 0.0))
-        text = _mtv_wrap_lyric(scene.get("text") or scene.get("lyric") or "")
-        if text:
-            start = cursor + 0.15
-            end = max(start + 0.5, cursor + dur - 0.15)
-            lines.append(f"Dialogue: 0,{_mtv_ass_time(start)},{_mtv_ass_time(end)},Default,,0,0,0,,{text}\n")
-            records.append({"scene": idx + 1, "start": round(start, 3), "end": round(end, 3), "text": text})
-        cursor += dur
+    asr_start, asr_end, asr_records = _mtv_vocal_span_from_asr(song_path or "") if song_path else (0.0, 0.0, [])
+    use_asr_span = bool(asr_end > asr_start and asr_end - asr_start >= 5)
+    if use_asr_span:
+        lyric_units: list[tuple[int, str]] = []
+        for idx, scene in enumerate(script):
+            for clause in _mtv_split_lyric_clauses(scene.get("text") or scene.get("lyric") or ""):
+                if clause.strip():
+                    lyric_units.append((idx, clause.strip()))
+        weights = [max(4, len(re.sub(r"\s+", "", unit))) for _idx, unit in lyric_units]
+        total_weight = sum(weights) or 1
+        vocal_dur = asr_end - asr_start
+        cursor = asr_start
+        for (idx, unit), weight in zip(lyric_units, weights):
+            dur = max(1.2, vocal_dur * weight / total_weight)
+            start = cursor + 0.05
+            end = min(asr_end, max(start + 0.7, cursor + dur - 0.05))
+            text = _mtv_wrap_lyric(unit)
+            if text:
+                lines.append(f"Dialogue: 0,{_mtv_ass_time(start)},{_mtv_ass_time(end)},Default,,0,0,0,,{text}\n")
+                records.append({"scene": idx + 1, "start": round(start, 3), "end": round(end, 3), "text": text, "source": "song_asr_vocal_span"})
+            cursor = cursor + dur
+            if cursor >= asr_end:
+                break
+        log(f"MTV 字幕使用歌曲 ASR 人声区间：{asr_start:.2f}-{asr_end:.2f}s，{len(records)} 条")
+    else:
+        for idx, scene in enumerate(script):
+            vid_path = scene.get("vid_path") or ""
+            dur = ffprobe_duration(vid_path) if vid_path and os.path.exists(vid_path) else float(scene.get("vid_duration") or scene.get("dur") or 0)
+            dur = max(0.5, float(dur or 0.0))
+            text = _mtv_wrap_lyric(scene.get("text") or scene.get("lyric") or "")
+            if text:
+                start = cursor + 0.15
+                end = max(start + 0.5, cursor + dur - 0.15)
+                lines.append(f"Dialogue: 0,{_mtv_ass_time(start)},{_mtv_ass_time(end)},Default,,0,0,0,,{text}\n")
+                records.append({"scene": idx + 1, "start": round(start, 3), "end": round(end, 3), "text": text, "source": "scene_duration_fallback"})
+            cursor += dur
     ass_path.write_text("".join(lines), encoding="utf-8")
     (OUTPUT_DIR / "mtv_subtitle_qa.json").write_text(
         json.dumps({
@@ -11592,6 +11673,10 @@ Format: Layer,Start,End,Style,Name,MarginL,MarginR,MarginV,Effect,Text
             "subtitle_path": str(ass_path),
             "total_scenes": len(script),
             "subtitle_count": len(records),
+            "alignment_mode": "song_asr_vocal_span" if use_asr_span else "scene_duration_fallback",
+            "asr_vocal_start": round(asr_start, 3) if use_asr_span else None,
+            "asr_vocal_end": round(asr_end, 3) if use_asr_span else None,
+            "asr_records": asr_records[:20],
             "records": records,
             "created_at": datetime.now().isoformat(timespec="seconds"),
         }, ensure_ascii=False, indent=2),
@@ -11614,7 +11699,7 @@ def _mtv_concat_and_render(script: list[dict], song_path: str, topic: str) -> st
     final_path = str(OUTPUT_DIR / "final_mtv.mp4")
     ass_path = ""
     if os.environ.get("ADR_MTV_SUBTITLES", "1").strip().lower() not in ("0", "false", "no", "off"):
-        ass_path = _write_mtv_subtitles(valid)
+        ass_path = _write_mtv_subtitles(valid, song_path)
     vf = f"scale={VIDEO_W}:{VIDEO_H}:force_original_aspect_ratio=increase,crop={VIDEO_W}:{VIDEO_H},setsar=1,setdar={ASPECT_RATIO},fps=24"
     if ass_path:
         ass_escaped = ass_path.replace("\\", "/").replace(":", "\\:")
@@ -20802,6 +20887,11 @@ def step10_deliver(final_path: str, topic: str, script: list[dict]):
     url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendVideo"
     # B70: delivery_tag/short_caption 已在 oversize router 之前提前定义
     video_ok = False
+    _tg_w, _tg_h = ffprobe_video_size(final_path)
+    _tg_w = int(_tg_w or VIDEO_W)
+    _tg_h = int(_tg_h or VIDEO_H)
+    _tg_dur = int(round(ffprobe_duration(final_path) or 0))
+    log(f"Telegram sendVideo metadata: width={_tg_w} height={_tg_h} duration={_tg_dur}s")
 
     # ── SSL 假阴性防护：见模块级 _tg_probe_send / _tg_probe_delete ──
     # 局部 alias，保留原变量名以最小化 diff
@@ -20819,8 +20909,9 @@ def step10_deliver(final_path: str, topic: str, script: list[dict]):
                     "chat_id":           TG_CHAT_ID,
                     "caption":           short_caption,
                     "supports_streaming": "true",
-                    "width":             str(VIDEO_W),
-                    "height":            str(VIDEO_H),
+                    "width":             str(_tg_w),
+                    "height":            str(_tg_h),
+                    "duration":          str(_tg_dur),
                 }, files={"video": (os.path.basename(final_path), f, "video/mp4")}, timeout=(30, 600))
             if r.status_code == 200:
                 try:
@@ -20884,8 +20975,9 @@ def step10_deliver(final_path: str, topic: str, script: list[dict]):
                     "-F", f"chat_id={TG_CHAT_ID}",
                     "-F", f"caption={short_caption}",
                     "-F", "supports_streaming=true",
-                    "-F", f"width={VIDEO_W}",
-                    "-F", f"height={VIDEO_H}",
+                    "-F", f"width={_tg_w}",
+                    "-F", f"height={_tg_h}",
+                    "-F", f"duration={_tg_dur}",
                     "-F", f"video=@{final_path}",
                     "--max-time", "600",
                     "--connect-timeout", "30",
