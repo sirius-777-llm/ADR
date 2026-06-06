@@ -72,8 +72,14 @@ def _audit_locked(out_dir: Path, qa: dict) -> tuple[bool, list[str]]:
     song_dur = float(qa.get("song_duration") or 0.0)
     if song_dur and abs(prev_end - song_dur) > 0.35:
         issues.append(f"timeline total != song duration: timeline={prev_end:.3f}, song={song_dur:.3f}")
-    if qa.get("lip_sync_enabled") and qa.get("vocal_segment_count") and int(qa.get("lip_sync_success_count") or 0) <= 0:
-        issues.append("lip_sync_enabled but no successful vocal lip-sync segments")
+    if qa.get("lip_sync_enabled") and qa.get("vocal_segment_count"):
+        vocal_count = int(qa.get("vocal_segment_count") or 0)
+        lip_success = int(qa.get("lip_sync_success_count") or 0)
+        if lip_success < vocal_count:
+            issues.append(f"lip_sync incomplete: {lip_success}/{vocal_count} vocal segments succeeded")
+        for rec in records:
+            if rec.get("role") == "vocal" and rec.get("motion_path") != "song-audio-lip-sync":
+                issues.append(f"vocal turn {rec.get('turn')} not rendered by song-audio-lip-sync: {rec.get('motion_path')}")
     return not issues, issues
 
 

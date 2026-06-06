@@ -11532,6 +11532,18 @@ def _mtv_generate_visual_segments(plan: dict, song_path: str, singer: str, singe
                 f"Visual style: {plan.get('visual_style', '')}"
             )[:1800]
             scene["mtv_motion"] = "instrumental cinematic montage, slow expressive camera motion, no singing mouth close-up"
+        elif role == "vocal":
+            scene["prompt"] = (
+                f"{src.get('shot', '')}. Lead singer identity lock: {visual_subject}. "
+                "Vocal performance frame: chest-up or medium close-up of the singer, face large in frame, "
+                "mouth clearly visible and unobstructed for lip-sync, natural singing expression, eyes and jaw readable. "
+                "No on-screen lyrics, no subtitles, no logos, no watermarks. "
+                f"Visual style: {plan.get('visual_style', '')}"
+            )[:1800]
+            scene["mtv_motion"] = (
+                "medium close-up singing performance, face stable, mouth clearly visible, subtle head movement, "
+                "cinematic camera breathing without cutting away from the singer"
+            )
         timeline.append(scene)
 
     if records:
@@ -11611,6 +11623,7 @@ def _mtv_generate_visual_segments(plan: dict, song_path: str, singer: str, singe
         except Exception as e:
             log(f"MTV t2v 失败 scene {i+1}: {e}")
         scene["mtv_motion_path"] = "still_fallback"
+        _mtv_static_fallback_segment(scene, float(scene.get("vid_duration") or scene.get("dur") or 0.0))
         tg(f"⚠️ MTV 第 {i+1} 镜 WeryDance 失败，保留静态兜底片段")
     sync_qa = {
         "mode": CURRENT_MODE_LABEL,
@@ -11933,6 +11946,28 @@ def _mtv_normalize_segment_duration(scene: dict, target_dur: float) -> bool:
     return False
 
 
+def _mtv_static_fallback_segment(scene: dict, target_dur: float) -> bool:
+    img_path = str(scene.get("img_path") or "")
+    vid_path = str(scene.get("vid_path") or "")
+    if not img_path or not os.path.exists(img_path) or not vid_path:
+        return False
+    target = max(0.3, float(target_dur or 0.0))
+    try:
+        ffmpeg(
+            "-loop", "1", "-t", f"{target:.3f}", "-i", img_path,
+            "-vf", f"scale={VIDEO_W}:{VIDEO_H}:force_original_aspect_ratio=increase,crop={VIDEO_W}:{VIDEO_H},setsar=1,setdar={ASPECT_RATIO},fps=24",
+            "-an",
+            "-c:v", "libx264", "-crf", "20", "-preset", "medium",
+            "-pix_fmt", "yuv420p",
+            vid_path,
+            timeout=180,
+        )
+        return os.path.exists(vid_path) and os.path.getsize(vid_path) > 1000
+    except Exception as e:
+        log(f"MTV static fallback 失败：{e}")
+        return False
+
+
 def _mtv_lip_sync_segment(idx: int, scene: dict, audio_path: str, target_dur: float) -> tuple[bool, dict]:
     info = {
         "turn": idx + 1,
@@ -11954,7 +11989,9 @@ def _mtv_lip_sync_segment(idx: int, scene: dict, audio_path: str, target_dur: fl
         prompt = (
             "Chinese cinematic music video lead singer performance. "
             "Use the uploaded audio as the exact sung vocal/music timing reference; synchronize the singer mouth and jaw movement to that audio. "
-            "Keep the lead singer face stable, expressive, and visible enough for lip movement, with natural head and body performance. "
+            "Keep a chest-up or medium close-up composition: singer face large in frame, mouth clearly visible, unobstructed, and readable throughout. "
+            "Avoid wide shots, profile-only shots, back views, covered mouth, tiny face, or cutting away from the singer during the vocal line. "
+            "Keep the face stable and expressive with natural singing jaw motion and subtle head movement. "
             f"Sung lyric meaning for performance context: 「{lyric}」. "
             f"Scene action: {scene.get('shot', '')}. "
             "No generated subtitles, no captions, no text overlays, no logos, no watermark."

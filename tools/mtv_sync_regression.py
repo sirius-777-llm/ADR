@@ -51,6 +51,16 @@ def main() -> int:
         dur = _duration(long_seg)
         assert abs(dur - 1.35) <= 0.12, f"normalized duration mismatch: {dur}"
 
+        still = tmp / "still.jpg"
+        static_seg = tmp / "seg_static.mp4"
+        _run([
+            "ffmpeg", "-hide_banner", "-y", "-f", "lavfi", "-i", "color=c=blue:s=720x1280",
+            "-frames:v", "1", str(still),
+        ])
+        assert adr._mtv_static_fallback_segment({"img_path": str(still), "vid_path": str(static_seg)}, 0.9), "static fallback returned false"
+        static_dur = _duration(static_seg)
+        assert abs(static_dur - 0.9) <= 0.12, f"static fallback duration mismatch: {static_dur}"
+
         script = [
             {
                 "vid_path": str(long_seg),
