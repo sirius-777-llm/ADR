@@ -12152,7 +12152,7 @@ def _mtv_concat_and_render(script: list[dict], song_path: str, topic: str) -> st
         "subtitle_path": ass_path,
         "subtitles_enabled": bool(ass_path),
         "scene_count": len(valid),
-        "motion_paths": {k: sum(1 for s in valid if s.get("mtv_motion_path") == k) for k in ("image-to-video", "text-to-video", "still_fallback")},
+        "motion_paths": {k: sum(1 for s in valid if s.get("mtv_motion_path") == k) for k in ("song-audio-lip-sync", "image-to-video", "text-to-video", "still_fallback")},
         "duration": ffprobe_duration(final_path),
         "created_at": datetime.now().isoformat(timespec="seconds"),
     }
