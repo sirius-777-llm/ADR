@@ -11601,6 +11601,10 @@ def _mtv_generate_visual_segments(plan: dict, song_path: str, singer: str, singe
                 ok, info = _mtv_lip_sync_segment(i, scene, slice_path, float(scene.get("vid_duration") or scene.get("dur") or 0.0))
                 lip_records.append(info)
                 if ok:
+                    # B94: almighty lip-sync 片段时长(整数 api_dur, min 4s + 0.3)≠ source span(锁定时间轴),
+                    # 必须 trim/pad 回 vid_duration, 否则视频段累积漂移 → 整首歌铺上去【口型与音频不同步】
+                    # (字幕走视频段时间轴故仍与口型一致, 正是大哥观察的现象)。fallback 路径本就归一, lip-sync 路径此前漏了。
+                    _mtv_normalize_segment_duration(scene, float(scene.get("vid_duration") or scene.get("dur") or 0.0))
                     scene["mtv_motion_path"] = "song-audio-lip-sync"
                     continue
                 log(f"MTV lip-sync 失败 scene {i+1}: {info.get('reason')}")
