@@ -10,6 +10,8 @@ ADR V8 — 字幕驱动纪录片自动生成管线
     TG_BOT_TOKEN     必填（状态推送）
     TG_CHAT_ID       必填
     OUTPUT_DIR       可选，默认 /tmp/adr_v8_output
+    ADR_ALMIGHTY_MODEL       可选，Almighty 主模型，默认 WERYDANCE
+    ADR_ALMIGHTY_FAST_MODEL  可选，Almighty 快速回退模型，默认 SEEDANCE_2_0_FAST_OS
 """
 import json
 import math
@@ -127,6 +129,29 @@ TG_CHAT_ID     = os.environ.get("TG_CHAT_ID", "")
 TG_PROGRESS_MODE = os.environ.get("ADR_TG_PROGRESS_MODE", "dashboard").strip().lower()
 TG_DIGEST_INTERVAL_SEC = float(os.environ.get("ADR_TG_DIGEST_INTERVAL_SEC", "120"))
 TG_DASHBOARD_EDIT_INTERVAL_SEC = float(os.environ.get("ADR_TG_DASHBOARD_EDIT_INTERVAL_SEC", "8"))
+
+SUPPORTED_ALMIGHTY_MODELS = frozenset({
+    "WERYDANCE",
+    "SEEDANCE_2_0_OS",
+    "SEEDANCE_2_0_FAST_OS",
+    "SEEDANCE_2_0_MINI_OS",
+})
+
+
+def _read_almighty_model(env_name: str, default: str) -> str:
+    value = os.environ.get(env_name, default).strip().upper() or default
+    if value not in SUPPORTED_ALMIGHTY_MODELS:
+        allowed = ", ".join(sorted(SUPPORTED_ALMIGHTY_MODELS))
+        raise ValueError(f"{env_name}={value!r} 不支持，可选: {allowed}")
+    return value
+
+
+try:
+    ALMIGHTY_MODEL = _read_almighty_model("ADR_ALMIGHTY_MODEL", "WERYDANCE")
+    ALMIGHTY_FAST_MODEL = _read_almighty_model("ADR_ALMIGHTY_FAST_MODEL", "SEEDANCE_2_0_FAST_OS")
+except ValueError as exc:
+    print(f"ERROR: {exc}", file=sys.stderr)
+    sys.exit(2)
 
 if not all([WERYAI_API_KEY, TG_BOT_TOKEN, TG_CHAT_ID]):
     missing = [k for k, v in [("WERYAI_API_KEY", WERYAI_API_KEY), ("TG_BOT_TOKEN", TG_BOT_TOKEN), ("TG_CHAT_ID", TG_CHAT_ID)] if not v]
@@ -11976,6 +12001,7 @@ def _mtv_lip_sync_segment(idx: int, scene: dict, audio_path: str, target_dur: fl
     info = {
         "turn": idx + 1,
         "interface": "almighty-reference-to-video",
+        "model": ALMIGHTY_MODEL,
         "mode": "mtv_song_audio_lip_sync",
         "source_audio": audio_path,
         "target_duration": round(float(target_dur or 0.0), 3),
@@ -12007,7 +12033,7 @@ def _mtv_lip_sync_segment(idx: int, scene: dict, audio_path: str, target_dur: fl
             try:
                 _wait_motion_submit_slot(f"mtv lip-sync {idx+1}")
                 response = req_post("/generation/almighty-reference-to-video", {
-                    "model": "WERYDANCE_2_0",
+                    "model": ALMIGHTY_MODEL,
                     "images": [image_url],
                     "audios": [audio_url],
                     "prompt": prompt,
@@ -13645,7 +13671,7 @@ def _try_motion_audio_dub_video(idx: int, scene: dict, motion_prompt: str, aspec
         try:
             _wait_motion_submit_slot(f"motion audio-dub {idx+1}")
             response = req_post("/generation/almighty-reference-to-video", {
-                "model": "WERYDANCE_2_0",
+                "model": ALMIGHTY_MODEL,
                 "images": image_urls,
                 "audios": [audio_url],
                 "prompt": prompt,
@@ -13683,7 +13709,7 @@ def _try_motion_audio_dub_video(idx: int, scene: dict, motion_prompt: str, aspec
     timed_out_or_reusable = str(idx) in _load_motion_tasks()
     info.update({
         "path": "almighty-reference-audio-dub",
-        "model": "WERYDANCE_2_0",
+        "model": ALMIGHTY_MODEL,
         "submit_duration": dur,
         "target_duration": round(float(target_dur or dur), 3),
         "aspect_ratio": aspect_ratio,
@@ -15012,7 +15038,7 @@ def _generate_character_trailer_motion(script: list[dict], motion_prompts: list[
         "mode": "character_sheet_plus_clean_refs_to_trailer",
         "enabled": True,
         "interface": "almighty-reference-to-video",
-        "model": "WERYDANCE_2_0",
+        "model": ALMIGHTY_MODEL,
         "aspect_ratio": aspect_ratio,
         "resolution": os.environ.get("ADR_CHARACTER_TRAILER_RESOLUTION", "720p"),
         "character_sheet": str(sheet_path),
@@ -15062,7 +15088,7 @@ def _generate_character_trailer_motion(script: list[dict], motion_prompts: list[
             prompt = _character_trailer_prompt(scene, idx, motion_prompts[idx] if idx < len(motion_prompts) else "")
             _wait_motion_submit_slot(f"character trailer shot {idx+1}")
             r = req_post("/generation/almighty-reference-to-video", {
-                "model": "WERYDANCE_2_0",
+                "model": ALMIGHTY_MODEL,
                 "images": [sheet_url, shot_url],
                 "prompt": prompt,
                 "duration": record["duration_requested"],
@@ -15186,7 +15212,7 @@ def _generate_multi_trailer_segments(script: list[dict], aspect_ratio: str) -> s
         try:
             _wait_motion_submit_slot(f"multi-trailer seg {gi+1}")
             r = req_post("/generation/almighty-reference-to-video", {
-                "model": "WERYDANCE_2_0",
+                "model": ALMIGHTY_MODEL,
                 "images": images,
                 "prompt": prompt,
                 "duration": group["duration"],
@@ -15250,7 +15276,7 @@ def _generate_storyboard_trailer_motion(script: list[dict], motion_prompts: list
         "mode": "production_storyboard_page_to_trailer",
         "enabled": True,
         "interface": "almighty-reference-to-video",
-        "model": "WERYDANCE_2_0",
+        "model": ALMIGHTY_MODEL,
         "aspect_ratio": aspect_ratio,
         "resolution": os.environ.get("ADR_STORYBOARD_TRAILER_RESOLUTION", "720p"),
         "storyboard_page": str(board_path),
@@ -15279,7 +15305,7 @@ def _generate_storyboard_trailer_motion(script: list[dict], motion_prompts: list
         prompt = _storyboard_trailer_prompt(script, motion_prompts, has_character_sheet)
         _wait_motion_submit_slot("storyboard trailer")
         r = req_post("/generation/almighty-reference-to-video", {
-            "model": "WERYDANCE_2_0",
+            "model": ALMIGHTY_MODEL,
             "images": image_urls,
             "prompt": prompt,
             "duration": qa["duration_requested"],
@@ -15325,7 +15351,7 @@ def _generate_previs_page_motion_segments(script: list[dict], motion_prompts: li
         "mode": "storyboard_previs_page_to_werydance",
         "enabled": True,
         "interface": "almighty-reference-to-video",
-        "model": "WERYDANCE_2_0",
+        "model": ALMIGHTY_MODEL,
         "aspect_ratio": aspect_ratio,
         "resolution": os.environ.get("ADR_PREVIS_PAGE_RESOLUTION", "720p"),
         "total_pages": len(groups),
@@ -15378,7 +15404,7 @@ def _generate_previs_page_motion_segments(script: list[dict], motion_prompts: li
             prompt = _previs_page_group_prompt(group, scene_indices, motion_prompts, has_character_sheet)
             _wait_motion_submit_slot(f"previs page {group_no}")
             r = req_post("/generation/almighty-reference-to-video", {
-                "model": "WERYDANCE_2_0",
+                "model": ALMIGHTY_MODEL,
                 "images": image_urls,
                 "prompt": prompt,
                 "duration": duration,
@@ -15460,7 +15486,7 @@ def _generate_grid_multiref_motion_segments(script: list[dict], motion_prompts: 
         "mode": "storyboard_grid_clean_refs_to_werydance_multiref",
         "enabled": True,
         "interface": "almighty-reference-to-video",
-        "model": "WERYDANCE_2_0",
+        "model": ALMIGHTY_MODEL,
         "aspect_ratio": aspect_ratio,
         "resolution": os.environ.get("ADR_STORYBOARD_GRID_MULTIREF_RESOLUTION", "720p"),
         "group_size": _b62_group_size,
@@ -15569,7 +15595,7 @@ def _generate_grid_multiref_motion_segments(script: list[dict], motion_prompts: 
             # try/except 包整 submit, 上游 reject combo 自动回退原 silent 路径
             voice_ref = _select_voice_asset_reference(group[0], mode="motion")
             base_payload = {
-                "model": "WERYDANCE_2_0",
+                "model": ALMIGHTY_MODEL,
                 "images": image_urls,
                 "prompt": prompt,
                 "duration": duration,
@@ -16840,7 +16866,7 @@ def _lip_sync_one_group(group: list[int], script: list[dict], target_durs: list[
         # codex Medium fix: 用 actual_total (实际拼接 audio 时长) 算 api_dur
         api_dur = int(round(min(15, max(4, actual_total + 0.3))))
         payload = {
-            "model": "WERYDANCE_2_0",
+            "model": ALMIGHTY_MODEL,
             "images": ref_images,
             "audios": [audio_url],
             "prompt": prompt,
@@ -17055,13 +17081,13 @@ def _lip_sync_one_scene(idx: int, scene: dict, target_dur: float, aspect_ratio: 
                 api_dur = max(api_dur, 10)
                 _act_prompt_safe = _adsd_action_b_motion_prompt(scene, safe_retry=True)
                 variants = [
-                    ("action_b_kinetic", "WERYDANCE_2_0", _adsd_action_b_motion_prompt(scene, safe_retry=False), "true"),
-                    ("action_b_kinetic_safe", "WERYDANCE_2_0", _act_prompt_safe, "true"),
+                    ("action_b_kinetic", ALMIGHTY_MODEL, _adsd_action_b_motion_prompt(scene, safe_retry=False), "true"),
+                    ("action_b_kinetic_safe", ALMIGHTY_MODEL, _act_prompt_safe, "true"),
                 ]
                 if fast_fallback_enabled:
-                    variants.append(("action_b_kinetic_fast", "WERYDANCE_2_0_FAST", _act_prompt_safe, "true"))
+                    variants.append(("action_b_kinetic_fast", ALMIGHTY_FAST_MODEL, _act_prompt_safe, "true"))
                     for _r in range(FAST_RETRY_COUNT):
-                        variants.append((f"action_b_fast_retry_{_r+1}", "WERYDANCE_2_0_FAST", _act_prompt_safe, "true"))
+                        variants.append((f"action_b_fast_retry_{_r+1}", ALMIGHTY_FAST_MODEL, _act_prompt_safe, "true"))
             elif is_silent:
                 # silent_b：纯 motion，呼吸位 prompt。B91.5: env ADR_SILENT_B_NATIVE_AUDIO 开 →
                 # 用 Seedance(WERYDANCE_2_0)原生环境音(silent_b 无旁白/对话, 叠在 BGM 下不冲突;
@@ -17069,62 +17095,62 @@ def _lip_sync_one_scene(idx: int, scene: dict, target_dur: float, aspect_ratio: 
                 _sil_ga = "true" if os.environ.get("ADR_SILENT_B_NATIVE_AUDIO", "0").strip().lower() in ("1", "true", "yes", "on") else "false"
                 _sil_prompt_safe = _adsd_silent_b_motion_prompt(scene, safe_retry=True)
                 variants = [
-                    ("silent_b_motion", "WERYDANCE_2_0", _adsd_silent_b_motion_prompt(scene, safe_retry=False), _sil_ga),
-                    ("silent_b_motion_safe", "WERYDANCE_2_0", _sil_prompt_safe, _sil_ga),
+                    ("silent_b_motion", ALMIGHTY_MODEL, _adsd_silent_b_motion_prompt(scene, safe_retry=False), _sil_ga),
+                    ("silent_b_motion_safe", ALMIGHTY_MODEL, _sil_prompt_safe, _sil_ga),
                 ]
                 if fast_fallback_enabled:
-                    variants.append(("silent_b_motion_fast", "WERYDANCE_2_0_FAST", _sil_prompt_safe, _sil_ga))
+                    variants.append(("silent_b_motion_fast", ALMIGHTY_FAST_MODEL, _sil_prompt_safe, _sil_ga))
                     for _r in range(FAST_RETRY_COUNT):
-                        variants.append((f"silent_b_fast_retry_{_r+1}", "WERYDANCE_2_0_FAST", _sil_prompt_safe, _sil_ga))
+                        variants.append((f"silent_b_fast_retry_{_r+1}", ALMIGHTY_FAST_MODEL, _sil_prompt_safe, _sil_ga))
             elif is_narrated and ADSD_ALMIGHTY_AUDIO_DUB_EXPERIMENT and audio_url:
                 # narrated_b：走 audio_dub 拿克隆旁白音色 + 含 dialogue text 的专属 prompt
                 # (之前用 broll prompt 没 dialogue text 导致 WERYDANCE 脑补杂音)
                 _nar_prompt_safe = _adsd_narrated_b_audio_dub_prompt(scene, safe_retry=True)
                 variants = [
-                    ("narrated_b_audio_dub", "WERYDANCE_2_0", _adsd_narrated_b_audio_dub_prompt(scene, safe_retry=False), "true"),
-                    ("narrated_b_audio_dub_safe", "WERYDANCE_2_0", _nar_prompt_safe, "true"),
-                    ("narrated_b_motion_fallback", "WERYDANCE_2_0", _adsd_broll_motion_prompt(scene, safe_retry=True), "false"),
+                    ("narrated_b_audio_dub", ALMIGHTY_MODEL, _adsd_narrated_b_audio_dub_prompt(scene, safe_retry=False), "true"),
+                    ("narrated_b_audio_dub_safe", ALMIGHTY_MODEL, _nar_prompt_safe, "true"),
+                    ("narrated_b_motion_fallback", ALMIGHTY_MODEL, _adsd_broll_motion_prompt(scene, safe_retry=True), "false"),
                 ]
                 if fast_fallback_enabled:
-                    variants.insert(2, ("narrated_b_audio_dub_fast", "WERYDANCE_2_0_FAST", _nar_prompt_safe, "true"))
+                    variants.insert(2, ("narrated_b_audio_dub_fast", ALMIGHTY_FAST_MODEL, _nar_prompt_safe, "true"))
                     for _r in range(FAST_RETRY_COUNT):
-                        variants.append((f"narrated_b_fast_retry_{_r+1}", "WERYDANCE_2_0_FAST", _nar_prompt_safe, "true"))
+                        variants.append((f"narrated_b_fast_retry_{_r+1}", ALMIGHTY_FAST_MODEL, _nar_prompt_safe, "true"))
             else:
                 # 兜底（旧 narrated_b 行为）：纯 motion 无 audio
                 _broll_prompt_safe = _adsd_broll_motion_prompt(scene, safe_retry=True)
                 variants = [
-                    ("broll_motion", "WERYDANCE_2_0", _adsd_broll_motion_prompt(scene, safe_retry=False), "false"),
-                    ("broll_motion_safe", "WERYDANCE_2_0", _broll_prompt_safe, "false"),
+                    ("broll_motion", ALMIGHTY_MODEL, _adsd_broll_motion_prompt(scene, safe_retry=False), "false"),
+                    ("broll_motion_safe", ALMIGHTY_MODEL, _broll_prompt_safe, "false"),
                 ]
                 if fast_fallback_enabled:
-                    variants.append(("broll_motion_fast", "WERYDANCE_2_0_FAST", _broll_prompt_safe, "false"))
+                    variants.append(("broll_motion_fast", ALMIGHTY_FAST_MODEL, _broll_prompt_safe, "false"))
                     for _r in range(FAST_RETRY_COUNT):
-                        variants.append((f"broll_fast_retry_{_r+1}", "WERYDANCE_2_0_FAST", _broll_prompt_safe, "false"))
+                        variants.append((f"broll_fast_retry_{_r+1}", ALMIGHTY_FAST_MODEL, _broll_prompt_safe, "false"))
         elif ADSD_ALMIGHTY_AUDIO_DUB_EXPERIMENT:
             _audio_dub_prompt_safe = _adsd_almighty_audio_dub_prompt(scene, safe_retry=True)
             variants = [
-                ("audio_dub_primary", "WERYDANCE_2_0", _adsd_almighty_audio_dub_prompt(scene, safe_retry=False), "true"),
-                ("silent_lips_fallback", "WERYDANCE_2_0", _adsd_lip_sync_prompt(scene, safe_retry=True), "false"),
+                ("audio_dub_primary", ALMIGHTY_MODEL, _adsd_almighty_audio_dub_prompt(scene, safe_retry=False), "true"),
+                ("silent_lips_fallback", ALMIGHTY_MODEL, _adsd_lip_sync_prompt(scene, safe_retry=True), "false"),
             ]
             if meta_grid_url:
                 # 人设符召唤 variant 排首位，失败回退原切片路径
-                variants.insert(0, ("meta_grid_call", "WERYDANCE_2_0", _adsd_meta_grid_call_prompt(scene), "true"))
+                variants.insert(0, ("meta_grid_call", ALMIGHTY_MODEL, _adsd_meta_grid_call_prompt(scene), "true"))
                 log(f"[lip-sync {idx}] 启用人设符召唤路径：speaker={scene.get('speaker', '?')}")
             if fast_fallback_enabled:
-                variants.insert(2 if meta_grid_url else 1, ("audio_dub_safe", "WERYDANCE_2_0_FAST", _audio_dub_prompt_safe, "true"))
+                variants.insert(2 if meta_grid_url else 1, ("audio_dub_safe", ALMIGHTY_FAST_MODEL, _audio_dub_prompt_safe, "true"))
                 # FAST retry 兜底（追加末尾 2 次 FAST 重跑）
                 for _r in range(FAST_RETRY_COUNT):
-                    variants.append((f"audio_dub_fast_retry_{_r+1}", "WERYDANCE_2_0_FAST", _audio_dub_prompt_safe, "true"))
+                    variants.append((f"audio_dub_fast_retry_{_r+1}", ALMIGHTY_FAST_MODEL, _audio_dub_prompt_safe, "true"))
         else:
             _ls_prompt_safe = _adsd_lip_sync_prompt(scene, safe_retry=True)
             variants = [
-                ("primary", "WERYDANCE_2_0", _adsd_lip_sync_prompt(scene, safe_retry=False), "false"),
-                ("safe_prompt", "WERYDANCE_2_0", _ls_prompt_safe, "false"),
+                ("primary", ALMIGHTY_MODEL, _adsd_lip_sync_prompt(scene, safe_retry=False), "false"),
+                ("safe_prompt", ALMIGHTY_MODEL, _ls_prompt_safe, "false"),
             ]
             if fast_fallback_enabled:
-                variants.append(("fast_safe_prompt", "WERYDANCE_2_0_FAST", _ls_prompt_safe, "false"))
+                variants.append(("fast_safe_prompt", ALMIGHTY_FAST_MODEL, _ls_prompt_safe, "false"))
                 for _r in range(FAST_RETRY_COUNT):
-                    variants.append((f"lip_sync_fast_retry_{_r+1}", "WERYDANCE_2_0_FAST", _ls_prompt_safe, "false"))
+                    variants.append((f"lip_sync_fast_retry_{_r+1}", ALMIGHTY_FAST_MODEL, _ls_prompt_safe, "false"))
         attempts: list[dict] = []
         for variant_name, model, prompt, generate_audio in variants:
             r = None
@@ -17260,7 +17286,7 @@ def step66_adsd_lip_sync(script: list[dict]):
     n = len(script)
     aspect = "9:16" if IS_VERTICAL else "16:9"
     mode_note = "audio-dub 音色直配" if ADSD_ALMIGHTY_AUDIO_DUB_EXPERIMENT else "静音口型同步"
-    tg(f"👄 {ADSD_MODE_NAME} 口型同步启动：WERYDANCE_2_0 Almighty Reference × {n} turn（{mode_note}）")
+    tg(f"👄 {ADSD_MODE_NAME} 口型同步启动：{ALMIGHTY_MODEL} Almighty Reference × {n} turn（{mode_note}）")
     target_durs = [_lip_sync_slot_duration(script, i) for i in range(n)]
     # P2 分析：识别"连续同 speaker"分组（潜在 batching 机会）
     # 当前实施分析层 + QA log，实际 batching 留 TODO（涉及 ThreadPoolExecutor 重构）
@@ -17499,7 +17525,8 @@ def step66_adsd_lip_sync(script: list[dict]):
     qa = {
         "mode": ADSD_MODE_NAME,
         "interface": "almighty-reference-to-video+video-lips-change-fallback" if ADSD_LIPS_CHANGE_REPAIR else "almighty-reference-to-video",
-        "model": "WERYDANCE_2_0",
+        "model": ALMIGHTY_MODEL,
+        "fallback_model": ALMIGHTY_FAST_MODEL,
         "character_sheet_reference": str(sheet_path) if sheet_path.exists() else None,
         "character_sheet_reference_exists": sheet_path.exists() and sheet_path.stat().st_size > 10000,
         "multiref_alt_speaker_panels_enabled": True,
@@ -17611,7 +17638,7 @@ def step65_motion(script: list[dict]):
         mode_tag = "clean keyframe 图生视频优先"
     else:
         mode_tag = "文本生视频"
-    tg(f"🎬 动态化启动{reporter_tag}：WERYDANCE_2_0 × {n} 分镜并发生成运动视频（{mode_tag}）...")
+    tg(f"🎬 动态化启动{reporter_tag}：{ALMIGHTY_MODEL} Almighty × {n} 分镜并发生成运动视频（{mode_tag}）...")
 
     # 1. 生成每个分镜的 motion prompt
     motion_prompts = _generate_motion_prompts(script)

@@ -127,6 +127,7 @@ def test_two_turn_group_basic():
         assert idxs == [0, 1], f"idxs mismatch: {idxs}"
         assert all(oks), f"some turn failed: {oks}"
         assert submit_calls.call_count == 1, f"expected 1 submit call, got {submit_calls.call_count}"
+        assert submit_calls.call_args.args[1]["model"] == adr.ALMIGHTY_MODEL
         concat_audio = tmpdir / "merged_a_group_0_1.wav"
         assert concat_audio.exists(), "audio concat 文件未生成"
         seg_0 = tmpdir / "seg_0.mp4"
@@ -238,6 +239,7 @@ def test_three_turn_group():
         idxs, oks, infos = adr._lip_sync_one_group([0, 1, 2], script, target_durs, "16:9")
         assert all(oks), f"some failed: {oks}"
         assert submit_calls.call_count == 1, f"expected 1 submit, got {submit_calls.call_count}"
+        assert submit_calls.call_args.args[1]["model"] == adr.ALMIGHTY_MODEL
         for i in range(3):
             assert (tmpdir / f"seg_{i}.mp4").exists(), f"seg_{i} 未生成"
         # saved_api_calls = 3 - 1 = 2
