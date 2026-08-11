@@ -50,7 +50,7 @@ def submit_almighty(images: list[str], audio: str | None, prompt: str, duration:
     image_urls = [adr._upload_to_weryai(p) for p in images]
     audio_url = adr._upload_to_weryai(audio) if audio else None
     payload = {
-        "model": "WERYDANCE_2_0",
+        "model": adr.ALMIGHTY_MODEL,
         "images": image_urls,
         "prompt": prompt,
         "duration": duration,
@@ -60,7 +60,10 @@ def submit_almighty(images: list[str], audio: str | None, prompt: str, duration:
     }
     if audio_url:
         payload["audios"] = [audio_url]
-    print(f"  submitting almighty: {len(image_urls)} images, audio={'yes' if audio else 'no'}, duration={duration}s")
+    print(
+        f"  submitting almighty: model={adr.ALMIGHTY_MODEL}, "
+        f"{len(image_urls)} images, audio={'yes' if audio else 'no'}, duration={duration}s"
+    )
     r = adr.req_post("/generation/almighty-reference-to-video", payload, timeout=30)
     task_id = r.get("data", {}).get("task_id") or (r.get("data", {}).get("task_ids") or [None])[0]
     if not task_id:

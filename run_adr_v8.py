@@ -135,6 +135,9 @@ SUPPORTED_ALMIGHTY_MODELS = frozenset({
     "SEEDANCE_2_0_OS",
     "SEEDANCE_2_0_FAST_OS",
     "SEEDANCE_2_0_MINI_OS",
+    "WERYDANCE_2_0",
+    "WERYDANCE_2_0_FAST",
+    "WERYDANCE_2_0_MINI",
 })
 
 
@@ -12037,7 +12040,6 @@ def _mtv_lip_sync_segment(idx: int, scene: dict, audio_path: str, target_dur: fl
                     "images": [image_url],
                     "audios": [audio_url],
                     "prompt": prompt,
-                    "negative_prompt": _werydance_negative_prompt(scene),
                     "duration": api_dur,
                     "aspect_ratio": ASPECT_RATIO,
                     "resolution": "720p",
@@ -12058,7 +12060,12 @@ def _mtv_lip_sync_segment(idx: int, scene: dict, audio_path: str, target_dur: fl
             info.update({"pass": False, "reason": "submit_without_task_id", "response": response})
             return False, info
         ok, poll_info = _lip_sync_poll_download_and_process(idx, task_id, scene, float(target_dur or 0.0))
-        poll_info.update({"interface": "almighty-reference-to-video", "mode": "mtv_song_audio_lip_sync", "submit_duration": api_dur})
+        poll_info.update({
+            "interface": "almighty-reference-to-video",
+            "model": ALMIGHTY_MODEL,
+            "mode": "mtv_song_audio_lip_sync",
+            "submit_duration": api_dur,
+        })
         return ok, poll_info
     except Exception as e:
         info.update({"pass": False, "reason": str(e)})
@@ -12673,6 +12680,8 @@ _motion_qa_lock = threading.Lock()
 
 
 def _motion_tasks_file() -> Path:
+    # Keep the historical filename so deployments upgraded from the string-only
+    # cache continue to see in-flight paid tasks.
     return OUTPUT_DIR / "motion_tasks.json"
 
 
@@ -12792,21 +12801,101 @@ def _lip_sync_tasks_file() -> Path:
     return OUTPUT_DIR / "lip_sync_tasks.json"
 
 
-def _load_motion_tasks() -> dict:
-    p = _motion_tasks_file()
-    if not p.exists():
+def _normalize_generation_interface(value: object, default: str | None = None) -> str | None:
+    interface = str(value or default or "").strip()
+    if not interface:
+        return None
+    for prefix in ("/v1/generation/", "/generation/"):
+        if interface.startswith(prefix):
+            return interface[len(prefix):]
+    return interface
+
+
+def _generation_task_record(
+    task_id: str,
+    *,
+    model: str | None,
+    interface: str,
+    **metadata,
+) -> dict:
+    """Build the durable task-cache contract used by every video resume path."""
+    record = {
+        "task_id": str(task_id).strip(),
+        "model": str(model).strip() if model else None,
+        "interface": _normalize_generation_interface(interface),
+        "saved_at": datetime.now().isoformat(timespec="seconds"),
+    }
+    record.update({key: value for key, value in metadata.items() if value is not None})
+    return record
+
+
+def _normalize_cached_task(value: object, *, default_interface: str | None = None) -> dict | None:
+    """Read both legacy ``task_id`` strings and the structured cache format."""
+    if isinstance(value, str):
+        task_id = value.strip()
+        if not task_id:
+            return None
+        return {
+            "task_id": task_id,
+            "model": None,
+            "interface": _normalize_generation_interface(default_interface),
+            "legacy_format": True,
+        }
+    if not isinstance(value, dict):
+        return None
+    task_id = str(value.get("task_id") or "").strip()
+    if not task_id:
+        return None
+    record = dict(value)
+    record["task_id"] = task_id
+    record["model"] = record.get("model") or record.get("submit_model") or None
+    record["interface"] = _normalize_generation_interface(
+        record.get("interface") or record.get("endpoint"),
+        default_interface,
+    )
+    return record
+
+
+def _load_generation_tasks(path: Path, *, default_interface: str | None = None) -> dict:
+    if not path.exists():
         return {}
     try:
-        return json.loads(p.read_text(encoding="utf-8"))
+        raw = json.loads(path.read_text(encoding="utf-8"))
     except Exception:
         return {}
+    if not isinstance(raw, dict):
+        return {}
+    tasks = {}
+    for key, value in raw.items():
+        record = _normalize_cached_task(value, default_interface=default_interface)
+        if record:
+            tasks[str(key)] = record
+    return tasks
 
 
-def _save_motion_task(idx: int, task_id: str):
-    """线程安全地持久化某个分镜的 task_id（覆盖已有值）"""
+def _load_motion_tasks() -> dict:
+    # Legacy motion entries can be Almighty, image-to-video, or text-to-video;
+    # their endpoint cannot be reconstructed safely, but task_id is pollable.
+    return _load_generation_tasks(_motion_tasks_file())
+
+
+def _save_motion_task(
+    idx: int,
+    task_id: str,
+    *,
+    model: str,
+    interface: str,
+    **metadata,
+):
+    """线程安全地持久化某个分镜的任务及真实提交路由。"""
     with _motion_tasks_lock:
         tasks = _load_motion_tasks()
-        tasks[str(idx)] = task_id
+        tasks[str(idx)] = _generation_task_record(
+            task_id,
+            model=model,
+            interface=interface,
+            **metadata,
+        )
         _motion_tasks_file().write_text(json.dumps(tasks, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
@@ -12818,19 +12907,28 @@ def _remove_motion_task(idx: int):
 
 
 def _load_lip_sync_tasks() -> dict:
-    p = _lip_sync_tasks_file()
-    if not p.exists():
-        return {}
-    try:
-        return json.loads(p.read_text(encoding="utf-8"))
-    except Exception:
-        return {}
+    return _load_generation_tasks(
+        _lip_sync_tasks_file(),
+        default_interface="almighty-reference-to-video",
+    )
 
 
-def _save_lip_sync_task(idx: int, task_id: str):
+def _save_lip_sync_task(
+    idx: int,
+    task_id: str,
+    *,
+    model: str,
+    interface: str = "almighty-reference-to-video",
+    **metadata,
+):
     with _lip_sync_tasks_lock:
         tasks = _load_lip_sync_tasks()
-        tasks[str(idx)] = task_id
+        tasks[str(idx)] = _generation_task_record(
+            task_id,
+            model=model,
+            interface=interface,
+            **metadata,
+        )
         _lip_sync_tasks_file().write_text(json.dumps(tasks, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
@@ -13066,7 +13164,7 @@ def _motion_poll_and_download(idx: int, task_id: str, vid_path: str, target_dur:
         # 其他状态（waiting/processing）继续 poll
         time.sleep(5)
     # 超时：保留 task_id，下次 rerun 可复用查询
-    log(f"[motion {idx}] 轮询 10min 超时 · task_id={task_id}（已持久化到 motion_tasks.json，下次可复用）")
+    log(f"[motion {idx}] 轮询 10min 超时 · task_id={task_id}（已持久化到 {_motion_tasks_file().name}，下次可复用）")
     return False
 
 
@@ -13573,6 +13671,7 @@ def _motion_audio_dub_poll_and_download(idx: int, task_id: str, scene: dict, tar
                 _remove_motion_task(idx)
                 return True, info
             info.setdefault("reason", "postprocess_missing_generated_audio")
+            _remove_motion_task(idx)
             return False, info
         if st == "failed":
             _remove_motion_task(idx)
@@ -13675,7 +13774,6 @@ def _try_motion_audio_dub_video(idx: int, scene: dict, motion_prompt: str, aspec
                 "images": image_urls,
                 "audios": [audio_url],
                 "prompt": prompt,
-                "negative_prompt": _werydance_negative_prompt(scene),
                 "duration": dur,
                 "aspect_ratio": aspect_ratio,
                 "resolution": VOICE_ASSET_AUDIO_DUB_RESOLUTION,
@@ -13704,7 +13802,14 @@ def _try_motion_audio_dub_video(idx: int, scene: dict, motion_prompt: str, aspec
         })
         return False, False
 
-    _save_motion_task(idx, task_id)
+    _save_motion_task(
+        idx,
+        task_id,
+        model=ALMIGHTY_MODEL,
+        interface="almighty-reference-to-video",
+        mode="almighty-reference-audio-dub",
+        generate_audio="true",
+    )
     ok, info = _motion_audio_dub_poll_and_download(idx, task_id, scene, float(target_dur or dur))
     timed_out_or_reusable = str(idx) in _load_motion_tasks()
     info.update({
@@ -13740,10 +13845,9 @@ def _try_motion_audio_dub_video(idx: int, scene: dict, motion_prompt: str, aspec
     # B28 (2026-05-27): audio_dub timeout 不再阻断 fallback.
     # 之前: timeout return (True, False) → caller 跳过 reference_video/text-to-video fallback
     #       整片 audio_dub 全 timeout 时 → 纯 Ken Burns 静态片 (观沧海 144159 实测)
-    # 现在: 全部失败都 return (False, False), caller 继续走 fallback 路径出 motion 视频
-    # ⚠️  代价: fallback 路径会覆盖 motion_tasks.json[idx] = 新 task_id, 上游
-    #     audio_dub task 后台真成功时无法 resume (覆盖丢失, +1 次 credits 浪费)
-    return ok, ok
+    # waiting/processing 或轮询异常时记录仍在，必须停止本轮 fallback，避免覆盖
+    # 已付费 task_id 后重复提交；永久 failed 会清缓存，下一轮才可走后续路径。
+    return bool(ok or timed_out_or_reusable), ok
 
 
 # ── B92 (2026-06-05): 轨迹标记运镜 (Seedance 红线技法) ──────────────────────────
@@ -14011,7 +14115,13 @@ def _try_motion_reference_video(idx: int, scene: dict, motion_prompt: str, aspec
         })
         return False, False
 
-    _save_motion_task(idx, task_id)
+    _save_motion_task(
+        idx,
+        task_id,
+        model="WERYDANCE_2_0",
+        interface="image-to-video",
+        mode="storyboard-reference-motion",
+    )
     ok = _motion_poll_and_download(idx, task_id, scene["vid_path"], target_dur=target_dur)
     # B92 根治: 轨迹镜裁掉开头带引导线的帧 + 拉伸回原时长(保时间轴)。大哥逐帧实测确认线在早期帧。
     if ok and scene.get("_b92_active"):
@@ -14049,6 +14159,38 @@ def _try_motion_reference_video(idx: int, scene: dict, motion_prompt: str, aspec
     return ok, ok
 
 
+def _resume_motion_task(idx: int, record: dict, scene: dict, target_dur: float) -> bool:
+    task_id = record["task_id"]
+    interface = record.get("interface")
+    model = record.get("model")
+    log(
+        f"[motion {idx}] 发现历史 task_id={task_id}"
+        f"（interface={interface or 'legacy-unknown'}, model={model or 'legacy-unknown'}），继续轮询..."
+    )
+    if interface == "almighty-reference-to-video" and record.get("mode") == "almighty-reference-audio-dub":
+        ok, info = _motion_audio_dub_poll_and_download(idx, task_id, scene, target_dur)
+        info.update({
+            "path": "almighty-reference-audio-dub",
+            "interface": interface,
+            "model": model,
+            "resumed_task": True,
+        })
+        _append_motion_qa(info)
+        return ok
+    ok = _motion_poll_and_download(idx, task_id, scene["vid_path"], target_dur=target_dur)
+    _append_motion_qa({
+        "turn": idx + 1,
+        "path": interface or "legacy-resume",
+        "interface": interface,
+        "model": model,
+        "task_id": task_id,
+        "pass": ok,
+        "resumed_task": True,
+        "target_duration": round(target_dur, 3),
+    })
+    return ok
+
+
 def _motion_one_scene(idx: int, scene: dict, motion_prompt: str, aspect_ratio: str, safe_retry: bool = False) -> bool:
     """对单个 scene 调 WERYDANCE_2_0 生成 motion 版 seg_N.mp4；成功返回 True"""
     img_path = scene["img_path"]
@@ -14061,25 +14203,11 @@ def _motion_one_scene(idx: int, scene: dict, motion_prompt: str, aspect_ratio: s
 
     # ★ 持久化：检查这个 scene 是否有未完成的历史 task_id，有则先查状态，避免重复提交烧钱
     existing_tasks = _load_motion_tasks()
-    existing_tid = existing_tasks.get(str(idx))
-    if existing_tid:
-        log(f"[motion {idx}] 发现历史 task_id={existing_tid}，先查 WeryAI 后台状态...")
-        try:
-            s = req_get(f"/generation/{existing_tid}/status")
-            st = s.get("data", {}).get("task_status", "")
-            if st == "succeed":
-                # 后台已完成，直接下载复用
-                log(f"[motion {idx}] 历史任务 {existing_tid} 已完成，直接下载复用")
-                return _motion_poll_and_download(idx, existing_tid, vid_path, target_dur=target_dur)
-            if st == "failed":
-                log(f"[motion {idx}] 历史任务 {existing_tid} 已 failed，移除记录，重新提交")
-                _remove_motion_task(idx)
-            elif st in ("waiting", "processing"):
-                log(f"[motion {idx}] 历史任务 {existing_tid} 仍 {st}，继续轮询")
-                return _motion_poll_and_download(idx, existing_tid, vid_path, target_dur=target_dur)
-            # 其他状态：走新提交流程
-        except Exception as e:
-            log(f"[motion {idx}] 查历史任务失败: {e}，走新提交")
+    existing_record = existing_tasks.get(str(idx))
+    if existing_record:
+        # Poll handles transient status errors and leaves the record on timeout.
+        # Never submit a replacement while an existing paid task is unresolved.
+        return _resume_motion_task(idx, existing_record, scene, target_dur)
 
     try:
         handled_audio_dub, audio_dub_ok = _try_motion_audio_dub_video(
@@ -14146,7 +14274,13 @@ def _motion_one_scene(idx: int, scene: dict, motion_prompt: str, aspect_ratio: s
             return False
 
         # ★ 立即持久化：轮询任何阶段失败/超时，下次 rerun 都能复用
-        _save_motion_task(idx, task_id)
+        _save_motion_task(
+            idx,
+            task_id,
+            model="WERYDANCE_2_0",
+            interface="text-to-video",
+            mode="text-motion-fallback",
+        )
 
         # 轮询 + 下载
         ok = _motion_poll_and_download(idx, task_id, vid_path, target_dur=target_dur)
@@ -14188,36 +14322,50 @@ def _previs_page_tasks_file() -> Path:
 
 
 def _load_grid_multiref_tasks() -> dict:
-    p = _grid_multiref_tasks_file()
-    if not p.exists():
-        return {}
-    try:
-        return json.loads(p.read_text(encoding="utf-8"))
-    except Exception:
-        return {}
+    return _load_generation_tasks(
+        _grid_multiref_tasks_file(),
+        default_interface="almighty-reference-to-video",
+    )
 
 
 def _load_previs_page_tasks() -> dict:
-    p = _previs_page_tasks_file()
-    if not p.exists():
-        return {}
-    try:
-        return json.loads(p.read_text(encoding="utf-8"))
-    except Exception:
-        return {}
+    return _load_generation_tasks(
+        _previs_page_tasks_file(),
+        default_interface="almighty-reference-to-video",
+    )
 
 
-def _save_grid_multiref_task(group_key: str, task_id: str) -> None:
+def _save_grid_multiref_task(
+    group_key: str,
+    task_id: str,
+    *,
+    model: str,
+    interface: str = "almighty-reference-to-video",
+) -> None:
     with _grid_multiref_tasks_lock:
         tasks = _load_grid_multiref_tasks()
-        tasks[group_key] = task_id
+        tasks[group_key] = _generation_task_record(
+            task_id,
+            model=model,
+            interface=interface,
+        )
         _grid_multiref_tasks_file().write_text(json.dumps(tasks, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
-def _save_previs_page_task(group_key: str, task_id: str) -> None:
+def _save_previs_page_task(
+    group_key: str,
+    task_id: str,
+    *,
+    model: str,
+    interface: str = "almighty-reference-to-video",
+) -> None:
     with _previs_page_tasks_lock:
         tasks = _load_previs_page_tasks()
-        tasks[group_key] = task_id
+        tasks[group_key] = _generation_task_record(
+            task_id,
+            model=model,
+            interface=interface,
+        )
         _previs_page_tasks_file().write_text(json.dumps(tasks, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
@@ -15386,9 +15534,15 @@ def _generate_previs_page_motion_segments(script: list[dict], motion_prompts: li
         }
         qa["records"].append(record)
         try:
-            existing_tid = _load_previs_page_tasks().get(group_key)
-            if existing_tid:
-                record.update({"task_id": existing_tid, "resumed_task": True})
+            existing_task = _load_previs_page_tasks().get(group_key)
+            if existing_task:
+                existing_tid = existing_task["task_id"]
+                record.update({
+                    "task_id": existing_tid,
+                    "model": existing_task.get("model"),
+                    "interface": existing_task.get("interface"),
+                    "resumed_task": True,
+                })
                 ok, info = _poll_video_task_download(existing_tid, out_path, f"previs page {group_no}")
                 record.update(info)
                 record["pass"] = ok
@@ -15422,7 +15576,7 @@ def _generate_previs_page_motion_segments(script: list[dict], motion_prompts: li
             if not task_id:
                 record.update({"reason": "submit_without_task_id", "response": r})
                 continue
-            _save_previs_page_task(group_key, task_id)
+            _save_previs_page_task(group_key, task_id, model=ALMIGHTY_MODEL)
             ok, info = _poll_video_task_download(task_id, out_path, f"previs page {group_no}")
             record.update(info)
             record["pass"] = ok
@@ -15570,10 +15724,16 @@ def _generate_grid_multiref_motion_segments(script: list[dict], motion_prompts: 
         group_key = f"{scene_indices[0] + 1:02d}_{scene_indices[-1] + 1:02d}"
         try:
             with _grid_multiref_tasks_lock:  # B79/codex Med: 加锁读, 防并发写 task 文件时读到半文件 → resume 丢失
-                existing_tid = _load_grid_multiref_tasks().get(group_key)
+                existing_task = _load_grid_multiref_tasks().get(group_key)
             out_path = OUTPUT_DIR / f"grid_multiref_{group_key}.mp4"
-            if existing_tid:
-                record.update({"task_id": existing_tid, "resumed_task": True})
+            if existing_task:
+                existing_tid = existing_task["task_id"]
+                record.update({
+                    "task_id": existing_tid,
+                    "model": existing_task.get("model"),
+                    "interface": existing_task.get("interface"),
+                    "resumed_task": True,
+                })
                 ok, info = _poll_video_task_download(existing_tid, out_path, f"grid multi-ref {group_no}")
                 record.update(info)
                 record["pass"] = ok
@@ -15655,7 +15815,7 @@ def _generate_grid_multiref_motion_segments(script: list[dict], motion_prompts: 
                 record.update({"reason": "submit_without_task_id", "response": r})
                 _finalize()
                 return
-            _save_grid_multiref_task(group_key, task_id)
+            _save_grid_multiref_task(group_key, task_id, model=ALMIGHTY_MODEL)
             ok, info = _poll_video_task_download(task_id, out_path, f"grid multi-ref {group_no}")
             record.update(info)
             record["pass"] = ok
@@ -15667,7 +15827,19 @@ def _generate_grid_multiref_motion_segments(script: list[dict], motion_prompts: 
             # B40.3: submit_without_task_id 早在 L12330 continue 不会到这, 不放 transient
             # (Medium: resumed 分支也走 continue 不进 retry, kill 重启场景罕见, 留 backlog)
             _TRANSIENT_REASONS = ("task_failed", "task_timeout", "poll_timeout")
-            if not ok and record.get("reason") in _TRANSIENT_REASONS and not record.get("b40_3_retried"):
+            task_still_reusable = group_key in _load_grid_multiref_tasks()
+            record["timed_out_or_reusable"] = bool(not ok and task_still_reusable)
+            if task_still_reusable:
+                log(
+                    f"B40.3 group {group_no} 保留未决 task_id={task_id}，"
+                    "本轮不 retry，避免重复提交付费任务"
+                )
+            if (
+                not ok
+                and not task_still_reusable
+                and record.get("reason") in _TRANSIENT_REASONS
+                and not record.get("b40_3_retried")
+            ):
                 record["b40_3_retried"] = True
                 log(f"B40.3 group {group_no} {record.get('reason')}, 60s 后 retry 一次 (复用 payload)")
                 tg(f"🔁 B40.3 Grid multi-ref {record['scene_start']}-{record['scene_end']} retry (60s 后)")
@@ -15679,7 +15851,7 @@ def _generate_grid_multiref_motion_segments(script: list[dict], motion_prompts: 
                     if task_id2:
                         record["task_id"] = task_id2
                         record["b40_3_retry_task_id"] = task_id2
-                        _save_grid_multiref_task(group_key, task_id2)
+                        _save_grid_multiref_task(group_key, task_id2, model=ALMIGHTY_MODEL)
                         ok, info = _poll_video_task_download(task_id2, out_path, f"grid multi-ref {group_no} retry")
                         # info 含新 reason/path/duration 覆盖
                         record.update(info)
@@ -16743,6 +16915,35 @@ def _lip_sync_poll_download_and_process(idx: int, task_id: str, scene: dict, tar
     return False, info
 
 
+def _resume_lip_sync_task(
+    idx: int,
+    record: dict,
+    scene: dict,
+    target_dur: float,
+) -> tuple[bool, dict]:
+    """Resume without losing the actual FAST/primary model used at submit time."""
+    generate_audio = record.get("generate_audio")
+    if generate_audio is not None:
+        scene["_almighty_audio_dub_attempt"] = (
+            generate_audio is True
+            or str(generate_audio).strip().lower() in ("1", "true", "yes", "on")
+        )
+    ok, info = _lip_sync_poll_download_and_process(
+        idx,
+        record["task_id"],
+        scene,
+        target_dur,
+    )
+    info.update({
+        "resumed_task": True,
+        "interface": record.get("interface"),
+        "submit_model": record.get("model"),
+        "variant": record.get("variant"),
+        "generate_audio": generate_audio,
+    })
+    return ok, info
+
+
 def _lip_sync_one_group(group: list[int], script: list[dict], target_durs: list[float], aspect_ratio: str) -> tuple[list[int], list[bool], list[dict]]:
     """PR-A (2026-05-27) merged_a: 同 speaker 连续 turn 合并 almighty 调用.
     Steps:
@@ -16989,9 +17190,9 @@ def _lip_sync_one_scene(idx: int, scene: dict, target_dur: float, aspect_ratio: 
     manual_repair_turns = _load_lips_change_requested_turns()
     repair_requested = ADSD_LIPS_CHANGE_REPAIR and ((idx + 1) in manual_repair_turns)
     repair_all = ADSD_LIPS_CHANGE_REPAIR and ADSD_LIPS_CHANGE_ALL
-    existing_tid = _load_lip_sync_tasks().get(str(idx))
-    if existing_tid:
-        ok, info = _lip_sync_poll_download_and_process(idx, existing_tid, scene, target_dur)
+    existing_task = _load_lip_sync_tasks().get(str(idx))
+    if existing_task:
+        ok, info = _resume_lip_sync_task(idx, existing_task, scene, target_dur)
         return idx, ok, info
     try:
         image_url = _upload_to_weryai(scene["img_path"])
@@ -17171,7 +17372,6 @@ def _lip_sync_one_scene(idx: int, scene: dict, target_dur: float, aspect_ratio: 
                         "model": model,
                         "images": current_ref_images,
                         "prompt": prompt,
-                        "negative_prompt": _werydance_negative_prompt(scene),
                         "duration": api_dur,
                         "aspect_ratio": aspect_ratio,
                         "resolution": "720p",
@@ -17196,7 +17396,13 @@ def _lip_sync_one_scene(idx: int, scene: dict, target_dur: float, aspect_ratio: 
                 if r is not None:
                     attempts.append({"variant": variant_name, "model": model, "pass": False, "reason": "submit_without_task_id", "response": r})
                 continue
-            _save_lip_sync_task(idx, task_id)
+            _save_lip_sync_task(
+                idx,
+                task_id,
+                model=model,
+                variant=variant_name,
+                generate_audio=generate_audio,
+            )
             ok, info = _lip_sync_poll_download_and_process(idx, task_id, scene, target_dur)
             info.update({
                 "variant": variant_name,
@@ -17219,6 +17425,8 @@ def _lip_sync_one_scene(idx: int, scene: dict, target_dur: float, aspect_ratio: 
                 "ass_fallback_required": caption_info.get("ass_fallback_required"),
                 "caption_reason": caption_info.get("reason"),
             })
+            task_still_reusable = str(idx) in _load_lip_sync_tasks()
+            info["timed_out_or_reusable"] = bool(not ok and task_still_reusable)
             if ok and (repair_all or repair_requested):
                 repair_ok, repair_info = _lips_change_repair_segment(idx, scene, target_dur)
                 repair_info["reason"] = "all_turns" if repair_all else "manual_requested_turn"
@@ -17233,6 +17441,13 @@ def _lip_sync_one_scene(idx: int, scene: dict, target_dur: float, aspect_ratio: 
             if ok:
                 info["attempts"] = attempts
                 return idx, ok, info
+            if task_still_reusable:
+                info["attempts"] = attempts
+                log(
+                    f"[lip-sync {idx}] task_id={task_id} 仍可 resume，"
+                    "停止后续 variant，避免覆盖未决付费任务"
+                )
+                return idx, False, info
             # 敏感词 retry (Phase 3)：audit blocked + 含敏感名句 + 未 retry → paraphrase 重新跑一次
             if audit_blocked_now and not scene.get("_audit_retry"):
                 paraphrased, did_paraphrase = _paraphrase_sensitive_dialogue(scene.get("text", ""))
@@ -17625,7 +17840,7 @@ def step66_adsd_lip_sync(script: list[dict]):
 
 
 def step65_motion(script: list[dict]):
-    """把静态 seg_N.mp4 替换为 WERYDANCE_2_0 动态版本（并发 + 单轮内失败自动重试 1 次）"""
+    """并发动态化静态分镜，并在各生成接口间按能力回退。"""
     _b68_clamp_scene_durations_to_werydance_bounds(script, origin="step65_motion")
     _ensure_motion_action_plan(script)
     _write_motion_action_plan_qa(script)
@@ -17638,7 +17853,10 @@ def step65_motion(script: list[dict]):
         mode_tag = "clean keyframe 图生视频优先"
     else:
         mode_tag = "文本生视频"
-    tg(f"🎬 动态化启动{reporter_tag}：{ALMIGHTY_MODEL} Almighty × {n} 分镜并发生成运动视频（{mode_tag}）...")
+    tg(
+        f"🎬 动态化启动{reporter_tag}：{n} 分镜并发生成运动视频；"
+        f"Almighty 参考/配音路径={ALMIGHTY_MODEL}，图生/文生回退=WERYDANCE_2_0（{mode_tag}）..."
+    )
 
     # 1. 生成每个分镜的 motion prompt
     motion_prompts = _generate_motion_prompts(script)
@@ -17743,7 +17961,7 @@ def step65_motion(script: list[dict]):
                         f"(>= {fast_fail_threshold_min} 阈值 + ≥50% fail rate)\n"
                         f"WERYDANCE 上游可能异常 (rate limit / 5xx / poll timeout 雪崩)\n"
                         f"立即 kill step65 防整片纯 Ken Burns 静态 + 烧 25min credits\n"
-                        f"建议: 等 5-10min WERYDANCE 恢复后重试 (task_id 已存 motion_tasks.json 可 resume)"
+                        f"建议: 等 5-10min WERYDANCE 恢复后重试 (task_id 已存 {_motion_tasks_file().name} 可 resume)"
                     )
                     try:
                         tg(err)

@@ -28,6 +28,18 @@ import requests
 
 BASE_URL = "https://api.weryai.com/v1"
 POLL_INTERVAL = 5
+SUPPORTED_ALMIGHTY_MODELS = {
+    "WERYDANCE",
+    "SEEDANCE_2_0_OS",
+    "SEEDANCE_2_0_FAST_OS",
+    "SEEDANCE_2_0_MINI_OS",
+    "WERYDANCE_2_0",
+    "WERYDANCE_2_0_FAST",
+    "WERYDANCE_2_0_MINI",
+}
+ALMIGHTY_MODEL = os.environ.get("ADR_ALMIGHTY_MODEL", "WERYDANCE").strip().upper() or "WERYDANCE"
+if ALMIGHTY_MODEL not in SUPPORTED_ALMIGHTY_MODELS:
+    raise ValueError(f"Unsupported ADR_ALMIGHTY_MODEL: {ALMIGHTY_MODEL}")
 
 
 def log(msg: str) -> None:
@@ -239,7 +251,6 @@ def choose_audio(workdir: Path, turn: int, speaker: str) -> Path:
 
 def make_candidates(image_url: str, audio_url: str, prompt: str, duration: int, aspect_ratio: str) -> list[dict[str, Any]]:
     common = {
-        "model": "WERYDANCE_2_0",
         "prompt": prompt,
         "duration": duration,
         "aspect_ratio": aspect_ratio,
@@ -250,6 +261,7 @@ def make_candidates(image_url: str, audio_url: str, prompt: str, duration: int, 
             "path": "/generation/almighty-reference-to-video",
             "payload": {
                 **common,
+                "model": ALMIGHTY_MODEL,
                 "images": [image_url],
                 "audios": [audio_url],
                 "resolution": "720p",
@@ -260,17 +272,17 @@ def make_candidates(image_url: str, audio_url: str, prompt: str, duration: int, 
         {
             "name": "image_to_video_audio",
             "path": "/generation/image-to-video",
-            "payload": {**common, "image": image_url, "audio": audio_url, "resolution": "1080p", "audio_visual_sync": True},
+            "payload": {**common, "model": "WERYDANCE_2_0", "image": image_url, "audio": audio_url, "resolution": "1080p", "audio_visual_sync": True},
         },
         {
             "name": "image_to_video_audio_url",
             "path": "/generation/image-to-video",
-            "payload": {**common, "image": image_url, "audio_url": audio_url, "resolution": "1080p", "audio_visual_sync": True},
+            "payload": {**common, "model": "WERYDANCE_2_0", "image": image_url, "audio_url": audio_url, "resolution": "1080p", "audio_visual_sync": True},
         },
         {
             "name": "image_to_video_reference_audio",
             "path": "/generation/image-to-video",
-            "payload": {**common, "image": image_url, "reference_audio": audio_url, "resolution": "1080p", "audio_visual_sync": True},
+            "payload": {**common, "model": "WERYDANCE_2_0", "image": image_url, "reference_audio": audio_url, "resolution": "1080p", "audio_visual_sync": True},
         },
         {
             "name": "video_lip_sync_image_audio",
