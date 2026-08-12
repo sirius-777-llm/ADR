@@ -93,6 +93,27 @@ def _patch_adr_io(tmpdir: Path, fake_raw_video: Path):
     return submit_calls
 
 
+def _make_group_inputs(tmpdir: Path, count: int = 2, duration: float = 1.0):
+    panel = tmpdir / "panel.png"
+    _make_fake_image(panel)
+    script = []
+    target_durs = []
+    for i in range(count):
+        audio = tmpdir / f"turn_{i}.wav"
+        _make_fake_audio(audio, duration)
+        script.append({
+            "speaker": "罗永浩",
+            "text": f"turn {i}",
+            "dialogue_audio_mp3": str(audio),
+            "img_path": str(panel),
+            "vid_path": str(tmpdir / f"seg_{i}.mp4"),
+            "needs_lip_sync": True,
+            "dialogue_turn": i + 1,
+        })
+        target_durs.append(duration)
+    return script, target_durs
+
+
 def test_two_turn_group_basic():
     tmpdir = Path(tempfile.mkdtemp(prefix="pr_a_unit_"))
     print(f"\n[case 1] basic 2-turn group, tmpdir={tmpdir}")
@@ -334,6 +355,142 @@ def test_terminal_success_without_url_releases_cache():
         print(f"  tmpdir kept: {tmpdir}")
 
 
+def test_overlapping_merged_group_blocks_submit():
+    tmpdir = Path(tempfile.mkdtemp(prefix="pr_a_overlap_group_"))
+    print(f"\n[case 7] overlapping merged group blocks submit, tmpdir={tmpdir}")
+    try:
+        adr.OUTPUT_DIR = tmpdir
+        adr.req_post = MagicMock(side_effect=AssertionError("overlap must not submit"))
+        script = [{}, {}, {}]
+
+        # Legacy records may expose their turns only through the merged key.
+        adr._atomic_write_json(adr._lip_sync_tasks_file(), {"merged:0_1": "paid-legacy-group"})
+        result = adr._lip_sync_one_group([0, 1, 2], script, [3.0, 3.0, 3.0], "16:9")
+        assert not any(result[1])
+        assert all(info.get("timed_out_or_reusable") for info in result[2])
+        assert all(info.get("overlapping_task_key") == "merged:0_1" for info in result[2])
+
+        # Structured records can use group_indices even when the key is nonstandard.
+        adr._atomic_write_json(adr._lip_sync_tasks_file(), {
+            "legacy-batch-record": {
+                "task_id": "paid-structured-group",
+                "mode": "merged-a-group",
+                "group_indices": [1, 2],
+            }
+        })
+        result = adr._lip_sync_one_group([0, 1, 2], script, [3.0, 3.0, 3.0], "16:9")
+        assert not any(result[1])
+        assert all(info.get("overlapping_task_key") == "legacy-batch-record" for info in result[2])
+        assert adr.req_post.call_count == 0
+        print("  overlapping legacy/structured group records both block paid submit")
+    finally:
+        print(f"  tmpdir kept: {tmpdir}")
+
+
+def test_overlapping_single_turn_blocks_group_submit():
+    tmpdir = Path(tempfile.mkdtemp(prefix="pr_a_overlap_turn_"))
+    print(f"\n[case 8] pending single turn blocks group submit, tmpdir={tmpdir}")
+    try:
+        adr.OUTPUT_DIR = tmpdir
+        adr.req_post = MagicMock(side_effect=AssertionError("overlap must not submit"))
+        adr._atomic_write_json(adr._lip_sync_tasks_file(), {"1": "paid-single-turn"})
+
+        result = adr._lip_sync_one_group([0, 1, 2], [{}, {}, {}], [3.0, 3.0, 3.0], "16:9")
+
+        assert not any(result[1])
+        assert all(info.get("timed_out_or_reusable") for info in result[2])
+        assert all(info.get("overlapping_task_key") == "1" for info in result[2])
+        assert adr.req_post.call_count == 0
+        print("  pending single-turn task blocks overlapping group submit")
+    finally:
+        print(f"  tmpdir kept: {tmpdir}")
+
+
+def test_cache_write_failure_after_submit_is_unresolved():
+    tmpdir = Path(tempfile.mkdtemp(prefix="pr_a_cache_failure_"))
+    print(f"\n[case 9] cache write failure after submit is unresolved, tmpdir={tmpdir}")
+    original_save = adr._save_lip_sync_task
+    try:
+        script, target_durs = _make_group_inputs(tmpdir)
+        submit_calls = _patch_adr_io(tmpdir, tmpdir / "unused.mp4")
+        adr._save_lip_sync_task = MagicMock(side_effect=OSError("simulated cache failure"))
+
+        result = adr._lip_sync_one_group([0, 1], script, target_durs, "16:9")
+
+        assert submit_calls.call_count == 1
+        assert not any(result[1])
+        assert all(info.get("reason") == "task_cache_write_failed_after_submit" for info in result[2])
+        assert all(info.get("task_id") == "fake_task_123" for info in result[2])
+        assert all(info.get("timed_out_or_reusable") for info in result[2])
+        print("  one paid submit; cache failure cannot trigger per-turn fallback")
+    finally:
+        adr._save_lip_sync_task = original_save
+        print(f"  tmpdir kept: {tmpdir}")
+
+
+def test_split_failure_keeps_cache_and_reuses_raw_video():
+    tmpdir = Path(tempfile.mkdtemp(prefix="pr_a_split_retry_"))
+    print(f"\n[case 10] split failure keeps cache/raw for local retry, tmpdir={tmpdir}")
+    original_split = adr._split_lip_sync_raw_by_durations
+    try:
+        script, target_durs = _make_group_inputs(tmpdir)
+        fake_raw = tmpdir / "fake_remote_raw.mp4"
+        _make_fake_video(fake_raw, 2.0)
+        submit_calls = _patch_adr_io(tmpdir, fake_raw)
+        status_calls = adr.req_get
+        adr._split_lip_sync_raw_by_durations = MagicMock(return_value=False)
+
+        first = adr._lip_sync_one_group([0, 1], script, target_durs, "16:9")
+        second = adr._lip_sync_one_group([0, 1], script, target_durs, "16:9")
+
+        cache_key = adr._merged_lip_sync_task_key([0, 1])
+        raw_path = tmpdir / "lip_sync_raw_group_0_1.mp4"
+        assert submit_calls.call_count == 1
+        assert status_calls.call_count == 1, "second local retry must reuse downloaded raw video"
+        assert cache_key in adr._load_lip_sync_tasks()
+        assert raw_path.exists()
+        for result in (first, second):
+            assert not any(result[1])
+            assert all(info.get("remote_task_succeeded") for info in result[2])
+            assert all(info.get("local_retryable") for info in result[2])
+            assert all(info.get("timed_out_or_reusable") for info in result[2])
+        print("  split retry uses one submit/one poll and preserves raw video")
+    finally:
+        adr._split_lip_sync_raw_by_durations = original_split
+        print(f"  tmpdir kept: {tmpdir}")
+
+
+def test_postprocess_failure_keeps_cache_until_local_success():
+    tmpdir = Path(tempfile.mkdtemp(prefix="pr_a_postprocess_retry_"))
+    print(f"\n[case 11] postprocess failure keeps cache until local success, tmpdir={tmpdir}")
+    try:
+        script, target_durs = _make_group_inputs(tmpdir)
+        fake_raw = tmpdir / "fake_remote_raw.mp4"
+        _make_fake_video(fake_raw, 2.0)
+        submit_calls = _patch_adr_io(tmpdir, fake_raw)
+        status_calls = adr.req_get
+        adr._postprocess_audio_dub_segment = MagicMock(side_effect=[True, False])
+
+        first = adr._lip_sync_one_group([0, 1], script, target_durs, "16:9")
+        cache_key = adr._merged_lip_sync_task_key([0, 1])
+        assert first[1] == [True, False]
+        assert cache_key in adr._load_lip_sync_tasks()
+        assert all(info.get("remote_task_succeeded") for info in first[2])
+        assert all(info.get("local_retryable") for info in first[2])
+        assert all(info.get("timed_out_or_reusable") for info in first[2])
+
+        adr._postprocess_audio_dub_segment = MagicMock(return_value=True)
+        second = adr._lip_sync_one_group([0, 1], script, target_durs, "16:9")
+        assert all(second[1])
+        assert submit_calls.call_count == 1
+        assert status_calls.call_count == 1, "local retry must not poll or resubmit"
+        assert cache_key not in adr._load_lip_sync_tasks()
+        assert (tmpdir / "lip_sync_raw_group_0_1.mp4").exists()
+        print("  cache clears only after all local postprocessing succeeds")
+    finally:
+        print(f"  tmpdir kept: {tmpdir}")
+
+
 def main():
     print("=== PR-A merged_a unit test ===")
     test_two_turn_group_basic()
@@ -342,7 +499,12 @@ def main():
     test_three_turn_group()
     test_group_timeout_resumes_without_resubmit()
     test_terminal_success_without_url_releases_cache()
-    print("\n=== 6/6 PASSED ===")
+    test_overlapping_merged_group_blocks_submit()
+    test_overlapping_single_turn_blocks_group_submit()
+    test_cache_write_failure_after_submit_is_unresolved()
+    test_split_failure_keeps_cache_and_reuses_raw_video()
+    test_postprocess_failure_keeps_cache_until_local_success()
+    print("\n=== 11/11 PASSED ===")
 
 
 if __name__ == "__main__":

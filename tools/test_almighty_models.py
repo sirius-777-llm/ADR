@@ -436,6 +436,25 @@ assert second_mtv[1]["resumed_task"] is True
 assert mtv_submits == [adr.ALMIGHTY_MODEL]
 assert adr._load_lip_sync_tasks()[adr._mtv_lip_sync_task_key(3)]["task_id"] == "mtv-pending"
 
+# Once submit returns a paid task_id, a cache failure must not enter poll/fallback.
+mtv_cache_failure_polls = []
+adr._lip_sync_poll_download_and_process = lambda *args, **kwargs: mtv_cache_failure_polls.append(args) or (
+    False,
+    {"pass": False, "reason": "unexpected_poll"},
+)
+original_save_lip_sync_task = adr._save_lip_sync_task
+adr._save_lip_sync_task = lambda *args, **kwargs: (_ for _ in ()).throw(OSError("simulated cache failure"))
+try:
+    mtv_cache_failure = adr._mtv_lip_sync_segment(4, mtv_scene, str(audio_path), 5.0)
+finally:
+    adr._save_lip_sync_task = original_save_lip_sync_task
+assert mtv_cache_failure[0] is False
+assert mtv_cache_failure[1]["reason"] == "task_cache_write_failed_after_submit"
+assert mtv_cache_failure[1]["task_id"] == "mtv-pending"
+assert mtv_cache_failure[1]["timed_out_or_reusable"] is True
+assert mtv_cache_failure_polls == []
+assert mtv_submits == [adr.ALMIGHTY_MODEL, adr.ALMIGHTY_MODEL]
+
 print(json.dumps({
     "legacy": 4,
     "structured": 4,
@@ -443,6 +462,7 @@ print(json.dumps({
     "lip_timeout_submits": len(lip_submits),
     "grid_timeout_submits": len(grid_submits),
     "mtv_timeout_submits": len(mtv_submits),
+    "mtv_cache_failure_reason": mtv_cache_failure[1]["reason"],
 }))
 '''
     result = subprocess.run(
@@ -461,7 +481,8 @@ print(json.dumps({
         "fast_resume_model": "SEEDANCE_2_0_FAST_OS",
         "lip_timeout_submits": 1,
         "grid_timeout_submits": 1,
-        "mtv_timeout_submits": 1,
+        "mtv_timeout_submits": 2,
+        "mtv_cache_failure_reason": "task_cache_write_failed_after_submit",
     }
 
 
