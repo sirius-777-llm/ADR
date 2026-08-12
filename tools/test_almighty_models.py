@@ -163,22 +163,19 @@ def test_endpoint_routing() -> None:
     collector.visit(tree)
 
     almighty = [item for item in collector.calls if item[2] == "/generation/almighty-reference-to-video"]
-    assert len(almighty) == 11, f"expected 11 Almighty submits, found {len(almighty)}"
+    assert len(almighty) == 9, f"expected 9 Almighty submit sites, found {len(almighty)}"
     counts = Counter(owner.name for _, owner, _ in almighty if isinstance(owner, ast.FunctionDef))
     assert counts == Counter({
-        "_mtv_lip_sync_segment": 1,
+        "_submit_lip_sync_task_transaction": 1,
         "_try_motion_audio_dub_video": 1,
         "_generate_character_trailer_motion": 1,
         "_gen_segment": 1,
         "_generate_storyboard_trailer_motion": 1,
         "_generate_previs_page_motion_segments": 1,
         "_run_grid_group": 3,
-        "_lip_sync_one_group": 1,
-        "_lip_sync_one_scene": 1,
     })
 
     direct_functions = {
-        "_mtv_lip_sync_segment",
         "_try_motion_audio_dub_video",
         "_generate_character_trailer_motion",
         "_gen_segment",
@@ -196,26 +193,60 @@ def test_endpoint_routing() -> None:
             assert isinstance(call.args[1], ast.Name) and call.args[1].id == "payload"
             model = _assigned_dict_model(owner, "base_payload")
             assert isinstance(model, ast.Name) and model.id == "ALMIGHTY_MODEL"
-        elif owner.name == "_lip_sync_one_group":
+        elif owner.name == "_submit_lip_sync_task_transaction":
             assert isinstance(call.args[1], ast.Name) and call.args[1].id == "payload"
-            model = _assigned_dict_model(owner, "payload")
-            assert isinstance(model, ast.Name) and model.id == "ALMIGHTY_MODEL"
-        elif owner.name == "_lip_sync_one_scene":
-            assert isinstance(call.args[1], ast.Name) and call.args[1].id == "payload"
-            model = _assigned_dict_model(owner, "payload")
-            assert isinstance(model, ast.Name) and model.id == "model"
-            variant_models = _variant_model_values(owner)
-            assert variant_models
-            assert all(
-                isinstance(value, ast.Name) and value.id in {"ALMIGHTY_MODEL", "ALMIGHTY_FAST_MODEL"}
-                for value in variant_models
-            )
-            assert {value.id for value in variant_models if isinstance(value, ast.Name)} == {
-                "ALMIGHTY_MODEL",
-                "ALMIGHTY_FAST_MODEL",
-            }
         else:
             raise AssertionError(f"unhandled Almighty submit in {owner.name}")
+
+    owners = {
+        node.name: node for node in tree.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name in {"_mtv_lip_sync_segment", "_lip_sync_one_group", "_lip_sync_one_scene"}
+    }
+    transaction_calls = {
+        name: [
+            node for node in ast.walk(owner)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "_submit_lip_sync_task_transaction"
+        ]
+        for name, owner in owners.items()
+    }
+    assert all(len(calls) == 1 for calls in transaction_calls.values())
+
+    mtv_owner = owners["_mtv_lip_sync_segment"]
+    mtv_submit = transaction_calls["_mtv_lip_sync_segment"][0]
+    assert isinstance(mtv_submit.args[2], ast.Name) and mtv_submit.args[2].id == "payload"
+    model_keyword = next(keyword.value for keyword in mtv_submit.keywords if keyword.arg == "model")
+    assert isinstance(model_keyword, ast.Name) and model_keyword.id == "ALMIGHTY_MODEL"
+    model = _assigned_dict_model(mtv_owner, "payload")
+    assert isinstance(model, ast.Name) and model.id == "ALMIGHTY_MODEL"
+
+    group_owner = owners["_lip_sync_one_group"]
+    group_submit = transaction_calls["_lip_sync_one_group"][0]
+    assert isinstance(group_submit.args[2], ast.Name) and group_submit.args[2].id == "payload"
+    model_keyword = next(keyword.value for keyword in group_submit.keywords if keyword.arg == "model")
+    assert isinstance(model_keyword, ast.Name) and model_keyword.id == "ALMIGHTY_MODEL"
+    model = _assigned_dict_model(group_owner, "payload")
+    assert isinstance(model, ast.Name) and model.id == "ALMIGHTY_MODEL"
+
+    scene_owner = owners["_lip_sync_one_scene"]
+    scene_submit = transaction_calls["_lip_sync_one_scene"][0]
+    assert isinstance(scene_submit.args[2], ast.Name) and scene_submit.args[2].id == "payload"
+    model_keyword = next(keyword.value for keyword in scene_submit.keywords if keyword.arg == "model")
+    assert isinstance(model_keyword, ast.Name) and model_keyword.id == "model"
+    model = _assigned_dict_model(scene_owner, "payload")
+    assert isinstance(model, ast.Name) and model.id == "model"
+    variant_models = _variant_model_values(scene_owner)
+    assert variant_models
+    assert all(
+        isinstance(value, ast.Name) and value.id in {"ALMIGHTY_MODEL", "ALMIGHTY_FAST_MODEL"}
+        for value in variant_models
+    )
+    assert {value.id for value in variant_models if isinstance(value, ast.Name)} == {
+        "ALMIGHTY_MODEL",
+        "ALMIGHTY_FAST_MODEL",
+    }
 
     legacy_video_calls = [
         item for item in collector.calls

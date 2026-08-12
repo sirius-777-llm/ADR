@@ -12,6 +12,7 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor
 from unittest.mock import MagicMock
 
 # 设 mock env 防 ADR 启动崩
@@ -444,7 +445,7 @@ def test_split_failure_keeps_cache_and_reuses_raw_video():
         second = adr._lip_sync_one_group([0, 1], script, target_durs, "16:9")
 
         cache_key = adr._merged_lip_sync_task_key([0, 1])
-        raw_path = tmpdir / "lip_sync_raw_group_0_1.mp4"
+        raw_path = Path(adr._lip_sync_group_raw_path("group_0_1", "fake_task_123"))
         assert submit_calls.call_count == 1
         assert status_calls.call_count == 1, "second local retry must reuse downloaded raw video"
         assert cache_key in adr._load_lip_sync_tasks()
@@ -485,8 +486,212 @@ def test_postprocess_failure_keeps_cache_until_local_success():
         assert submit_calls.call_count == 1
         assert status_calls.call_count == 1, "local retry must not poll or resubmit"
         assert cache_key not in adr._load_lip_sync_tasks()
-        assert (tmpdir / "lip_sync_raw_group_0_1.mp4").exists()
+        assert Path(adr._lip_sync_group_raw_path("group_0_1", "fake_task_123")).exists()
         print("  cache clears only after all local postprocessing succeeds")
+    finally:
+        print(f"  tmpdir kept: {tmpdir}")
+
+
+def test_stale_legacy_raw_does_not_bypass_cached_task_poll():
+    tmpdir = Path(tempfile.mkdtemp(prefix="pr_a_stale_raw_"))
+    print(f"\n[case 12] stale legacy raw cannot satisfy a newer cached task, tmpdir={tmpdir}")
+    try:
+        script, target_durs = _make_group_inputs(tmpdir)
+        new_remote_raw = tmpdir / "new_remote_raw.mp4"
+        _make_fake_video(new_remote_raw, 2.0)
+        _patch_adr_io(tmpdir, new_remote_raw)
+        no_submit = MagicMock(side_effect=AssertionError("cached task must not resubmit"))
+        adr.req_post = no_submit
+        adr._atomic_write_json(adr._lip_sync_tasks_file(), {
+            "merged:0_1": {
+                "task_id": "new-paid-task",
+                "model": "WERYDANCE",
+                "mode": "merged-a-group",
+                "group_indices": [0, 1],
+                "split_durations": [1.0, 1.0],
+                "target_durations": [1.0, 1.0],
+            }
+        })
+
+        stale_raw = tmpdir / "lip_sync_raw_group_0_1.mp4"
+        _make_fake_video(stale_raw, 6.0)
+        result = adr._lip_sync_one_group([0, 1], script, target_durs, "16:9")
+
+        expected_raw = Path(adr._lip_sync_group_raw_path("group_0_1", "new-paid-task"))
+        assert all(result[1])
+        assert no_submit.call_count == 0
+        assert adr.req_get.call_count == 1, "new cached task must be polled despite stale legacy raw"
+        assert expected_raw.exists() and stale_raw.exists()
+        assert expected_raw != stale_raw
+        assert all(info.get("raw_video_path") == str(expected_raw) for info in result[2])
+        print("  stale group raw ignored; cached task polled and downloaded to task-bound path")
+    finally:
+        print(f"  tmpdir kept: {tmpdir}")
+
+
+def test_legacy_cache_without_durations_resumes_without_submit():
+    tmpdir = Path(tempfile.mkdtemp(prefix="pr_a_legacy_resume_"))
+    print(f"\n[case 13] legacy cached group derives split durations locally, tmpdir={tmpdir}")
+    try:
+        script, target_durs = _make_group_inputs(tmpdir)
+        remote_raw = tmpdir / "legacy_remote_raw.mp4"
+        _make_fake_video(remote_raw, 2.0)
+        _patch_adr_io(tmpdir, remote_raw)
+        no_submit = MagicMock(side_effect=AssertionError("legacy cached task must not resubmit"))
+        adr.req_post = no_submit
+        adr._atomic_write_json(adr._lip_sync_tasks_file(), {
+            "merged:0_1": "legacy-paid-task",
+        })
+
+        result = adr._lip_sync_one_group([0, 1], script, target_durs, "16:9")
+
+        assert all(result[1])
+        assert no_submit.call_count == 0
+        assert adr.req_get.call_count == 1
+        assert Path(adr._lip_sync_group_raw_path("group_0_1", "legacy-paid-task")).exists()
+        print("  legacy cache resumed with derived audio durations and zero paid submits")
+    finally:
+        print(f"  tmpdir kept: {tmpdir}")
+
+
+def test_concurrent_group_submit_transaction_creates_one_paid_task():
+    tmpdir = Path(tempfile.mkdtemp(prefix="pr_a_concurrent_submit_"))
+    print(f"\n[case 14] concurrent group transaction creates one paid task, tmpdir={tmpdir}")
+    try:
+        adr.OUTPUT_DIR = tmpdir
+        adr.req_post = MagicMock(return_value={"data": {"task_id": "single-paid-task"}})
+        payload = {
+            "model": "WERYDANCE",
+            "images": ["https://example.invalid/panel.jpg"],
+            "prompt": "offline concurrency test",
+            "duration": 4,
+            "resolution": "720p",
+        }
+
+        def submit_once():
+            return adr._submit_lip_sync_task_transaction(
+                "merged:0_1",
+                [0, 1],
+                payload,
+                model="WERYDANCE",
+                metadata={"mode": "merged-a-group", "group_indices": [0, 1]},
+            )
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            results = list(pool.map(lambda _value: submit_once(), range(2)))
+
+        assert adr.req_post.call_count == 1, "concurrent callers must create only one paid task"
+        assert sum(result.get("task_id") == "single-paid-task" for result in results) == 1
+        assert sum(result.get("conflict_key") == "merged:0_1" for result in results) == 1
+        cached = adr._load_lip_sync_tasks()["merged:0_1"]
+        assert cached["task_id"] == "single-paid-task"
+        print("  two concurrent callers produced one POST and one cached conflict")
+    finally:
+        print(f"  tmpdir kept: {tmpdir}")
+
+
+def test_group_and_single_submit_share_overlap_transaction():
+    tmpdir = Path(tempfile.mkdtemp(prefix="pr_a_group_single_race_"))
+    print(f"\n[case 15] group and single transactions cannot both submit, tmpdir={tmpdir}")
+    try:
+        adr.OUTPUT_DIR = tmpdir
+        task_counter = 0
+
+        def post_once(*_args, **_kwargs):
+            nonlocal task_counter
+            task_counter += 1
+            return {"data": {"task_id": f"paid-task-{task_counter}"}}
+
+        adr.req_post = MagicMock(side_effect=post_once)
+        payload = {
+            "model": "WERYDANCE",
+            "images": ["https://example.invalid/panel.jpg"],
+            "prompt": "offline overlap test",
+            "duration": 4,
+            "resolution": "720p",
+        }
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            group_future = pool.submit(
+                adr._submit_lip_sync_task_transaction,
+                "merged:0_1", [0, 1], payload,
+                model="WERYDANCE",
+                metadata={"mode": "merged-a-group", "group_indices": [0, 1]},
+            )
+            scene_future = pool.submit(
+                adr._submit_lip_sync_task_transaction,
+                1, [1], payload,
+                model="WERYDANCE",
+                metadata={"variant": "single-turn"},
+            )
+            results = [group_future.result(), scene_future.result()]
+
+        assert adr.req_post.call_count == 1
+        assert sum(bool(result.get("task_id")) for result in results) == 1
+        assert sum(bool(result.get("conflict_record")) for result in results) == 1
+        assert len(adr._load_lip_sync_tasks()) == 1
+        print("  overlapping group/single callers produced exactly one POST")
+    finally:
+        print(f"  tmpdir kept: {tmpdir}")
+
+
+def test_submit_exception_is_unknown_and_not_retried():
+    tmpdir = Path(tempfile.mkdtemp(prefix="pr_a_submit_unknown_"))
+    print(f"\n[case 16] submit exception is outcome-unknown and never retried, tmpdir={tmpdir}")
+    try:
+        adr.OUTPUT_DIR = tmpdir
+        adr.req_post = MagicMock(side_effect=TimeoutError("response lost after POST"))
+        result = adr._submit_lip_sync_task_transaction(
+            "merged:0_1",
+            [0, 1],
+            {
+                "model": "WERYDANCE",
+                "images": ["https://example.invalid/panel.jpg"],
+                "prompt": "offline unknown-outcome test",
+                "duration": 4,
+                "resolution": "720p",
+            },
+            model="WERYDANCE",
+            metadata={"mode": "merged-a-group", "group_indices": [0, 1]},
+        )
+
+        assert adr.req_post.call_count == 1
+        assert result.get("outcome_unknown") is True
+        assert isinstance(result.get("submit_error"), TimeoutError)
+        assert result.get("task_id") is None
+        reservation = adr._load_lip_sync_tasks()["merged:0_1"]
+        assert adr._is_lip_sync_submission_reservation(reservation)
+        print("  one POST attempt; timeout marked unknown for operator reconciliation")
+    finally:
+        print(f"  tmpdir kept: {tmpdir}")
+
+
+def test_submission_reservation_is_not_polled_as_remote_task():
+    tmpdir = Path(tempfile.mkdtemp(prefix="pr_a_reservation_resume_"))
+    print(f"\n[case 17] persisted reservation blocks submit without fake polling, tmpdir={tmpdir}")
+    try:
+        script, target_durs = _make_group_inputs(tmpdir)
+        adr.OUTPUT_DIR = tmpdir
+        adr.req_get = MagicMock(side_effect=AssertionError("reservation is not a remote task_id"))
+        adr.req_post = MagicMock(side_effect=AssertionError("reservation must block resubmit"))
+        adr._atomic_write_json(adr._lip_sync_tasks_file(), {
+            "merged:0_1": {
+                "task_id": "submission-pending:unknown",
+                "model": "WERYDANCE",
+                "mode": "merged-a-group",
+                "group_indices": [0, 1],
+                "submission_state": "submitting",
+                "split_durations": [1.0, 1.0],
+            }
+        })
+
+        result = adr._lip_sync_one_group([0, 1], script, target_durs, "16:9")
+
+        assert not any(result[1])
+        assert all(info.get("reason") == "submit_outcome_unknown" for info in result[2])
+        assert adr.req_get.call_count == 0
+        assert adr.req_post.call_count == 0
+        print("  reservation remains unresolved with zero GET/POST calls")
     finally:
         print(f"  tmpdir kept: {tmpdir}")
 
@@ -504,7 +709,13 @@ def main():
     test_cache_write_failure_after_submit_is_unresolved()
     test_split_failure_keeps_cache_and_reuses_raw_video()
     test_postprocess_failure_keeps_cache_until_local_success()
-    print("\n=== 11/11 PASSED ===")
+    test_stale_legacy_raw_does_not_bypass_cached_task_poll()
+    test_legacy_cache_without_durations_resumes_without_submit()
+    test_concurrent_group_submit_transaction_creates_one_paid_task()
+    test_group_and_single_submit_share_overlap_transaction()
+    test_submit_exception_is_unknown_and_not_retried()
+    test_submission_reservation_is_not_polled_as_remote_task()
+    print("\n=== 17/17 PASSED ===")
 
 
 if __name__ == "__main__":

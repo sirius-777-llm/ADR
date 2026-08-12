@@ -14,6 +14,8 @@ ADR V8 — 字幕驱动纪录片自动生成管线
     ADR_ALMIGHTY_FAST_MODEL  可选，Almighty 快速回退模型，默认 SEEDANCE_2_0_FAST_OS
 """
 import json
+import hashlib
+import fcntl
 import math
 import os
 import re
@@ -23,6 +25,8 @@ import tempfile
 import time
 import threading
 import urllib.request
+import uuid
+from contextlib import contextmanager
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from difflib import SequenceMatcher
@@ -12032,6 +12036,15 @@ def _mtv_lip_sync_segment(idx: int, scene: dict, audio_path: str, target_dur: fl
         cache_key = _mtv_lip_sync_task_key(idx)
         existing_task = _load_lip_sync_tasks().get(cache_key)
         if existing_task:
+            if _is_lip_sync_submission_reservation(existing_task):
+                info.update({
+                    "pass": False,
+                    "reason": "submit_outcome_unknown",
+                    "task_id": existing_task["task_id"],
+                    "timed_out_or_reusable": True,
+                    "resumed_task": True,
+                })
+                return False, info
             ok, poll_info = _lip_sync_poll_download_and_process(
                 idx,
                 existing_task["task_id"],
@@ -12061,44 +12074,61 @@ def _mtv_lip_sync_segment(idx: int, scene: dict, audio_path: str, target_dur: fl
             "No generated subtitles, no captions, no text overlays, no logos, no watermark."
         )[:2000]
         api_dur = int(round(max(4, min(15, float(target_dur or 4) + 0.3))))
-        response = None
-        task_id = None
-        for submit_attempt in range(3):
-            try:
-                _wait_motion_submit_slot(f"mtv lip-sync {idx+1}")
-                response = req_post("/generation/almighty-reference-to-video", {
-                    "model": ALMIGHTY_MODEL,
-                    "images": [image_url],
-                    "audios": [audio_url],
-                    "prompt": prompt,
-                    "duration": api_dur,
-                    "aspect_ratio": ASPECT_RATIO,
-                    "resolution": "720p",
-                    "generate_audio": "false",
-                    "video_number": 1,
-                }, timeout=30)
-                task_id = response.get("data", {}).get("task_id") or (response.get("data", {}).get("task_ids") or [None])[0]
-                if task_id:
-                    break
-            except Exception as e:
-                if submit_attempt < 2:
-                    wait_s = 5 * (submit_attempt + 1)
-                    log(f"[mtv lip-sync {idx}] submit 失败（第 {submit_attempt+1}/3 次）：{e}，{wait_s}s 后重试")
-                    time.sleep(wait_s)
-                    continue
-                raise
+        payload = {
+            "model": ALMIGHTY_MODEL,
+            "images": [image_url],
+            "audios": [audio_url],
+            "prompt": prompt,
+            "duration": api_dur,
+            "aspect_ratio": ASPECT_RATIO,
+            "resolution": "720p",
+            "generate_audio": "false",
+            "video_number": 1,
+        }
+        _wait_motion_submit_slot(f"mtv lip-sync {idx+1}")
+        submit = _submit_lip_sync_task_transaction(
+            cache_key,
+            [],
+            payload,
+            model=ALMIGHTY_MODEL,
+            metadata={
+                "mode": "mtv-song-audio-lip-sync",
+                "generate_audio": "false",
+            },
+        )
+        conflict_record = submit.get("conflict_record")
+        if conflict_record:
+            ok, poll_info = _lip_sync_poll_download_and_process(
+                idx,
+                conflict_record["task_id"],
+                scene,
+                float(target_dur or 0.0),
+                task_cache_key=cache_key,
+            )
+            poll_info.update({
+                "interface": conflict_record.get("interface"),
+                "model": conflict_record.get("model"),
+                "mode": "mtv_song_audio_lip_sync",
+                "resumed_task": True,
+            })
+            poll_info["timed_out_or_reusable"] = cache_key in _load_lip_sync_tasks()
+            return ok, poll_info
+        submit_error = submit.get("submit_error")
+        if submit_error is not None:
+            info.update({
+                "pass": False,
+                "reason": "submit_outcome_unknown",
+                "submit_error": str(submit_error),
+                "timed_out_or_reusable": True,
+            })
+            return False, info
+        response = submit.get("response")
+        task_id = submit.get("task_id")
         if not task_id:
             info.update({"pass": False, "reason": "submit_without_task_id", "response": response})
             return False, info
-        try:
-            _save_lip_sync_task(
-                cache_key,
-                task_id,
-                model=ALMIGHTY_MODEL,
-                mode="mtv-song-audio-lip-sync",
-                generate_audio="false",
-            )
-        except Exception as cache_error:
+        cache_error = submit.get("cache_error")
+        if cache_error is not None:
             log(f"[mtv lip-sync {idx}] task 已提交但缓存写入失败: {cache_error}")
             info.update({
                 "pass": False,
@@ -12850,11 +12880,29 @@ def _finalize_motion_qa(total: int, success_count: int) -> None:
         p.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
-_lip_sync_tasks_lock = threading.Lock()
+_lip_sync_tasks_lock = threading.RLock()
 
 
 def _lip_sync_tasks_file() -> Path:
     return OUTPUT_DIR / "lip_sync_tasks.json"
+
+
+def _lip_sync_tasks_lock_file() -> Path:
+    return OUTPUT_DIR / ".lip_sync_tasks.lock"
+
+
+@contextmanager
+def _lip_sync_tasks_guard():
+    """Serialize lip-sync cache transactions across threads and ADR processes."""
+    with _lip_sync_tasks_lock:
+        lock_path = _lip_sync_tasks_lock_file()
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        with lock_path.open("a+", encoding="utf-8") as lock_file:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
 
 def _normalize_generation_interface(value: object, default: str | None = None) -> str | None:
@@ -13040,6 +13088,17 @@ def _find_overlapping_lip_sync_task(
     return None
 
 
+def _lip_sync_conflict_info(
+    group: list[int],
+    tasks: dict,
+    *,
+    exact_key: str | None = None,
+) -> tuple[str, dict, list[int]] | None:
+    if exact_key and exact_key in tasks:
+        return exact_key, tasks[exact_key], sorted({int(idx) for idx in group})
+    return _find_overlapping_lip_sync_task(group, tasks)
+
+
 def _is_reusable_lip_sync_raw_video(path: str) -> bool:
     """Accept only a complete, probeable download for PR-A local retries."""
     if not os.path.exists(path) or os.path.getsize(path) < 10000:
@@ -13048,6 +13107,11 @@ def _is_reusable_lip_sync_raw_video(path: str) -> bool:
         return ffprobe_duration(path) > 0 and all(ffprobe_video_size(path))
     except Exception:
         return False
+
+
+def _lip_sync_group_raw_path(group_label: str, task_id: str) -> str:
+    task_hash = hashlib.sha256(str(task_id).encode("utf-8")).hexdigest()[:12]
+    return str(OUTPUT_DIR / f"lip_sync_raw_{group_label}_{task_hash}.mp4")
 
 
 def _find_merged_lip_sync_task(idx: int) -> tuple[str, dict] | None:
@@ -13065,10 +13129,10 @@ def _save_lip_sync_task(
     *,
     model: str,
     interface: str = "almighty-reference-to-video",
+    _locked_tasks: dict | None = None,
     **metadata,
 ):
-    with _lip_sync_tasks_lock:
-        tasks = _load_lip_sync_tasks()
+    def save(tasks: dict) -> None:
         tasks[str(idx)] = _generation_task_record(
             task_id,
             model=model,
@@ -13077,12 +13141,117 @@ def _save_lip_sync_task(
         )
         _atomic_write_json(_lip_sync_tasks_file(), tasks)
 
-
-def _remove_lip_sync_task(idx: object):
-    with _lip_sync_tasks_lock:
+    if _locked_tasks is not None:
+        save(_locked_tasks)
+        return
+    with _lip_sync_tasks_guard():
         tasks = _load_lip_sync_tasks()
+        save(tasks)
+
+
+def _submit_lip_sync_task_transaction(
+    cache_key: object,
+    claimed_indices: list[int],
+    payload: dict,
+    *,
+    model: str,
+    metadata: dict | None = None,
+) -> dict:
+    """Reserve claimed turns, submit once, then replace the reservation with task_id."""
+    key = str(cache_key)
+    with _lip_sync_tasks_guard():
+        tasks = _load_lip_sync_tasks()
+        conflict = _lip_sync_conflict_info(
+            claimed_indices,
+            tasks,
+            exact_key=key,
+        )
+        if conflict:
+            conflict_key, conflict_record, overlap = conflict
+            return {
+                "conflict_key": conflict_key,
+                "conflict_record": conflict_record,
+                "overlap": overlap,
+            }
+
+        reservation_id = f"submission-pending:{uuid.uuid4().hex}"
+        reservation_metadata = dict(metadata or {})
+        reservation_metadata.update({
+            "submission_state": "submitting",
+            "claimed_indices": claimed_indices,
+            "request_fingerprint": hashlib.sha256(
+                json.dumps(payload, sort_keys=True, ensure_ascii=False).encode("utf-8")
+            ).hexdigest(),
+        })
+        tasks[key] = _generation_task_record(
+            reservation_id,
+            model=model,
+            interface="almighty-reference-to-video",
+            **reservation_metadata,
+        )
+        _atomic_write_json(_lip_sync_tasks_file(), tasks)
+
+    try:
+        response = req_post(
+            "/generation/almighty-reference-to-video",
+            payload,
+            timeout=30,
+        )
+    except Exception as submit_error:
+        return {
+            "submit_error": submit_error,
+            "outcome_unknown": True,
+        }
+    data = response.get("data", {}) if isinstance(response, dict) else {}
+    task_ids = data.get("task_ids") or []
+    task_id = data.get("task_id") or (task_ids[0] if task_ids else None)
+    result = {"response": response, "task_id": task_id}
+    if not task_id:
+        _remove_lip_sync_task(key, expected_task_id=reservation_id)
+        return result
+
+    with _lip_sync_tasks_guard():
+        tasks = _load_lip_sync_tasks()
+        current = tasks.get(key)
+        if not current or current.get("task_id") != reservation_id:
+            result["cache_error"] = RuntimeError(
+                f"lip-sync submission reservation changed before task_id persist: {key}"
+            )
+            return result
+        try:
+            _save_lip_sync_task(
+                key,
+                task_id,
+                model=model,
+                _locked_tasks=tasks,
+                **(metadata or {}),
+            )
+        except Exception as cache_error:
+            result["cache_error"] = cache_error
+        return result
+
+
+def _is_lip_sync_submission_reservation(record: dict | None) -> bool:
+    return bool(
+        record
+        and (
+            record.get("submission_state") == "submitting"
+            or str(record.get("task_id") or "").startswith("submission-pending:")
+        )
+    )
+
+
+def _remove_lip_sync_task(idx: object, *, expected_task_id: str | None = None):
+    with _lip_sync_tasks_guard():
+        tasks = _load_lip_sync_tasks()
+        current = tasks.get(str(idx))
+        if expected_task_id is not None and (
+            not current or current.get("task_id") != str(expected_task_id)
+        ):
+            return False
         tasks.pop(str(idx), None)
         _atomic_write_json(_lip_sync_tasks_file(), tasks)
+        return True
 
 
 def _video_visual_motion_qa(path: str) -> dict:
@@ -17027,7 +17196,7 @@ def _lip_sync_poll_download_and_process(
                 vid_url = _extract_video_url(data)
                 if not vid_url:
                     info.update({"pass": False, "reason": "succeed_without_video_url"})
-                    _remove_lip_sync_task(cache_key)
+                    _remove_lip_sync_task(cache_key, expected_task_id=task_id)
                     return False, info
                 raw_path = str(OUTPUT_DIR / f"lip_sync_raw_{idx}.mp4")
                 urllib.request.urlretrieve(vid_url, raw_path)
@@ -17051,7 +17220,7 @@ def _lip_sync_poll_download_and_process(
                     "needs_master_audio_mux": not audio_dub,
                     "generated_audio_from_prompt_dialogue": audio_dub,
                 })
-                _remove_lip_sync_task(cache_key)
+                _remove_lip_sync_task(cache_key, expected_task_id=task_id)
                 return ok, info
             if st == "failed":
                 # 2026-05-22 抽 msg 入 reason 方便诊断（之前看不到具体审核拦截原因）
@@ -17059,7 +17228,7 @@ def _lip_sync_poll_download_and_process(
                 fail_reason = f"task_failed: {fail_msg}" if fail_msg else "task_failed"
                 info.update({"pass": False, "reason": fail_reason, "response": data})
                 log(f"[lip-sync {idx}] task_failed msg: {fail_msg or '(empty)'}")
-                _remove_lip_sync_task(cache_key)
+                _remove_lip_sync_task(cache_key, expected_task_id=task_id)
                 return False, info
         except Exception as e:
             if iteration in (0, 12, 60, 120):
@@ -17098,6 +17267,170 @@ def _resume_lip_sync_task(
     return ok, info
 
 
+def _poll_download_and_process_lip_sync_group(
+    *,
+    idxs: list[int],
+    scenes: list[dict],
+    target_durs: list[float],
+    split_durs: list[float],
+    speaker: str,
+    group_label: str,
+    cache_key: str,
+    task_id: str,
+    submit_model: str | None,
+    allow_raw_reuse: bool,
+) -> tuple[list[int], list[bool], list[dict]]:
+    """Finish a paid PR-A task without allowing local failures to resubmit it."""
+    g_size = len(idxs)
+    raw_path = _lip_sync_group_raw_path(group_label, task_id)
+    succeed = bool(allow_raw_reuse and _is_reusable_lip_sync_raw_video(raw_path))
+    if succeed:
+        log(f"PR-A {group_label}: reuse downloaded raw video for local retry")
+
+    for iteration in range(181 if not succeed else 0):
+        try:
+            response = req_get(f"/generation/{task_id}/status")
+            data = response.get("data", {})
+            status = data.get("task_status", "")
+            if iteration == 0 or iteration % 12 == 0 or status in ("succeed", "failed"):
+                log(f"[PR-A {group_label}] poll #{iteration+1}: {status}")
+            if status == "succeed":
+                video_url = _extract_video_url(data)
+                if not video_url:
+                    log(f"PR-A {group_label}: succeed 但无 video url")
+                    _remove_lip_sync_task(cache_key, expected_task_id=task_id)
+                    return idxs, [False] * g_size, [
+                        {"turn": i + 1, "pass": False, "reason": "succeed_without_video_url"}
+                        for i in idxs
+                    ]
+                download_path = raw_path + ".download"
+                Path(download_path).unlink(missing_ok=True)
+                try:
+                    urllib.request.urlretrieve(video_url, download_path)
+                    if not _is_reusable_lip_sync_raw_video(download_path):
+                        raise RuntimeError("downloaded video failed media validation")
+                    os.replace(download_path, raw_path)
+                finally:
+                    Path(download_path).unlink(missing_ok=True)
+                succeed = True
+                break
+            if status == "failed":
+                log(f"PR-A {group_label}: task_failed {data.get('msg', '')[:120]}")
+                _remove_lip_sync_task(cache_key, expected_task_id=task_id)
+                return idxs, [False] * g_size, [
+                    {"turn": i + 1, "pass": False, "reason": "group_task_failed"}
+                    for i in idxs
+                ]
+        except Exception as exc:
+            if iteration in (0, 12, 60, 120):
+                log(f"PR-A {group_label} poll 异常: {exc}")
+        time.sleep(5)
+
+    if not succeed:
+        return idxs, [False] * g_size, [
+            {
+                "turn": i + 1,
+                "task_id": task_id,
+                "pass": False,
+                "reason": "poll_timeout",
+                "timed_out_or_reusable": True,
+                "submit_model": submit_model,
+                "merged_a_group": group_label,
+            }
+            for i in idxs
+        ]
+
+    out_paths = [scene["vid_path"] for scene in scenes]
+    split_error = None
+    try:
+        split_ok = _split_lip_sync_raw_by_durations(raw_path, split_durs, out_paths)
+    except Exception as exc:
+        split_ok = False
+        split_error = str(exc)
+    if not split_ok:
+        log(f"PR-A {group_label}: split 失败，保留远端结果供本地重试")
+        return idxs, [False] * g_size, [
+            {
+                "turn": i + 1,
+                "task_id": task_id,
+                "pass": False,
+                "reason": "split_failed",
+                "local_error": split_error,
+                "remote_task_succeeded": True,
+                "local_retryable": True,
+                "timed_out_or_reusable": True,
+                "raw_video_path": raw_path,
+                "submit_model": submit_model,
+                "merged_a_group": group_label,
+            }
+            for i in idxs
+        ]
+
+    try:
+        raw_dur = ffprobe_duration(raw_path)
+    except Exception:
+        raw_dur = None
+    oks: list[bool] = []
+    infos: list[dict] = []
+    for i, scene, target_dur in zip(idxs, scenes, target_durs):
+        postprocess_error = None
+        try:
+            ok = _postprocess_audio_dub_segment(scene["vid_path"], scene, target_dur)
+        except Exception as exc:
+            ok = False
+            postprocess_error = str(exc)
+            log(f"PR-A {group_label}: turn {i + 1} postprocess 异常: {exc}")
+        final_dur = None
+        if ok:
+            try:
+                final_dur = ffprobe_duration(scene["vid_path"])
+            except Exception as exc:
+                ok = False
+                postprocess_error = f"final_duration_probe_failed: {exc}"
+        infos.append({
+            "turn": i + 1,
+            "speaker": speaker,
+            "task_id": task_id,
+            "merged_a_group": group_label,
+            "merged_a_group_size": g_size,
+            "raw_video_path": raw_path,
+            "raw_video_duration": raw_dur,
+            "final_segment_path": scene["vid_path"],
+            "final_segment_duration": final_dur,
+            "source_audio_duration": target_dur,
+            "video_has_audio": True,
+            "pass": ok,
+            "reason": None if ok else "postprocess_failed",
+            "local_error": postprocess_error,
+            "remote_task_succeeded": True,
+            "candidate": "merged_a_group_audio_dub",
+            "needs_master_audio_mux": False,
+            "generated_audio_from_prompt_dialogue": True,
+        })
+        oks.append(ok)
+
+    if all(oks):
+        try:
+            _remove_lip_sync_task(cache_key, expected_task_id=task_id)
+        except Exception as cache_error:
+            log(f"PR-A {group_label}: 本地处理完成但 task cache 清理失败: {cache_error}")
+            for info in infos:
+                info["task_cache_cleanup_error"] = str(cache_error)
+        saved_api_calls = g_size - 1
+        log(f"PR-A {group_label}: {g_size}/{g_size} turn 切分 + postprocess ok, 节省 {saved_api_calls} 次 API")
+    else:
+        for info in infos:
+            info.update({
+                "local_retryable": True,
+                "timed_out_or_reusable": True,
+            })
+        log(
+            f"PR-A {group_label}: {sum(oks)}/{g_size} turn postprocess ok，"
+            "保留 task cache 和 raw video 供本地重试"
+        )
+    return idxs, oks, infos
+
+
 def _lip_sync_one_group(group: list[int], script: list[dict], target_durs: list[float], aspect_ratio: str) -> tuple[list[int], list[bool], list[dict]]:
     """PR-A (2026-05-27) merged_a: 同 speaker 连续 turn 合并 almighty 调用.
     Steps:
@@ -17121,6 +17454,78 @@ def _lip_sync_one_group(group: list[int], script: list[dict], target_durs: list[
     cache_key = _merged_lip_sync_task_key(idxs)
     cached_tasks = _load_lip_sync_tasks()
     existing_task = cached_tasks.get(cache_key)
+    if existing_task:
+        if _is_lip_sync_submission_reservation(existing_task):
+            return idxs, [False] * g_size, [
+                {
+                    "turn": i + 1,
+                    "task_id": existing_task["task_id"],
+                    "pass": False,
+                    "reason": "submit_outcome_unknown",
+                    "timed_out_or_reusable": True,
+                    "submit_model": existing_task.get("model"),
+                    "merged_a_group": group_label,
+                }
+                for i in idxs
+            ]
+        split_durs = existing_task.get("split_durations") or []
+        split_durs_valid = (
+            isinstance(split_durs, list)
+            and len(split_durs) == g_size
+            and all(
+                isinstance(value, (int, float))
+                and math.isfinite(float(value))
+                and float(value) > 0
+                for value in split_durs
+            )
+        )
+        if not split_durs_valid:
+            try:
+                split_durs = [
+                    ffprobe_duration(
+                        scene.get("dialogue_audio_mp3") or scene.get("dialogue_audio") or ""
+                    )
+                    for scene in scenes
+                ]
+                split_durs_valid = all(
+                    math.isfinite(float(value)) and float(value) > 0
+                    for value in split_durs
+                )
+            except Exception:
+                split_durs_valid = False
+        if not split_durs_valid:
+            log(f"PR-A {group_label}: cached task 缺可用 split durations，保持未决")
+            return idxs, [False] * g_size, [
+                {
+                    "turn": i + 1,
+                    "task_id": existing_task["task_id"],
+                    "pass": False,
+                    "reason": "resume_split_durations_unavailable",
+                    "timed_out_or_reusable": True,
+                    "submit_model": existing_task.get("model"),
+                    "merged_a_group": group_label,
+                }
+                for i in idxs
+            ]
+        for scene in scenes:
+            scene["_merged_a_group"] = group_label
+            scene["_almighty_audio_dub_attempt"] = True
+        log(
+            f"PR-A {group_label}: resume task_id={existing_task['task_id']} "
+            f"model={existing_task.get('model') or 'legacy-unknown'}"
+        )
+        return _poll_download_and_process_lip_sync_group(
+            idxs=idxs,
+            scenes=scenes,
+            target_durs=durs,
+            split_durs=[float(value) for value in split_durs],
+            speaker=speaker,
+            group_label=group_label,
+            cache_key=cache_key,
+            task_id=existing_task["task_id"],
+            submit_model=existing_task.get("model"),
+            allow_raw_reuse=True,
+        )
     if not existing_task:
         overlapping_task = _find_overlapping_lip_sync_task(idxs, cached_tasks)
         if overlapping_task:
@@ -17263,22 +17668,64 @@ def _lip_sync_one_group(group: list[int], script: list[dict], target_durs: list[
             )
         else:
             _wait_motion_submit_slot(f"PR-A {group_label}")
-            r = req_post("/generation/almighty-reference-to-video", payload, timeout=30)
-            task_id = r.get("data", {}).get("task_id") or (r.get("data", {}).get("task_ids") or [None])[0]
+            submit_result = _submit_lip_sync_task_transaction(
+                cache_key,
+                idxs,
+                payload,
+                model=ALMIGHTY_MODEL,
+                metadata={
+                    "mode": "merged-a-group",
+                    "variant": "merged_a_group_audio_dub",
+                    "generate_audio": "true",
+                    "group_indices": idxs,
+                    "split_durations": [round(float(value), 6) for value in actual_audio_durs],
+                    "target_durations": [round(float(value), 6) for value in durs],
+                },
+            )
+            conflict_record = submit_result.get("conflict_record")
+            if conflict_record:
+                conflict_key = submit_result["conflict_key"]
+                overlap = submit_result.get("overlap") or []
+                log(
+                    f"PR-A {group_label}: pending task {conflict_key} overlaps turns "
+                    f"{overlap}; skip submit"
+                )
+                return idxs, [False] * g_size, [
+                    {
+                        "turn": i + 1,
+                        "task_id": conflict_record["task_id"],
+                        "pass": False,
+                        "reason": "overlapping_lip_sync_task_pending",
+                        "timed_out_or_reusable": True,
+                        "submit_model": conflict_record.get("model"),
+                        "overlapping_task_key": conflict_key,
+                        "overlapping_turn_indices": overlap,
+                        "merged_a_group": group_label,
+                    }
+                    for i in idxs
+                ]
+            submit_error = submit_result.get("submit_error")
+            if submit_error is not None:
+                log(f"PR-A {group_label}: submit 结果未知: {submit_error}")
+                return idxs, [False] * g_size, [
+                    {
+                        "turn": i + 1,
+                        "pass": False,
+                        "reason": "submit_outcome_unknown",
+                        "submit_error": str(submit_error),
+                        "timed_out_or_reusable": True,
+                        "submit_model": ALMIGHTY_MODEL,
+                        "merged_a_group": group_label,
+                    }
+                    for i in idxs
+                ]
+            r = submit_result.get("response")
+            task_id = submit_result.get("task_id")
             if not task_id:
                 log(f"PR-A {group_label}: submit 无 task_id: {r}")
                 return idxs, [False] * g_size, [{"turn": i + 1, "pass": False, "reason": "submit_no_task_id"} for i in idxs]
-            try:
-                _save_lip_sync_task(
-                    cache_key,
-                    task_id,
-                    model=ALMIGHTY_MODEL,
-                    mode="merged-a-group",
-                    variant="merged_a_group_audio_dub",
-                    generate_audio="true",
-                    group_indices=idxs,
-                )
-            except Exception as cache_error:
+            cache_error = submit_result.get("cache_error")
+            if cache_error is not None:
                 log(f"PR-A {group_label}: task 已提交但缓存写入失败: {cache_error}")
                 return idxs, [False] * g_size, [
                     {
@@ -17296,141 +17743,18 @@ def _lip_sync_one_group(group: list[int], script: list[dict], target_durs: list[
     except Exception as e:
         log(f"PR-A {group_label} submit 异常: {e}")
         return idxs, [False] * g_size, [{"turn": i + 1, "pass": False, "reason": f"submit_exception: {e}"} for i in idxs]
-
-    # poll
-    raw_path = str(OUTPUT_DIR / f"lip_sync_raw_{group_label}.mp4")
-    succeed = bool(existing_task and _is_reusable_lip_sync_raw_video(raw_path))
-    if succeed:
-        log(f"PR-A {group_label}: reuse downloaded raw video for local retry")
-    for iteration in range(181 if not succeed else 0):
-        try:
-            s = req_get(f"/generation/{task_id}/status")
-            data = s.get("data", {})
-            st = data.get("task_status", "")
-            if iteration == 0 or iteration % 12 == 0 or st in ("succeed", "failed"):
-                log(f"[PR-A {group_label}] poll #{iteration+1}: {st}")
-            if st == "succeed":
-                vid_url = _extract_video_url(data)
-                if not vid_url:
-                    log(f"PR-A {group_label}: succeed 但无 video url")
-                    _remove_lip_sync_task(cache_key)
-                    return idxs, [False] * g_size, [{"turn": i + 1, "pass": False, "reason": "succeed_without_video_url"} for i in idxs]
-                download_path = raw_path + ".download"
-                Path(download_path).unlink(missing_ok=True)
-                try:
-                    urllib.request.urlretrieve(vid_url, download_path)
-                    if not _is_reusable_lip_sync_raw_video(download_path):
-                        raise RuntimeError("downloaded video failed media validation")
-                    os.replace(download_path, raw_path)
-                finally:
-                    Path(download_path).unlink(missing_ok=True)
-                succeed = True
-                break
-            if st == "failed":
-                log(f"PR-A {group_label}: task_failed {data.get('msg', '')[:120]}")
-                _remove_lip_sync_task(cache_key)
-                return idxs, [False] * g_size, [{"turn": i + 1, "pass": False, "reason": "group_task_failed"} for i in idxs]
-        except Exception as e:
-            if iteration in (0, 12, 60, 120):
-                log(f"PR-A {group_label} poll 异常: {e}")
-        time.sleep(5)
-
-    if not succeed:
-        return idxs, [False] * g_size, [
-            {
-                "turn": i + 1,
-                "task_id": task_id,
-                "pass": False,
-                "reason": "poll_timeout",
-                "timed_out_or_reusable": True,
-                "submit_model": existing_task.get("model") if existing_task else ALMIGHTY_MODEL,
-                "merged_a_group": group_label,
-            }
-            for i in idxs
-        ]
-
-    # ffmpeg split → seg_i.mp4 for each i in group
-    # codex High 1 fix: 用实际 audio dur 作切分边界, 不用 target_dur
-    out_paths = [scenes[k]["vid_path"] for k in range(g_size)]
-    split_error = None
-    try:
-        split_ok = _split_lip_sync_raw_by_durations(raw_path, actual_audio_durs, out_paths)
-    except Exception as exc:
-        split_ok = False
-        split_error = str(exc)
-    if not split_ok:
-        log(f"PR-A {group_label}: split 失败，保留远端结果供本地重试")
-        return idxs, [False] * g_size, [
-            {
-                "turn": i + 1,
-                "task_id": task_id,
-                "pass": False,
-                "reason": "split_failed",
-                "local_error": split_error,
-                "remote_task_succeeded": True,
-                "local_retryable": True,
-                "timed_out_or_reusable": True,
-                "raw_video_path": raw_path,
-                "submit_model": existing_task.get("model") if existing_task else ALMIGHTY_MODEL,
-                "merged_a_group": group_label,
-            }
-            for i in idxs
-        ]
-
-    # 每个切分段走 _postprocess_audio_dub_segment retiming
-    oks: list[bool] = []
-    infos: list[dict] = []
-    raw_dur = ffprobe_duration(raw_path)
-    for k, (i, scene, dur) in enumerate(zip(idxs, scenes, durs)):
-        postprocess_error = None
-        try:
-            ok = _postprocess_audio_dub_segment(scene["vid_path"], scene, dur)
-        except Exception as exc:
-            ok = False
-            postprocess_error = str(exc)
-            log(f"PR-A {group_label}: turn {i + 1} postprocess 异常: {exc}")
-        final_dur = ffprobe_duration(scene["vid_path"]) if ok else None
-        infos.append({
-            "turn": i + 1,
-            "speaker": speaker,
-            "task_id": task_id,
-            "merged_a_group": group_label,
-            "merged_a_group_size": g_size,
-            "raw_video_path": raw_path,
-            "raw_video_duration": raw_dur,
-            "final_segment_path": scene["vid_path"],
-            "final_segment_duration": final_dur,
-            "source_audio_duration": dur,
-            "video_has_audio": True,
-            "pass": ok,
-            "reason": None if ok else "postprocess_failed",
-            "local_error": postprocess_error,
-            "remote_task_succeeded": True,
-            "candidate": "merged_a_group_audio_dub",
-            "needs_master_audio_mux": False,
-            "generated_audio_from_prompt_dialogue": True,
-        })
-        oks.append(ok)
-    saved_api_calls = g_size - 1
-    if all(oks):
-        try:
-            _remove_lip_sync_task(cache_key)
-        except Exception as cache_error:
-            log(f"PR-A {group_label}: 本地处理完成但 task cache 清理失败: {cache_error}")
-            for info in infos:
-                info["task_cache_cleanup_error"] = str(cache_error)
-        log(f"PR-A {group_label}: {g_size}/{g_size} turn 切分 + postprocess ok, 节省 {saved_api_calls} 次 API")
-    else:
-        for info in infos:
-            info.update({
-                "local_retryable": True,
-                "timed_out_or_reusable": True,
-            })
-        log(
-            f"PR-A {group_label}: {sum(oks)}/{g_size} turn postprocess ok，"
-            "保留 task cache 和 raw video 供本地重试"
-        )
-    return idxs, oks, infos
+    return _poll_download_and_process_lip_sync_group(
+        idxs=idxs,
+        scenes=scenes,
+        target_durs=durs,
+        split_durs=actual_audio_durs,
+        speaker=speaker,
+        group_label=group_label,
+        cache_key=cache_key,
+        task_id=task_id,
+        submit_model=ALMIGHTY_MODEL,
+        allow_raw_reuse=False,
+    )
 
 
 def _lip_sync_one_scene(idx: int, scene: dict, target_dur: float, aspect_ratio: str) -> tuple[int, bool, dict]:
@@ -17485,6 +17809,15 @@ def _lip_sync_one_scene(idx: int, scene: dict, target_dur: float, aspect_ratio: 
         }
     existing_task = _load_lip_sync_tasks().get(str(idx))
     if existing_task:
+        if _is_lip_sync_submission_reservation(existing_task):
+            return idx, False, {
+                "turn": idx + 1,
+                "task_id": existing_task["task_id"],
+                "pass": False,
+                "reason": "submit_outcome_unknown",
+                "timed_out_or_reusable": True,
+                "submit_model": existing_task.get("model"),
+            }
         ok, info = _resume_lip_sync_task(idx, existing_task, scene, target_dur)
         return idx, ok, info
     try:
@@ -17674,9 +18007,53 @@ def _lip_sync_one_scene(idx: int, scene: dict, target_dur: float, aspect_ratio: 
                     # B-roll 模式不传 audios；A-roll 才传
                     if audio_url:
                         payload["audios"] = [audio_url]
-                    r = req_post("/generation/almighty-reference-to-video", payload, timeout=30)
-                    task_id = r.get("data", {}).get("task_id") or (r.get("data", {}).get("task_ids") or [None])[0]
+                    submit_result = _submit_lip_sync_task_transaction(
+                        idx,
+                        [idx],
+                        payload,
+                        model=model,
+                        metadata={
+                            "variant": variant_name,
+                            "generate_audio": generate_audio,
+                        },
+                    )
+                    conflict_record = submit_result.get("conflict_record")
+                    if conflict_record:
+                        conflict_key = submit_result["conflict_key"]
+                        return idx, False, {
+                            "turn": idx + 1,
+                            "task_id": conflict_record["task_id"],
+                            "pass": False,
+                            "reason": "lip_sync_task_pending",
+                            "timed_out_or_reusable": True,
+                            "submit_model": conflict_record.get("model"),
+                            "overlapping_task_key": conflict_key,
+                            "overlapping_turn_indices": submit_result.get("overlap") or [idx],
+                        }
+                    submit_error = submit_result.get("submit_error")
+                    if submit_error is not None:
+                        return idx, False, {
+                            "turn": idx + 1,
+                            "pass": False,
+                            "reason": "submit_outcome_unknown",
+                            "submit_error": str(submit_error),
+                            "timed_out_or_reusable": True,
+                            "submit_model": model,
+                        }
+                    r = submit_result.get("response")
+                    task_id = submit_result.get("task_id")
                     if task_id:
+                        cache_error = submit_result.get("cache_error")
+                        if cache_error is not None:
+                            return idx, False, {
+                                "turn": idx + 1,
+                                "task_id": task_id,
+                                "pass": False,
+                                "reason": "task_cache_write_failed_after_submit",
+                                "task_cache_error": str(cache_error),
+                                "timed_out_or_reusable": True,
+                                "submit_model": model,
+                            }
                         break
                 except Exception as e:
                     if submit_attempt < 2:
@@ -17689,13 +18066,6 @@ def _lip_sync_one_scene(idx: int, scene: dict, target_dur: float, aspect_ratio: 
                 if r is not None:
                     attempts.append({"variant": variant_name, "model": model, "pass": False, "reason": "submit_without_task_id", "response": r})
                 continue
-            _save_lip_sync_task(
-                idx,
-                task_id,
-                model=model,
-                variant=variant_name,
-                generate_audio=generate_audio,
-            )
             ok, info = _lip_sync_poll_download_and_process(idx, task_id, scene, target_dur)
             info.update({
                 "variant": variant_name,
