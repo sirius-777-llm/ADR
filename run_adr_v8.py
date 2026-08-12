@@ -11629,8 +11629,17 @@ def _mtv_generate_visual_segments(plan: dict, song_path: str, singer: str, singe
         )
         if lip_sync_enabled and scene.get("mtv_role") == "vocal":
             try:
-                slice_path = _mtv_song_slice(song_path, float(scene["mtv_source_start"]), float(scene["mtv_source_end"]), i)
-                scene["dialogue_audio_mp3"] = slice_path
+                cache_key = _mtv_lip_sync_task_key(i)
+                existing_lip_task = _load_lip_sync_tasks().get(cache_key)
+                slice_path = str(scene.get("dialogue_audio_mp3") or "")
+                if not existing_lip_task:
+                    slice_path = _mtv_song_slice(
+                        song_path,
+                        float(scene["mtv_source_start"]),
+                        float(scene["mtv_source_end"]),
+                        i,
+                    )
+                    scene["dialogue_audio_mp3"] = slice_path
                 ok, info = _mtv_lip_sync_segment(i, scene, slice_path, float(scene.get("vid_duration") or scene.get("dur") or 0.0))
                 lip_records.append(info)
                 if ok:
@@ -12026,9 +12035,6 @@ def _mtv_lip_sync_segment(idx: int, scene: dict, audio_path: str, target_dur: fl
         "source_audio": audio_path,
         "target_duration": round(float(target_dur or 0.0), 3),
     }
-    if not audio_path or not os.path.exists(audio_path):
-        info.update({"pass": False, "reason": "missing_audio_slice"})
-        return False, info
     try:
         scene["_almighty_reference_audio"] = audio_path
         scene["_almighty_reference_audio_role"] = "mtv_song_vocal_slice"
@@ -12060,6 +12066,9 @@ def _mtv_lip_sync_segment(idx: int, scene: dict, audio_path: str, target_dur: fl
             })
             poll_info["timed_out_or_reusable"] = cache_key in _load_lip_sync_tasks()
             return ok, poll_info
+        if not audio_path or not os.path.exists(audio_path):
+            info.update({"pass": False, "reason": "missing_audio_slice"})
+            return False, info
         image_url = _upload_to_weryai(scene["img_path"])
         audio_url = _upload_to_weryai(audio_path)
         lyric = re.sub(r"\s+", " ", str(scene.get("text") or "")).strip()[:180]
@@ -12098,6 +12107,15 @@ def _mtv_lip_sync_segment(idx: int, scene: dict, audio_path: str, target_dur: fl
         )
         conflict_record = submit.get("conflict_record")
         if conflict_record:
+            if _is_lip_sync_submission_reservation(conflict_record):
+                info.update({
+                    "pass": False,
+                    "reason": "submit_outcome_unknown",
+                    "task_id": conflict_record["task_id"],
+                    "timed_out_or_reusable": True,
+                    "resumed_task": True,
+                })
+                return False, info
             ok, poll_info = _lip_sync_poll_download_and_process(
                 idx,
                 conflict_record["task_id"],
@@ -12114,13 +12132,16 @@ def _mtv_lip_sync_segment(idx: int, scene: dict, audio_path: str, target_dur: fl
             poll_info["timed_out_or_reusable"] = cache_key in _load_lip_sync_tasks()
             return ok, poll_info
         submit_error = submit.get("submit_error")
-        if submit_error is not None:
+        if submit.get("outcome_unknown"):
             info.update({
                 "pass": False,
                 "reason": "submit_outcome_unknown",
-                "submit_error": str(submit_error),
                 "timed_out_or_reusable": True,
             })
+            if submit_error is not None:
+                info["submit_error"] = str(submit_error)
+            if submit.get("response") is not None:
+                info["response"] = submit["response"]
             return False, info
         response = submit.get("response")
         task_id = submit.get("task_id")
@@ -13060,6 +13081,13 @@ def _lip_sync_task_indices(key: object, record: dict) -> set[int]:
         text = str(value).strip()
         if re.fullmatch(r"\d+", text):
             indices.add(int(text))
+    claimed_indices = record.get("claimed_indices") or []
+    if not isinstance(claimed_indices, (list, tuple, set)):
+        claimed_indices = [claimed_indices]
+    for value in claimed_indices:
+        text = str(value).strip()
+        if re.fullmatch(r"\d+", text):
+            indices.add(int(text))
 
     key_text = str(key).strip()
     if key_text.startswith("merged:"):
@@ -13202,12 +13230,31 @@ def _submit_lip_sync_task_transaction(
             "submit_error": submit_error,
             "outcome_unknown": True,
         }
-    data = response.get("data", {}) if isinstance(response, dict) else {}
-    task_ids = data.get("task_ids") or []
-    task_id = data.get("task_id") or (task_ids[0] if task_ids else None)
+    try:
+        if not isinstance(response, dict):
+            raise TypeError(f"unexpected submit response type: {type(response).__name__}")
+        data = response.get("data")
+        if not isinstance(data, dict):
+            raise TypeError(f"unexpected submit data type: {type(data).__name__}")
+        task_ids = data.get("task_ids") or []
+        if not isinstance(task_ids, (list, tuple)):
+            task_ids = []
+        raw_task_id = data.get("task_id") or (task_ids[0] if task_ids else None)
+        task_id = str(raw_task_id).strip() if raw_task_id is not None else None
+        task_id = task_id or None
+    except Exception as response_error:
+        return {
+            "response": response,
+            "task_id": None,
+            "submit_error": response_error,
+            "outcome_unknown": True,
+        }
     result = {"response": response, "task_id": task_id}
     if not task_id:
-        _remove_lip_sync_task(key, expected_task_id=reservation_id)
+        # A successful HTTP exchange without a task_id does not prove that the
+        # upstream failed to create a paid task. Keep the reservation until an
+        # operator can reconcile the request fingerprint with WeryAI.
+        result["outcome_unknown"] = True
         return result
 
     with _lip_sync_tasks_guard():
@@ -17198,14 +17245,38 @@ def _lip_sync_poll_download_and_process(
                     info.update({"pass": False, "reason": "succeed_without_video_url"})
                     _remove_lip_sync_task(cache_key, expected_task_id=task_id)
                     return False, info
-                raw_path = str(OUTPUT_DIR / f"lip_sync_raw_{idx}.mp4")
-                urllib.request.urlretrieve(vid_url, raw_path)
+                task_hash = hashlib.sha256(str(task_id).encode("utf-8")).hexdigest()[:12]
+                raw_path = str(OUTPUT_DIR / f"lip_sync_raw_{idx}_{task_hash}.mp4")
+                if not _is_reusable_lip_sync_raw_video(raw_path):
+                    download_path = raw_path + ".download"
+                    Path(download_path).unlink(missing_ok=True)
+                    try:
+                        urllib.request.urlretrieve(vid_url, download_path)
+                        if not _is_reusable_lip_sync_raw_video(download_path):
+                            raise RuntimeError("downloaded video failed media validation")
+                        os.replace(download_path, raw_path)
+                    finally:
+                        Path(download_path).unlink(missing_ok=True)
                 raw_dur = ffprobe_duration(raw_path)
                 audio_dub = bool(scene.get("_almighty_audio_dub_attempt"))
-                ok = _postprocess_audio_dub_segment(raw_path, scene, target_dur) if audio_dub else _postprocess_lip_sync_segment(raw_path, scene, target_dur)
-                final_dur = ffprobe_duration(scene["vid_path"]) if ok else None
+                postprocess_error = None
+                try:
+                    ok = _postprocess_audio_dub_segment(raw_path, scene, target_dur) if audio_dub else _postprocess_lip_sync_segment(raw_path, scene, target_dur)
+                except Exception as exc:
+                    ok = False
+                    postprocess_error = str(exc)
+                final_dur = None
+                if ok:
+                    try:
+                        final_dur = ffprobe_duration(scene["vid_path"])
+                    except Exception as exc:
+                        ok = False
+                        postprocess_error = f"final_duration_probe_failed: {exc}"
                 source_audio = scene.get("_almighty_reference_audio") or scene.get("dialogue_audio_mp3") or scene.get("dialogue_audio")
-                audio_dur = ffprobe_duration(source_audio) if source_audio and os.path.exists(source_audio) else None
+                try:
+                    audio_dur = ffprobe_duration(source_audio) if source_audio and os.path.exists(source_audio) else None
+                except Exception:
+                    audio_dur = None
                 info.update({
                     "pass": ok,
                     "candidate": "almighty_reference_audio_dub" if audio_dub else "almighty_reference_image_audio",
@@ -17220,7 +17291,16 @@ def _lip_sync_poll_download_and_process(
                     "needs_master_audio_mux": not audio_dub,
                     "generated_audio_from_prompt_dialogue": audio_dub,
                 })
-                _remove_lip_sync_task(cache_key, expected_task_id=task_id)
+                if ok:
+                    _remove_lip_sync_task(cache_key, expected_task_id=task_id)
+                else:
+                    info.update({
+                        "reason": "postprocess_failed",
+                        "local_retryable": True,
+                        "remote_task_succeeded": True,
+                        "timed_out_or_reusable": True,
+                        "local_error": postprocess_error,
+                    })
                 return ok, info
             if st == "failed":
                 # 2026-05-22 抽 msg 入 reason 方便诊断（之前看不到具体审核拦截原因）
@@ -17539,7 +17619,11 @@ def _lip_sync_one_group(group: list[int], script: list[dict], target_durs: list[
                     "turn": i + 1,
                     "task_id": overlapping_record["task_id"],
                     "pass": False,
-                    "reason": "overlapping_lip_sync_task_pending",
+                    "reason": (
+                        "submit_outcome_unknown"
+                        if _is_lip_sync_submission_reservation(overlapping_record)
+                        else "overlapping_lip_sync_task_pending"
+                    ),
                     "timed_out_or_reusable": True,
                     "submit_model": overlapping_record.get("model"),
                     "overlapping_task_key": overlapping_key,
@@ -17695,7 +17779,11 @@ def _lip_sync_one_group(group: list[int], script: list[dict], target_durs: list[
                         "turn": i + 1,
                         "task_id": conflict_record["task_id"],
                         "pass": False,
-                        "reason": "overlapping_lip_sync_task_pending",
+                        "reason": (
+                            "submit_outcome_unknown"
+                            if _is_lip_sync_submission_reservation(conflict_record)
+                            else "overlapping_lip_sync_task_pending"
+                        ),
                         "timed_out_or_reusable": True,
                         "submit_model": conflict_record.get("model"),
                         "overlapping_task_key": conflict_key,
@@ -17705,20 +17793,24 @@ def _lip_sync_one_group(group: list[int], script: list[dict], target_durs: list[
                     for i in idxs
                 ]
             submit_error = submit_result.get("submit_error")
-            if submit_error is not None:
-                log(f"PR-A {group_label}: submit 结果未知: {submit_error}")
-                return idxs, [False] * g_size, [
-                    {
+            if submit_result.get("outcome_unknown"):
+                log(f"PR-A {group_label}: submit 结果未知: {submit_error or submit_result.get('response')}")
+                infos = []
+                for i in idxs:
+                    unknown_info = {
                         "turn": i + 1,
                         "pass": False,
                         "reason": "submit_outcome_unknown",
-                        "submit_error": str(submit_error),
                         "timed_out_or_reusable": True,
                         "submit_model": ALMIGHTY_MODEL,
                         "merged_a_group": group_label,
                     }
-                    for i in idxs
-                ]
+                    if submit_error is not None:
+                        unknown_info["submit_error"] = str(submit_error)
+                    if submit_result.get("response") is not None:
+                        unknown_info["response"] = submit_result["response"]
+                    infos.append(unknown_info)
+                return idxs, [False] * g_size, infos
             r = submit_result.get("response")
             task_id = submit_result.get("task_id")
             if not task_id:
@@ -17802,7 +17894,11 @@ def _lip_sync_one_scene(idx: int, scene: dict, target_dur: float, aspect_ratio: 
             "turn": idx + 1,
             "task_id": merged_record["task_id"],
             "pass": False,
-            "reason": "merged_group_task_pending",
+            "reason": (
+                "submit_outcome_unknown"
+                if _is_lip_sync_submission_reservation(merged_record)
+                else "merged_group_task_pending"
+            ),
             "timed_out_or_reusable": True,
             "submit_model": merged_record.get("model"),
             "merged_task_key": merged_key,
@@ -18024,22 +18120,30 @@ def _lip_sync_one_scene(idx: int, scene: dict, target_dur: float, aspect_ratio: 
                             "turn": idx + 1,
                             "task_id": conflict_record["task_id"],
                             "pass": False,
-                            "reason": "lip_sync_task_pending",
+                            "reason": (
+                                "submit_outcome_unknown"
+                                if _is_lip_sync_submission_reservation(conflict_record)
+                                else "lip_sync_task_pending"
+                            ),
                             "timed_out_or_reusable": True,
                             "submit_model": conflict_record.get("model"),
                             "overlapping_task_key": conflict_key,
                             "overlapping_turn_indices": submit_result.get("overlap") or [idx],
                         }
                     submit_error = submit_result.get("submit_error")
-                    if submit_error is not None:
-                        return idx, False, {
+                    if submit_result.get("outcome_unknown"):
+                        unknown_info = {
                             "turn": idx + 1,
                             "pass": False,
                             "reason": "submit_outcome_unknown",
-                            "submit_error": str(submit_error),
                             "timed_out_or_reusable": True,
                             "submit_model": model,
                         }
+                        if submit_error is not None:
+                            unknown_info["submit_error"] = str(submit_error)
+                        if submit_result.get("response") is not None:
+                            unknown_info["response"] = submit_result["response"]
+                        return idx, False, unknown_info
                     r = submit_result.get("response")
                     task_id = submit_result.get("task_id")
                     if task_id:

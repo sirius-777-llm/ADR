@@ -467,6 +467,28 @@ assert second_mtv[1]["resumed_task"] is True
 assert mtv_submits == [adr.ALMIGHTY_MODEL]
 assert adr._load_lip_sync_tasks()[adr._mtv_lip_sync_task_key(3)]["task_id"] == "mtv-pending"
 
+# A missing/rebuild-failed local slice cannot bypass an existing paid MTV task.
+missing_slice_mtv = adr._mtv_lip_sync_segment(
+    3,
+    mtv_scene,
+    str(root / "missing-mtv-slice.mp3"),
+    5.0,
+)
+assert missing_slice_mtv[1]["resumed_task"] is True
+assert missing_slice_mtv[1]["timed_out_or_reusable"] is True
+assert mtv_submits == [adr.ALMIGHTY_MODEL]
+
+# The MTV orchestration checks cache before trying to recreate a local slice.
+mtv_visual_source = adr.ADR_PATH.read_text(encoding="utf-8") if hasattr(adr, "ADR_PATH") else Path(adr.__file__).read_text(encoding="utf-8")
+mtv_visual_tree = __import__("ast").parse(mtv_visual_source)
+mtv_visual_fn = next(
+    node for node in mtv_visual_tree.body
+    if isinstance(node, __import__("ast").FunctionDef)
+    and node.name == "_mtv_generate_visual_segments"
+)
+source_segment = __import__("ast").get_source_segment(mtv_visual_source, mtv_visual_fn) or ""
+assert source_segment.index("existing_lip_task = _load_lip_sync_tasks().get(cache_key)") < source_segment.index("slice_path = _mtv_song_slice(")
+
 # Once submit returns a paid task_id, a cache failure must not enter poll/fallback.
 mtv_cache_failure_polls = []
 adr._lip_sync_poll_download_and_process = lambda *args, **kwargs: mtv_cache_failure_polls.append(args) or (
@@ -492,7 +514,7 @@ print(json.dumps({
     "fast_resume_model": info["submit_model"],
     "lip_timeout_submits": len(lip_submits),
     "grid_timeout_submits": len(grid_submits),
-    "mtv_timeout_submits": len(mtv_submits),
+        "mtv_timeout_submits": len(mtv_submits),
     "mtv_cache_failure_reason": mtv_cache_failure[1]["reason"],
 }))
 '''

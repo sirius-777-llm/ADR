@@ -7,6 +7,7 @@
 - 验证: 1 次 submit / audio 拼接产物 / 2 个 seg split / 全 ok
 """
 import os
+import json
 import shutil
 import subprocess
 import sys
@@ -696,6 +697,187 @@ def test_submission_reservation_is_not_polled_as_remote_task():
         print(f"  tmpdir kept: {tmpdir}")
 
 
+def test_submit_without_task_id_remains_unknown_and_blocks_resubmit():
+    tmpdir = Path(tempfile.mkdtemp(prefix="pr_a_submit_no_id_"))
+    print(f"\n[case 18] response without task_id remains outcome-unknown, tmpdir={tmpdir}")
+    try:
+        adr.OUTPUT_DIR = tmpdir
+        adr.req_post = MagicMock(return_value={"code": 0, "data": {}})
+        payload = {
+            "model": "WERYDANCE",
+            "images": ["https://example.invalid/panel.jpg"],
+            "prompt": "offline missing-task-id test",
+            "duration": 4,
+            "resolution": "720p",
+        }
+
+        first = adr._submit_lip_sync_task_transaction(
+            "merged:0_1", [0, 1], payload,
+            model="WERYDANCE",
+            metadata={"mode": "merged-a-group", "group_indices": [0, 1]},
+        )
+        second = adr._submit_lip_sync_task_transaction(
+            "merged:0_1", [0, 1], payload,
+            model="WERYDANCE",
+            metadata={"mode": "merged-a-group", "group_indices": [0, 1]},
+        )
+
+        assert first.get("outcome_unknown") is True
+        assert second.get("conflict_key") == "merged:0_1"
+        assert adr.req_post.call_count == 1
+        assert adr._is_lip_sync_submission_reservation(
+            adr._load_lip_sync_tasks()["merged:0_1"]
+        )
+        print("  missing task_id preserved reservation; second caller made zero POSTs")
+    finally:
+        print(f"  tmpdir kept: {tmpdir}")
+
+
+def test_cross_process_submit_lock_creates_one_paid_task():
+    tmpdir = Path(tempfile.mkdtemp(prefix="pr_a_process_lock_"))
+    print(f"\n[case 19] subprocess callers share the filesystem lock, tmpdir={tmpdir}")
+    try:
+        worker = r'''
+import json
+import os
+import sys
+import time
+from pathlib import Path
+
+os.environ.setdefault("WERYAI_API_KEY", "test_dummy")
+os.environ.setdefault("TG_BOT_TOKEN", "test_dummy")
+os.environ.setdefault("TG_CHAT_ID", "test_dummy")
+sys.argv = ["lock_worker.py", "test_topic_pr_a", "h", "--adsd"]
+sys.path.insert(0, sys.argv_original_root)
+import run_adr_v8 as adr
+
+adr.OUTPUT_DIR = Path(sys.argv_original_output)
+post_log = adr.OUTPUT_DIR / "paid_posts.log"
+
+def fake_post(*_args, **_kwargs):
+    with post_log.open("a", encoding="utf-8") as handle:
+        handle.write(str(os.getpid()) + "\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    time.sleep(0.25)
+    return {"data": {"task_id": "cross-process-paid-task"}}
+
+adr.req_post = fake_post
+result = adr._submit_lip_sync_task_transaction(
+    "merged:0_1",
+    [0, 1],
+    {"model": "WERYDANCE", "images": ["offline"], "prompt": "lock", "duration": 4},
+    model="WERYDANCE",
+    metadata={"mode": "merged-a-group", "group_indices": [0, 1]},
+)
+print(json.dumps({
+    "task_id": result.get("task_id"),
+    "conflict_key": result.get("conflict_key"),
+}))
+'''
+        launch_code = (
+            "import runpy,sys; "
+            f"sys.argv_original_root={str(ROOT)!r}; "
+            f"sys.argv_original_output={str(tmpdir)!r}; "
+            f"exec({worker!r})"
+        )
+        env = os.environ.copy()
+        env.update({
+            "WERYAI_API_KEY": "test_dummy",
+            "TG_BOT_TOKEN": "test_dummy",
+            "TG_CHAT_ID": "test_dummy",
+        })
+        procs = [
+            subprocess.Popen(
+                [sys.executable, "-c", launch_code],
+                cwd=ROOT,
+                env=env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            for _ in range(2)
+        ]
+        completed = [proc.communicate(timeout=30) for proc in procs]
+        assert all(proc.returncode == 0 for proc in procs), completed
+        results = [json.loads(stdout.strip().splitlines()[-1]) for stdout, _ in completed]
+        post_lines = (tmpdir / "paid_posts.log").read_text(encoding="utf-8").splitlines()
+        assert len(post_lines) == 1, post_lines
+        assert sum(result.get("task_id") == "cross-process-paid-task" for result in results) == 1
+        assert sum(result.get("conflict_key") == "merged:0_1" for result in results) == 1
+        print("  two subprocesses produced one POST and one cached conflict")
+    finally:
+        print(f"  tmpdir kept: {tmpdir}")
+
+
+def test_conditional_cache_delete_rejects_aba_replacement():
+    tmpdir = Path(tempfile.mkdtemp(prefix="pr_a_aba_delete_"))
+    print(f"\n[case 20] expected task_id prevents ABA cache deletion, tmpdir={tmpdir}")
+    try:
+        adr.OUTPUT_DIR = tmpdir
+        adr._save_lip_sync_task("0", "new-paid-task", model="WERYDANCE")
+
+        removed = adr._remove_lip_sync_task("0", expected_task_id="old-paid-task")
+
+        assert removed is False
+        assert adr._load_lip_sync_tasks()["0"]["task_id"] == "new-paid-task"
+        assert adr._remove_lip_sync_task("0", expected_task_id="new-paid-task") is True
+        assert "0" not in adr._load_lip_sync_tasks()
+        print("  stale cleanup could not delete a replacement task")
+    finally:
+        print(f"  tmpdir kept: {tmpdir}")
+
+
+def test_single_postprocess_failure_keeps_paid_task_for_local_retry():
+    tmpdir = Path(tempfile.mkdtemp(prefix="pr_a_single_local_retry_"))
+    print(f"\n[case 21] single-turn local failure keeps task and task-bound raw, tmpdir={tmpdir}")
+    original_urlretrieve = __import__("urllib.request", fromlist=["request"]).urlretrieve
+    original_postprocess = adr._postprocess_lip_sync_segment
+    try:
+        remote_raw = tmpdir / "remote.mp4"
+        _make_fake_video(remote_raw, 1.0)
+        adr.OUTPUT_DIR = tmpdir
+        adr.req_get = MagicMock(return_value={
+            "data": {"task_status": "succeed", "videos": [str(remote_raw)]}
+        })
+        adr._extract_video_url = lambda _data: str(remote_raw)
+
+        import urllib.request
+
+        def fake_urlretrieve(_url, dest):
+            shutil.copy(remote_raw, dest)
+            return dest, None
+
+        urllib.request.urlretrieve = fake_urlretrieve
+        adr._postprocess_lip_sync_segment = MagicMock(return_value=False)
+        adr._save_lip_sync_task("0", "paid-local-retry", model="WERYDANCE")
+        scene = {
+            "speaker": "test",
+            "dialogue_audio_mp3": str(tmpdir / "missing-is-ok.wav"),
+            "vid_path": str(tmpdir / "seg_0.mp4"),
+        }
+
+        first = adr._lip_sync_poll_download_and_process(0, "paid-local-retry", scene, 1.0)
+        first_get_count = adr.req_get.call_count
+        second = adr._lip_sync_poll_download_and_process(0, "paid-local-retry", scene, 1.0)
+
+        assert first[0] is False and second[0] is False
+        assert first[1].get("local_retryable") is True
+        assert second[1].get("local_retryable") is True
+        assert adr.req_get.call_count == first_get_count + 1
+        assert adr._load_lip_sync_tasks()["0"]["task_id"] == "paid-local-retry"
+        assert Path(first[1]["raw_video_path"]) == Path(second[1]["raw_video_path"])
+        expected_hash = __import__("hashlib").sha256(b"paid-local-retry").hexdigest()[:12]
+        assert expected_hash in Path(first[1]["raw_video_path"]).name
+        assert Path(first[1]["raw_video_path"]).exists()
+        print("  local retry preserved task cache and reused task-bound raw video")
+    finally:
+        import urllib.request
+        urllib.request.urlretrieve = original_urlretrieve
+        adr._postprocess_lip_sync_segment = original_postprocess
+        print(f"  tmpdir kept: {tmpdir}")
+
+
 def main():
     print("=== PR-A merged_a unit test ===")
     test_two_turn_group_basic()
@@ -715,7 +897,11 @@ def main():
     test_group_and_single_submit_share_overlap_transaction()
     test_submit_exception_is_unknown_and_not_retried()
     test_submission_reservation_is_not_polled_as_remote_task()
-    print("\n=== 17/17 PASSED ===")
+    test_submit_without_task_id_remains_unknown_and_blocks_resubmit()
+    test_cross_process_submit_lock_creates_one_paid_task()
+    test_conditional_cache_delete_rejects_aba_replacement()
+    test_single_postprocess_failure_keeps_paid_task_for_local_retry()
+    print("\n=== 21/21 PASSED ===")
 
 
 if __name__ == "__main__":
