@@ -11635,6 +11635,18 @@ def _mtv_generate_visual_segments(plan: dict, song_path: str, singer: str, singe
                     _mtv_normalize_segment_duration(scene, float(scene.get("vid_duration") or scene.get("dur") or 0.0))
                     scene["mtv_motion_path"] = "song-audio-lip-sync"
                     continue
+                if info.get("timed_out_or_reusable"):
+                    scene["mtv_motion_path"] = "song-audio-lip-sync-pending"
+                    log(
+                        f"MTV lip-sync 未决 scene {i+1}: task_id={info.get('task_id')}，"
+                        "停止 i2v/t2v 回退，避免重复提交付费任务"
+                    )
+                    if not _mtv_static_fallback_segment(
+                        scene,
+                        float(scene.get("vid_duration") or scene.get("dur") or 0.0),
+                    ):
+                        log(f"MTV lip-sync 未决 scene {i+1}: 本地静帧占位生成失败")
+                    continue
                 log(f"MTV lip-sync 失败 scene {i+1}: {info.get('reason')}")
             except Exception as e:
                 lip_records.append({"turn": i + 1, "pass": False, "reason": str(e), "mode": "mtv_song_audio_lip_sync"})
@@ -12013,11 +12025,29 @@ def _mtv_lip_sync_segment(idx: int, scene: dict, audio_path: str, target_dur: fl
         info.update({"pass": False, "reason": "missing_audio_slice"})
         return False, info
     try:
-        image_url = _upload_to_weryai(scene["img_path"])
-        audio_url = _upload_to_weryai(audio_path)
         scene["_almighty_reference_audio"] = audio_path
         scene["_almighty_reference_audio_role"] = "mtv_song_vocal_slice"
         scene["_almighty_audio_dub_attempt"] = False
+        cache_key = _mtv_lip_sync_task_key(idx)
+        existing_task = _load_lip_sync_tasks().get(cache_key)
+        if existing_task:
+            ok, poll_info = _lip_sync_poll_download_and_process(
+                idx,
+                existing_task["task_id"],
+                scene,
+                float(target_dur or 0.0),
+                task_cache_key=cache_key,
+            )
+            poll_info.update({
+                "interface": existing_task.get("interface"),
+                "model": existing_task.get("model"),
+                "mode": "mtv_song_audio_lip_sync",
+                "resumed_task": True,
+            })
+            poll_info["timed_out_or_reusable"] = cache_key in _load_lip_sync_tasks()
+            return ok, poll_info
+        image_url = _upload_to_weryai(scene["img_path"])
+        audio_url = _upload_to_weryai(audio_path)
         lyric = re.sub(r"\s+", " ", str(scene.get("text") or "")).strip()[:180]
         prompt = (
             "Chinese cinematic music video lead singer performance. "
@@ -12059,13 +12089,27 @@ def _mtv_lip_sync_segment(idx: int, scene: dict, audio_path: str, target_dur: fl
         if not task_id:
             info.update({"pass": False, "reason": "submit_without_task_id", "response": response})
             return False, info
-        ok, poll_info = _lip_sync_poll_download_and_process(idx, task_id, scene, float(target_dur or 0.0))
+        _save_lip_sync_task(
+            cache_key,
+            task_id,
+            model=ALMIGHTY_MODEL,
+            mode="mtv-song-audio-lip-sync",
+            generate_audio="false",
+        )
+        ok, poll_info = _lip_sync_poll_download_and_process(
+            idx,
+            task_id,
+            scene,
+            float(target_dur or 0.0),
+            task_cache_key=cache_key,
+        )
         poll_info.update({
             "interface": "almighty-reference-to-video",
             "model": ALMIGHTY_MODEL,
             "mode": "mtv_song_audio_lip_sync",
             "submit_duration": api_dur,
         })
+        poll_info["timed_out_or_reusable"] = cache_key in _load_lip_sync_tasks()
         return ok, poll_info
     except Exception as e:
         info.update({"pass": False, "reason": str(e)})
@@ -12913,8 +12957,26 @@ def _load_lip_sync_tasks() -> dict:
     )
 
 
+def _mtv_lip_sync_task_key(idx: int) -> str:
+    return f"mtv:{idx}"
+
+
+def _merged_lip_sync_task_key(group: list[int]) -> str:
+    return "merged:" + "_".join(str(idx) for idx in group)
+
+
+def _find_merged_lip_sync_task(idx: int) -> tuple[str, dict] | None:
+    for key, record in _load_lip_sync_tasks().items():
+        if record.get("mode") != "merged-a-group":
+            continue
+        group_indices = record.get("group_indices") or []
+        if str(idx) in {str(group_idx) for group_idx in group_indices}:
+            return key, record
+    return None
+
+
 def _save_lip_sync_task(
-    idx: int,
+    idx: object,
     task_id: str,
     *,
     model: str,
@@ -12932,7 +12994,7 @@ def _save_lip_sync_task(
         _lip_sync_tasks_file().write_text(json.dumps(tasks, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
-def _remove_lip_sync_task(idx: int):
+def _remove_lip_sync_task(idx: object):
     with _lip_sync_tasks_lock:
         tasks = _load_lip_sync_tasks()
         tasks.pop(str(idx), None)
@@ -16847,7 +16909,14 @@ def _select_voice_asset_reference(scene: dict, *, mode: str = "adsd", ref_offset
     return None
 
 
-def _lip_sync_poll_download_and_process(idx: int, task_id: str, scene: dict, target_dur: float) -> tuple[bool, dict]:
+def _lip_sync_poll_download_and_process(
+    idx: int,
+    task_id: str,
+    scene: dict,
+    target_dur: float,
+    task_cache_key: object | None = None,
+) -> tuple[bool, dict]:
+    cache_key = idx if task_cache_key is None else task_cache_key
     caption_info = _werydance_caption_request(scene)
     info = {
         "turn": idx + 1,
@@ -16874,6 +16943,7 @@ def _lip_sync_poll_download_and_process(idx: int, task_id: str, scene: dict, tar
                 vid_url = _extract_video_url(data)
                 if not vid_url:
                     info.update({"pass": False, "reason": "succeed_without_video_url"})
+                    _remove_lip_sync_task(cache_key)
                     return False, info
                 raw_path = str(OUTPUT_DIR / f"lip_sync_raw_{idx}.mp4")
                 urllib.request.urlretrieve(vid_url, raw_path)
@@ -16897,7 +16967,7 @@ def _lip_sync_poll_download_and_process(idx: int, task_id: str, scene: dict, tar
                     "needs_master_audio_mux": not audio_dub,
                     "generated_audio_from_prompt_dialogue": audio_dub,
                 })
-                _remove_lip_sync_task(idx)
+                _remove_lip_sync_task(cache_key)
                 return ok, info
             if st == "failed":
                 # 2026-05-22 抽 msg 入 reason 方便诊断（之前看不到具体审核拦截原因）
@@ -16905,7 +16975,7 @@ def _lip_sync_poll_download_and_process(idx: int, task_id: str, scene: dict, tar
                 fail_reason = f"task_failed: {fail_msg}" if fail_msg else "task_failed"
                 info.update({"pass": False, "reason": fail_reason, "response": data})
                 log(f"[lip-sync {idx}] task_failed msg: {fail_msg or '(empty)'}")
-                _remove_lip_sync_task(idx)
+                _remove_lip_sync_task(cache_key)
                 return False, info
         except Exception as e:
             if iteration in (0, 12, 60, 120):
@@ -16964,6 +17034,7 @@ def _lip_sync_one_group(group: list[int], script: list[dict], target_durs: list[
     total_dur = sum(durs)
     speaker = (scenes[0].get("speaker") or "").strip()
     group_label = f"group_{idxs[0]}_{idxs[-1]}"
+    cache_key = _merged_lip_sync_task_key(idxs)
 
     # 先粗筛 target_dur, 后面拼接后再用实际 audio dur 二次校验
     if total_dur > 15.0:
@@ -17022,6 +17093,8 @@ def _lip_sync_one_group(group: list[int], script: list[dict], target_durs: list[
         s["_almighty_voice_asset_reference"] = voice_asset_ref
         s["_almighty_audio_dub_attempt"] = True
 
+    existing_task = _load_lip_sync_tasks().get(cache_key)
+    task_id = existing_task["task_id"] if existing_task else None
     try:
         image_url = _upload_to_weryai(base_panel)
         alt_panel_urls: list[str] = []
@@ -17076,12 +17149,27 @@ def _lip_sync_one_group(group: list[int], script: list[dict], target_durs: list[
             "resolution": "720p",
             "generate_audio": "true",  # codex High 2 fix: 与单 turn audio_dub variants 一致 (true 才有视频音轨, 实际是 audio_dub 用 ref audio)
         }
-        _wait_motion_submit_slot(f"PR-A {group_label}")
-        r = req_post("/generation/almighty-reference-to-video", payload, timeout=30)
-        task_id = r.get("data", {}).get("task_id") or (r.get("data", {}).get("task_ids") or [None])[0]
-        if not task_id:
-            log(f"PR-A {group_label}: submit 无 task_id: {r}")
-            return idxs, [False] * g_size, [{"turn": i + 1, "pass": False, "reason": "submit_no_task_id"} for i in idxs]
+        if existing_task:
+            log(
+                f"PR-A {group_label}: resume task_id={task_id} "
+                f"model={existing_task.get('model') or 'legacy-unknown'}"
+            )
+        else:
+            _wait_motion_submit_slot(f"PR-A {group_label}")
+            r = req_post("/generation/almighty-reference-to-video", payload, timeout=30)
+            task_id = r.get("data", {}).get("task_id") or (r.get("data", {}).get("task_ids") or [None])[0]
+            if not task_id:
+                log(f"PR-A {group_label}: submit 无 task_id: {r}")
+                return idxs, [False] * g_size, [{"turn": i + 1, "pass": False, "reason": "submit_no_task_id"} for i in idxs]
+            _save_lip_sync_task(
+                cache_key,
+                task_id,
+                model=ALMIGHTY_MODEL,
+                mode="merged-a-group",
+                variant="merged_a_group_audio_dub",
+                generate_audio="true",
+                group_indices=idxs,
+            )
     except Exception as e:
         log(f"PR-A {group_label} submit 异常: {e}")
         return idxs, [False] * g_size, [{"turn": i + 1, "pass": False, "reason": f"submit_exception: {e}"} for i in idxs]
@@ -17100,12 +17188,14 @@ def _lip_sync_one_group(group: list[int], script: list[dict], target_durs: list[
                 vid_url = _extract_video_url(data)
                 if not vid_url:
                     log(f"PR-A {group_label}: succeed 但无 video url")
+                    _remove_lip_sync_task(cache_key)
                     return idxs, [False] * g_size, [{"turn": i + 1, "pass": False, "reason": "succeed_without_video_url"} for i in idxs]
                 urllib.request.urlretrieve(vid_url, raw_path)
                 succeed = True
                 break
             if st == "failed":
                 log(f"PR-A {group_label}: task_failed {data.get('msg', '')[:120]}")
+                _remove_lip_sync_task(cache_key)
                 return idxs, [False] * g_size, [{"turn": i + 1, "pass": False, "reason": "group_task_failed"} for i in idxs]
         except Exception as e:
             if iteration in (0, 12, 60, 120):
@@ -17113,13 +17203,25 @@ def _lip_sync_one_group(group: list[int], script: list[dict], target_durs: list[
         time.sleep(5)
 
     if not succeed:
-        return idxs, [False] * g_size, [{"turn": i + 1, "pass": False, "reason": "poll_timeout"} for i in idxs]
+        return idxs, [False] * g_size, [
+            {
+                "turn": i + 1,
+                "task_id": task_id,
+                "pass": False,
+                "reason": "poll_timeout",
+                "timed_out_or_reusable": True,
+                "submit_model": existing_task.get("model") if existing_task else ALMIGHTY_MODEL,
+                "merged_a_group": group_label,
+            }
+            for i in idxs
+        ]
 
     # ffmpeg split → seg_i.mp4 for each i in group
     # codex High 1 fix: 用实际 audio dur 作切分边界, 不用 target_dur
     out_paths = [scenes[k]["vid_path"] for k in range(g_size)]
     if not _split_lip_sync_raw_by_durations(raw_path, actual_audio_durs, out_paths):
         log(f"PR-A {group_label}: split 失败, 回退到逐 turn (调用方处理)")
+        _remove_lip_sync_task(cache_key)
         return idxs, [False] * g_size, [{"turn": i + 1, "pass": False, "reason": "split_failed"} for i in idxs]
 
     # 每个切分段走 _postprocess_audio_dub_segment retiming
@@ -17148,6 +17250,7 @@ def _lip_sync_one_group(group: list[int], script: list[dict], target_durs: list[
         })
         oks.append(ok)
     saved_api_calls = g_size - 1
+    _remove_lip_sync_task(cache_key)
     log(f"PR-A {group_label}: {sum(oks)}/{g_size} turn 切分 + postprocess ok, 节省 {saved_api_calls} 次 API")
     return idxs, oks, infos
 
@@ -17190,6 +17293,18 @@ def _lip_sync_one_scene(idx: int, scene: dict, target_dur: float, aspect_ratio: 
     manual_repair_turns = _load_lips_change_requested_turns()
     repair_requested = ADSD_LIPS_CHANGE_REPAIR and ((idx + 1) in manual_repair_turns)
     repair_all = ADSD_LIPS_CHANGE_REPAIR and ADSD_LIPS_CHANGE_ALL
+    merged_task = _find_merged_lip_sync_task(idx)
+    if merged_task:
+        merged_key, merged_record = merged_task
+        return idx, False, {
+            "turn": idx + 1,
+            "task_id": merged_record["task_id"],
+            "pass": False,
+            "reason": "merged_group_task_pending",
+            "timed_out_or_reusable": True,
+            "submit_model": merged_record.get("model"),
+            "merged_task_key": merged_key,
+        }
     existing_task = _load_lip_sync_tasks().get(str(idx))
     if existing_task:
         ok, info = _resume_lip_sync_task(idx, existing_task, scene, target_dur)
@@ -17698,6 +17813,13 @@ def step66_adsd_lip_sync(script: list[dict]):
                         # PR-A group 失败回退: 把组内失败的 turn 排队走单 turn 路径
                         fallback_idxs = [i for i, ok_ in zip(idxs_out, oks) if not ok_]
                         if fallback_idxs:
+                            group_unresolved = any(info.get("timed_out_or_reusable") for info in infos)
+                            if group_unresolved:
+                                tg(
+                                    f"⏳ PR-A group 未决 ({len(fallback_idxs)}/{len(idxs_out)})，"
+                                    "保留 task_id，停止逐 turn 回退"
+                                )
+                                continue
                             tg(f"⚠️ PR-A group 部分失败 ({len(fallback_idxs)}/{len(idxs_out)}), 回退到逐 turn")
                             for fi in fallback_idxs:
                                 idx2, ok2, info2 = _lip_sync_one_scene(fi, script[fi], target_durs[fi], aspect)

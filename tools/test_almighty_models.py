@@ -396,12 +396,35 @@ assert grid_submits == [adr.ALMIGHTY_MODEL]
 assert grid_qa["records"][0]["timed_out_or_reusable"] is True
 assert adr._load_grid_multiref_tasks()["01_02"]["task_id"] == "grid-pending"
 
+# MTV tasks use their own cache namespace and resume without another submit.
+audio_path = root / "mtv.wav"
+audio_path.write_bytes(b"audio")
+adr._upload_to_weryai = lambda path: "https://example.invalid/ref"
+mtv_submits = []
+adr.req_post = lambda *args, **kwargs: mtv_submits.append(args[1]["model"]) or {"data": {"task_id": "mtv-pending"}}
+adr._lip_sync_poll_download_and_process = lambda *args, **kwargs: (
+    False,
+    {"pass": False, "reason": "poll_timeout", "task_id": args[1]},
+)
+mtv_scene = {
+    "img_path": "unused.png",
+    "vid_path": str(root / "mtv.mp4"),
+    "text": "lyric",
+}
+first_mtv = adr._mtv_lip_sync_segment(3, mtv_scene, str(audio_path), 5.0)
+second_mtv = adr._mtv_lip_sync_segment(3, mtv_scene, str(audio_path), 5.0)
+assert first_mtv[1]["timed_out_or_reusable"] is True
+assert second_mtv[1]["resumed_task"] is True
+assert mtv_submits == [adr.ALMIGHTY_MODEL]
+assert adr._load_lip_sync_tasks()[adr._mtv_lip_sync_task_key(3)]["task_id"] == "mtv-pending"
+
 print(json.dumps({
     "legacy": 4,
     "structured": 4,
     "fast_resume_model": info["submit_model"],
     "lip_timeout_submits": len(lip_submits),
     "grid_timeout_submits": len(grid_submits),
+    "mtv_timeout_submits": len(mtv_submits),
 }))
 '''
     result = subprocess.run(
@@ -420,6 +443,7 @@ print(json.dumps({
         "fast_resume_model": "SEEDANCE_2_0_FAST_OS",
         "lip_timeout_submits": 1,
         "grid_timeout_submits": 1,
+        "mtv_timeout_submits": 1,
     }
 
 

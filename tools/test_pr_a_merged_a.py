@@ -248,13 +248,101 @@ def test_three_turn_group():
         print(f"  tmpdir kept: {tmpdir}")
 
 
+def test_group_timeout_resumes_without_resubmit():
+    tmpdir = Path(tempfile.mkdtemp(prefix="pr_a_resume_"))
+    print(f"\n[case 5] group timeout resumes without resubmit, tmpdir={tmpdir}")
+    try:
+        audios = []
+        panels = []
+        for i in range(2):
+            audio = tmpdir / f"turn_{i}.wav"
+            panel = tmpdir / f"panel_{i}.png"
+            _make_fake_audio(audio, 3.0)
+            _make_fake_image(panel)
+            audios.append(audio)
+            panels.append(panel)
+        fake_raw = tmpdir / "unused.mp4"
+        _make_fake_video(fake_raw, 6.0)
+        submit_calls = _patch_adr_io(tmpdir, fake_raw)
+        adr.time.sleep = lambda *_args, **_kwargs: None
+        adr.req_get = MagicMock(return_value={"data": {"task_status": "processing"}})
+        script = [
+            {
+                "speaker": "罗永浩",
+                "text": f"pending {i}",
+                "dialogue_audio_mp3": str(audios[i]),
+                "img_path": str(panels[i]),
+                "vid_path": str(tmpdir / f"seg_{i}.mp4"),
+                "needs_lip_sync": True,
+                "dialogue_turn": i + 1,
+            }
+            for i in range(2)
+        ]
+
+        first = adr._lip_sync_one_group([0, 1], script, [3.0, 3.0], "16:9")
+        second = adr._lip_sync_one_group([0, 1], script, [3.0, 3.0], "16:9")
+
+        assert submit_calls.call_count == 1, "resume must not create a second paid task"
+        assert not any(first[1]) and not any(second[1])
+        assert all(info.get("timed_out_or_reusable") for info in first[2] + second[2])
+        cached = adr._load_lip_sync_tasks()[adr._merged_lip_sync_task_key([0, 1])]
+        assert cached["task_id"] == "fake_task_123"
+        assert adr._find_merged_lip_sync_task(0) is not None
+        print("  ✅ timeout task cached and resumed with one submit")
+    finally:
+        print(f"  tmpdir kept: {tmpdir}")
+
+
+def test_terminal_success_without_url_releases_cache():
+    tmpdir = Path(tempfile.mkdtemp(prefix="pr_a_terminal_"))
+    print(f"\n[case 6] terminal success without URL releases cache, tmpdir={tmpdir}")
+    try:
+        audios = []
+        panels = []
+        for i in range(2):
+            audio = tmpdir / f"turn_{i}.wav"
+            panel = tmpdir / f"panel_{i}.png"
+            _make_fake_audio(audio, 3.0)
+            _make_fake_image(panel)
+            audios.append(audio)
+            panels.append(panel)
+        fake_raw = tmpdir / "unused.mp4"
+        _make_fake_video(fake_raw, 6.0)
+        _patch_adr_io(tmpdir, fake_raw)
+        adr.req_get = MagicMock(return_value={"data": {"task_status": "succeed"}})
+        adr._extract_video_url = lambda data: None
+        script = [
+            {
+                "speaker": "罗永浩",
+                "text": f"terminal {i}",
+                "dialogue_audio_mp3": str(audios[i]),
+                "img_path": str(panels[i]),
+                "vid_path": str(tmpdir / f"seg_{i}.mp4"),
+                "needs_lip_sync": True,
+                "dialogue_turn": i + 1,
+            }
+            for i in range(2)
+        ]
+
+        result = adr._lip_sync_one_group([0, 1], script, [3.0, 3.0], "16:9")
+
+        assert not any(result[1])
+        assert all(info.get("reason") == "succeed_without_video_url" for info in result[2])
+        assert adr._merged_lip_sync_task_key([0, 1]) not in adr._load_lip_sync_tasks()
+        print("  terminal unusable task removed from cache")
+    finally:
+        print(f"  tmpdir kept: {tmpdir}")
+
+
 def main():
     print("=== PR-A merged_a unit test ===")
     test_two_turn_group_basic()
     test_group_exceeds_15s()
     test_missing_turn_audio()
     test_three_turn_group()
-    print("\n=== 4/4 PASSED ===")
+    test_group_timeout_resumes_without_resubmit()
+    test_terminal_success_without_url_releases_cache()
+    print("\n=== 6/6 PASSED ===")
 
 
 if __name__ == "__main__":
