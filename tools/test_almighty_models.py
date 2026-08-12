@@ -274,6 +274,7 @@ def test_resume_cache_contract() -> None:
 import json
 from pathlib import Path
 import tempfile
+from unittest.mock import patch
 import run_adr_v8 as adr
 
 root = Path(tempfile.mkdtemp(prefix="adr_resume_cache_"))
@@ -313,6 +314,23 @@ assert fast_record["model"] == "SEEDANCE_2_0_FAST_OS"
 assert fast_record["interface"] == "almighty-reference-to-video"
 assert adr._load_grid_multiref_tasks()["05_08"]["model"] == "SEEDANCE_2_0_OS"
 assert adr._load_previs_page_tasks()["05_08"]["model"] == "WERYDANCE"
+
+# A failed replace must leave the previous paid-task cache intact and parseable.
+before_atomic_failure = adr._load_motion_tasks()
+with patch.object(adr.os, "replace", side_effect=OSError("simulated replace failure")):
+    try:
+        adr._save_motion_task(
+            9,
+            "must-not-replace-cache",
+            model="WERYDANCE",
+            interface="almighty-reference-to-video",
+        )
+    except OSError as exc:
+        assert "simulated replace failure" in str(exc)
+    else:
+        raise AssertionError("atomic cache write failure must propagate")
+assert adr._load_motion_tasks() == before_atomic_failure
+assert not list(root.glob(".motion_tasks.json.*.tmp"))
 
 adr._lip_sync_poll_download_and_process = lambda *args, **kwargs: (True, {"pass": True})
 scene = {}

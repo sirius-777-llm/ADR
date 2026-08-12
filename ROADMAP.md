@@ -3,7 +3,7 @@
 > ADR (Automated Documentary Rendering V8) 项目 backlog · 跨 session 持久化
 > 任何 Claude session 启动时优先查这个文件 + memory/project_adr_backlog.md
 
-Last updated: 2026-05-30
+Last updated: 2026-08-12
 
 ---
 
@@ -11,6 +11,7 @@ Last updated: 2026-05-30
 
 | 日期 | PR/改动 | 说明 |
 |------|---------|------|
+| 2026-08-12 | Almighty 海外 Seedance 2.0 接入 | `almighty-reference-to-video` 支持 `WERYDANCE`、`SEEDANCE_2_0_OS`、`SEEDANCE_2_0_FAST_OS`、`SEEDANCE_2_0_MINI_OS`，旧 WeryDance 2.0 值保持兼容；ADR/ADS 通过环境变量选择 Almighty 模型，普通 i2v/t2v 仍固定 `WERYDANCE_2_0`。任务缓存兼容旧字符串并记录真实模型/接口，原子写入，MTV、逐 turn、PR-A 合并组、grid/previs 未决任务均避免重复付费提交。OpenClaw 标准生视频脚本支持四个 Almighty 模型和 `--resume`，旧 VEO 命令不变。离线验收：ADR 模型/缓存 5/5、PR-A 6/6、OpenClaw CLI 9/9、vendor Node 6/6、Python/Node 语法通过；未调用真实生成接口。 |
 | 2026-05-30 | ✅ B69 全本滕王阁序 E2E 跑通 (5 chunk → 5min02s) | 52句/5段[12,12,12,12,4] 真 motion 渲染全成: chunk1-4 全部"提前收割·跳过step10推送"(reap 生效无僵死)、BGM 跨chunk复用、xfade+acrossfade 1s crossfade 跨5段、时长校验 301.8s≈预期301.2s 通过. 单段渲染 chunk1 54min/chunk2 37min/chunk3 54min/chunk4 23min (WERYDANCE 主导). **遗留: `_tg_send_final` 用 curl+官方API sendDocument 推 82MB 失败** (官方 bot 硬限 50MB; 且 macOS LibreSSL curl 上传 bad-record-mac). 手动补救: ffmpeg 压 82MB→28MB(CRF30 720p) + Python requests sendVideo 送达 msg 21684. **待修 B69.3: _tg_send_final 改 requests(非curl) + >48MB 自动压缩后 sendVideo(非 sendDocument)**. ROADMAP B70 "sendDocument≤1900MB" 在官方端点不成立(无本地 Bot API server, 全走 api.telegram.org), 标记勘误 |
 | 2026-05-30 | B69 reap 修 ADR 不退出僵死 (CCP review-code) | **根因**: ADR 干完活(成片+TG推送)后因残留非守护线程+连接池 CLOSE_WAIT **不退出**(实测卡~1h), long_video 的 subprocess.run 死等→流水线僵住 (单跑/bot 无人同步等故未暴露, B69 串行 subprocess 现形). **修**: run_one_chunk 改 `subprocess.Popen + start_new_session=True` + 轮询循环 — 最终 mp4 生成且 ffprobe 有效且大小连续两轮稳定即 `_kill_proc_group`(killpg 连 ADR 派生 ffmpeg/curl 一起杀, 防孤儿) 收割. mp4 在 step9 生成/step10 TG推送前 → 提前收割**顺带跳过 per-chunk TG 推送**(否则 TG 收 5 个残段+SSL重试拖时). 成功判定: reaped 或 exited-有效成片(rc≠0/负被信号也救回). 超时不重试 + 重跑前清 out_dir + out_dir 归属守卫. Codex review-code: 1 High(进程组 killpg)+2 Med(mp4 大小稳定防 race / wait 兜底收割)+2 Low 全修. chunk0(87min成片68.9s)抢救标 done. **实测 resume: chunk0 跳过 + chunk1 经 ADR_CHUNK_BGM_REUSE 复用 chunk0 bgm.mp3 ✓** (BGM 跨chunk复用核心特性首次实跑确认). test 45/45 |
 | 2026-05-30 | B69 E2E 加固 (CCP review-code) | 滕王阁序全文(864字/52句, 古诗文网抓取剥异文注)真渲染 E2E 暴露 + 修: (1) chunk timeout 默认 1h→4h (12-scene grid_multiref+WERYDANCE 重试现实值, 实测 chunk0 撞 1h 被砍); (2) 超时不重试 (同 workload+同 timeout 重跑必再超时, 白烧一个 timeout); (3) 重跑前清空 out_dir 防上次残片污染 ADR; (4) out_dir 归属守卫 `_outdir_belongs` (rmtree 前校验 run_root/out_*, 防篡改 manifest 误删别处, Codex review Med2) + 清理不彻底告警(Med1). **fail-loud 在生产被真实触发并正确中止**(chunk0 失败未吐残缺滕王阁序, 验证 B69 核心安全设计). test_long_video.py 38→45. E2E resume 续跑中 (--timeout 21600 6h/chunk, ~10-15h 过夜) |

@@ -19,6 +19,7 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 import time
 import threading
 import urllib.request
@@ -12917,6 +12918,31 @@ def _load_generation_tasks(path: Path, *, default_interface: str | None = None) 
     return tasks
 
 
+def _atomic_write_json(path: Path, payload: object) -> None:
+    """Replace a JSON cache atomically so an interrupted write preserves the old file."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    serialized = json.dumps(payload, ensure_ascii=False, indent=2)
+    tmp_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as tmp:
+            tmp.write(serialized)
+            tmp.flush()
+            os.fsync(tmp.fileno())
+            tmp_path = Path(tmp.name)
+        os.replace(tmp_path, path)
+        tmp_path = None
+    finally:
+        if tmp_path is not None:
+            tmp_path.unlink(missing_ok=True)
+
+
 def _load_motion_tasks() -> dict:
     # Legacy motion entries can be Almighty, image-to-video, or text-to-video;
     # their endpoint cannot be reconstructed safely, but task_id is pollable.
@@ -12940,14 +12966,14 @@ def _save_motion_task(
             interface=interface,
             **metadata,
         )
-        _motion_tasks_file().write_text(json.dumps(tasks, ensure_ascii=False, indent=2), encoding="utf-8")
+        _atomic_write_json(_motion_tasks_file(), tasks)
 
 
 def _remove_motion_task(idx: int):
     with _motion_tasks_lock:
         tasks = _load_motion_tasks()
         tasks.pop(str(idx), None)
-        _motion_tasks_file().write_text(json.dumps(tasks, ensure_ascii=False, indent=2), encoding="utf-8")
+        _atomic_write_json(_motion_tasks_file(), tasks)
 
 
 def _load_lip_sync_tasks() -> dict:
@@ -12991,14 +13017,14 @@ def _save_lip_sync_task(
             interface=interface,
             **metadata,
         )
-        _lip_sync_tasks_file().write_text(json.dumps(tasks, ensure_ascii=False, indent=2), encoding="utf-8")
+        _atomic_write_json(_lip_sync_tasks_file(), tasks)
 
 
 def _remove_lip_sync_task(idx: object):
     with _lip_sync_tasks_lock:
         tasks = _load_lip_sync_tasks()
         tasks.pop(str(idx), None)
-        _lip_sync_tasks_file().write_text(json.dumps(tasks, ensure_ascii=False, indent=2), encoding="utf-8")
+        _atomic_write_json(_lip_sync_tasks_file(), tasks)
 
 
 def _video_visual_motion_qa(path: str) -> dict:
@@ -14411,7 +14437,7 @@ def _save_grid_multiref_task(
             model=model,
             interface=interface,
         )
-        _grid_multiref_tasks_file().write_text(json.dumps(tasks, ensure_ascii=False, indent=2), encoding="utf-8")
+        _atomic_write_json(_grid_multiref_tasks_file(), tasks)
 
 
 def _save_previs_page_task(
@@ -14428,21 +14454,21 @@ def _save_previs_page_task(
             model=model,
             interface=interface,
         )
-        _previs_page_tasks_file().write_text(json.dumps(tasks, ensure_ascii=False, indent=2), encoding="utf-8")
+        _atomic_write_json(_previs_page_tasks_file(), tasks)
 
 
 def _remove_grid_multiref_task(group_key: str) -> None:
     with _grid_multiref_tasks_lock:
         tasks = _load_grid_multiref_tasks()
         tasks.pop(group_key, None)
-        _grid_multiref_tasks_file().write_text(json.dumps(tasks, ensure_ascii=False, indent=2), encoding="utf-8")
+        _atomic_write_json(_grid_multiref_tasks_file(), tasks)
 
 
 def _remove_previs_page_task(group_key: str) -> None:
     with _previs_page_tasks_lock:
         tasks = _load_previs_page_tasks()
         tasks.pop(group_key, None)
-        _previs_page_tasks_file().write_text(json.dumps(tasks, ensure_ascii=False, indent=2), encoding="utf-8")
+        _atomic_write_json(_previs_page_tasks_file(), tasks)
 
 
 def _poll_video_task_download(task_id: str, out_path: Path, label: str, max_iterations: int = 121) -> tuple[bool, dict]:
