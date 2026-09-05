@@ -1606,6 +1606,48 @@ def _is_llm_rate_limited_error(exc: Exception | str) -> bool:
     )
 
 
+def _is_llm_retryable_server_error(error: object) -> bool:
+    """识别 LLM 网关/上游可重试的 5xx。
+
+    WeryAI 有时以 HTTP 200 包一层业务 ``status=500``，有时直接抛 HTTPError；
+    两种形态都应触发跨模型降级。429 quota 由上面的专用退避逻辑处理，
+    不在这里归类。
+    """
+    status_values: list[object] = []
+    if isinstance(error, dict):
+        status_values.extend(error.get(key) for key in ("status", "status_code", "code"))
+        data = error.get("data")
+        if isinstance(data, dict):
+            status_values.extend(data.get(key) for key in ("status", "status_code", "code"))
+
+    response = getattr(error, "response", None)
+    if response is not None:
+        status_values.append(getattr(response, "status_code", None))
+
+    parsed_statuses: list[int] = []
+    for value in status_values:
+        try:
+            parsed_statuses.append(int(value))
+        except (TypeError, ValueError):
+            pass
+    if parsed_statuses:
+        return any(500 <= status < 600 for status in parsed_statuses)
+
+    if isinstance(error, dict):
+        text = json.dumps(error, ensure_ascii=False).lower()
+    else:
+        text = str(error).lower()
+    return (
+        re.search(r"(?:\bhttp(?:\s+status)?\b|[\"']?status(?:_code)?[\"']?)\s*[:=]?\s*5\d\d\b", text) is not None
+        or "server error" in text
+        or "internal server error" in text
+        or "bad gateway" in text
+        or "service unavailable" in text
+        or "gateway timeout" in text
+        or "抱歉，我没听清楚您说的话" in text
+    )
+
+
 # GPT_IMAGE_2 画质修正后缀（实测能有效消除颗粒感/脏感）
 # 大哥 2026-05-20 给的固定 suffix，避免逐处 prompt 都改
 # B87 (2026-06-04): 这条不再无差别碾压——它只是 clean 档。纹理由 LLM 美术总监
@@ -2077,11 +2119,14 @@ def tier_chat(tier: str, system: str, user: str, max_tokens: int = 4096, timeout
 
 
 def chat(model: str, system: str, user: str, max_tokens: int = 4096, timeout: int = 180) -> str:
-    """调用 WeryAI Chat Completion，返回回复文本。3 次重试防瞬断/限流/无 choices。
+    """调用 WeryAI Chat Completion，返回回复文本。有限重试防瞬断/限流/无 choices。
     timeout 默认 180s，对慢推理模型（GPT-5.4 / Claude Opus / DeepSeek-R1）需传更大值如 600s。
 
     B44 (2026-05-28): 识别 429 quota 用 _LLM_RATE_LIMIT_BACKOFF 30s/60s/120s 退避
     (vs 通用 3s/6s 线性). Flash Lite quota 实测每 run 多次触发, 通用退避救不了.
+
+    2026-09-05 hotfix: 业务 status=5xx / HTTP 5xx 时立即切 ADR_CHAT_FALLBACK_MODEL。
+    常规总尝试预算仍为 3；若最后一次才发现需降级，额外保证一次 fallback 实际调用。
     """
     payload = {
         "model": model,
@@ -2092,8 +2137,16 @@ def chat(model: str, system: str, user: str, max_tokens: int = 4096, timeout: in
         "max_tokens": max_tokens,
         "temperature": 0.85,
     }
+    fallback_model = os.environ.get("ADR_CHAT_FALLBACK_MODEL", "GEMINI_25_FLASH").strip() or "GEMINI_25_FLASH"
     last_err = None
-    for attempt in range(3):
+    models_tried: list[str] = []
+    attempt = 0
+    max_attempts = 3
+    while attempt < max_attempts:
+        attempt += 1
+        active_model = str(payload["model"])
+        if not models_tried or models_tried[-1] != active_model:
+            models_tried.append(active_model)
         is_quota_err = False
         try:
             resp = req_post("/chat/completions", payload, timeout=timeout)
@@ -2104,35 +2157,48 @@ def chat(model: str, system: str, user: str, max_tokens: int = 4096, timeout: in
             is_quota_err = _is_llm_rate_limited_error(full_resp_text)
             # B80.1 (2026-06-03): 模型被 weryai 无预警下线/改名 (status 1006 / "model does not exist") → 自动
             # fallback 到已验证可用模型, 不让一次模型变动崩掉整管线 (B80 P0: GEMINI_3_1_FLASH_LITE 突然 1006 致全崩)。
-            _fb = os.environ.get("ADR_CHAT_FALLBACK_MODEL", "GEMINI_25_FLASH")
             _ltxt = full_resp_text.lower()
-            if payload["model"] != _fb and ('"status": 1006' in full_resp_text
+            fallback_reason = None
+            if active_model != fallback_model and ('"status": 1006' in full_resp_text
                     or "does not exist" in _ltxt or "not model" in _ltxt):
-                log(f"[chat/{model}] ⚠️ B80.1 模型不可用(1006/not model), 自动 fallback → {_fb}")
-                payload["model"] = _fb
+                fallback_reason = "B80.1 模型不可用(1006/not model)"
+            elif active_model != fallback_model and not is_quota_err and _is_llm_retryable_server_error(resp):
+                fallback_reason = "上游 5xx"
+            if fallback_reason:
+                log(f"[chat/{active_model}] ⚠️ {fallback_reason}, 自动 fallback → {fallback_model}")
+                payload["model"] = fallback_model
+                if attempt >= max_attempts:
+                    max_attempts += 1  # 不允许在最后一次只改 model 却没有实际调用机会
                 continue  # 立即用 fallback 重试
             last_err = f"响应无 choices: {full_resp_text[:200]}"
-            log(f"[chat/{model}] 尝试 {attempt+1}/3 响应异常: {last_err}" + (" [B44 429]" if is_quota_err else ""))
+            log(f"[chat/{active_model}] 尝试 {attempt}/{max_attempts} 响应异常: {last_err}" + (" [B44 429]" if is_quota_err else ""))
         except Exception as e:
             last_err = f"{type(e).__name__}: {e}"
             is_quota_err = _is_llm_rate_limited_error(e)
-            _fb = os.environ.get("ADR_CHAT_FALLBACK_MODEL", "GEMINI_25_FLASH")
             _etxt = str(e).lower()
-            if payload["model"] != _fb and ('"status": 1006' in str(e)  # B80.1/codex Med2: 1006 抛异常时也 fallback
+            fallback_reason = None
+            if active_model != fallback_model and ('"status": 1006' in str(e)  # B80.1/codex Med2: 1006 抛异常时也 fallback
                     or "does not exist" in _etxt or "not model" in _etxt):
-                log(f"[chat/{model}] ⚠️ B80.1 模型不可用(异常 1006/not model), 自动 fallback → {_fb}")
-                payload["model"] = _fb
+                fallback_reason = "B80.1 模型不可用(异常 1006/not model)"
+            elif active_model != fallback_model and not is_quota_err and _is_llm_retryable_server_error(e):
+                fallback_reason = "上游 HTTP 5xx"
+            if fallback_reason:
+                log(f"[chat/{active_model}] ⚠️ {fallback_reason}, 自动 fallback → {fallback_model}")
+                payload["model"] = fallback_model
+                if attempt >= max_attempts:
+                    max_attempts += 1
                 continue
-            log(f"[chat/{model}] 尝试 {attempt+1}/3 异常: {last_err}" + (" [B44 429]" if is_quota_err else ""))
-        if attempt < 2:
+            log(f"[chat/{active_model}] 尝试 {attempt}/{max_attempts} 异常: {last_err}" + (" [B44 429]" if is_quota_err else ""))
+        if attempt < max_attempts:
             # B44: 429 quota 用长退避 30/60/120s, 普通瞬断仍 3s/6s
             if is_quota_err:
-                wait_s = _LLM_RATE_LIMIT_BACKOFF * (2 ** attempt)  # 30/60/120s
-                log(f"[chat/{model}] B44 429 quota 退避 {wait_s:.0f}s")
+                wait_s = _LLM_RATE_LIMIT_BACKOFF * (2 ** (attempt - 1))  # 30/60/120s
+                log(f"[chat/{active_model}] B44 429 quota 退避 {wait_s:.0f}s")
             else:
-                wait_s = 3 * (attempt + 1)
+                wait_s = 3 * attempt
             time.sleep(wait_s)
-    raise RuntimeError(f"chat({model}) 3 次重试全失败: {last_err}")
+    route = " → ".join(models_tried)
+    raise RuntimeError(f"chat({model}) {attempt} 次尝试全失败 (模型链: {route}): {last_err}")
 
 
 def pick_image_model(aspect: str) -> tuple[str, str, dict]:

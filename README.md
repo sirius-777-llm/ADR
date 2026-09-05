@@ -36,6 +36,7 @@ ADR 是一套自动纪录片生成管线。输入一个主题或带时间戳的�
 | Motion action storyboard | 开 | 每个分镜生成动作起点、过程、终点，避免人物发呆 |
 | Motion bridge refs | 开 | 为关键镜头补终点参考图，提升动作幅度 |
 | WeryDance 字幕 | 开 | 默认交给 WeryDance 生成字幕，ASS 硬字幕作为兜底 |
+| LLM 跨模型容错 | 开 | 主模型遇到 5xx 或模型下线时自动切备用模型，429 仍按原模型退避 |
 | 音色资产库 | 开 | 男声默认罗翔，女声默认 BY2，可用环境变量覆盖 |
 | 严格音色锁定 | 开 | Motion prompt 会显式锁定声音资产和人物性别 |
 | Telegram 进度 | dashboard | TG 只保留一条可编辑进度面板，显示进度条、当前阶段和最近日志 |
@@ -120,6 +121,7 @@ python3 run_adr_v8.py "唐宋八大家" h --no-motion          # 罕用：HADR �
 | `--singer <name>` | MTV 主唱；命中人物库则复用，否则自动创建人物卡 |
 | `--bgm-only` | 无旁白，仅画面、字幕、BGM |
 | `--skip-approval` | 跳过 Telegram 图片审批 |
+| `--with-approval` | 强制开启 Telegram 图片审批（默认关闭） |
 | `--speaker <id:name>` | 指定 Podcast 音色 |
 
 ## 关键环境变量
@@ -138,6 +140,7 @@ python3 run_adr_v8.py "唐宋八大家" h --no-motion          # 罕用：HADR �
 | `ADR_DEFAULT_FEMALE_VOICE_ASSET` | `external_by2_e7gn_001` | 默认女声音色资产 |
 | `ADR_DEFAULT_VOICE_ASSET` | 空 | 全局强制默认音色资产 |
 | `ADR_MOTION_VOICE_STRICT_LOCK` | `1` | 严格锁定音色和人物性别 |
+| `ADR_CHAT_FALLBACK_MODEL` | `GEMINI_25_FLASH` | LLM 主模型遇到 5xx/下线时的备用模型 |
 | `ADR_ADS_REPORTER_ALLOW_ENV` | 空 | 允许环境变量触发 reporter，默认不允许 |
 | `ADR_ADS_REPORTER` | 空 | reporter 环境开关，需配合上一项 |
 | `ADR_TG_PROGRESS_MODE` | `dashboard` | TG 推送模式：`dashboard` / `compact` / `verbose` / `silent` |
