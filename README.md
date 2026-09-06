@@ -160,7 +160,7 @@ python3 run_adr_v8.py "唐宋八大家" h --no-motion          # 罕用：HADR �
 | `ADR_MOTION_BRIDGE_REFS_SUBMIT_STAGGER` | `12` | motion bridge end keyframe 错峰提交间隔 |
 | `ADR_MOTION_BRIDGE_REFS_POLL_WORKERS` | `20` | motion bridge end keyframe 并发轮询/下载 worker 数 |
 
-2026-09-06 同 prompt 主创 A/B：`GPT_5_6_SOL` 在 22 镜视觉 JSON 中实现 22/22 对象、8/8 字段及所有 enum/字数/首尾约束通过；`CLAUDE_FABLE_5` 有超长与截断，`CLAUDE_4_8_OPUS` 出现间歇 5xx，因此未设为首选。
+2026-09-06 同 prompt 主创 A/B：`GPT_5_6_SOL` 在 22 镜视觉 JSON 中实现 22/22 对象、8/8 字段及所有 enum/字数/首尾约束通过；`CLAUDE_FABLE_5` 有超长与截断，`CLAUDE_4_8_OPUS` 出现间歇 5xx，因此未设为首选。判断档另以 180/200/300/600/800 token 的五类生产近似任务对照：`GEMINI_3_7_FLASH` 5/5 正常停止且格式通过，`GEMINI_25_FLASH` 4/5（严格 JSON 出现 Markdown fence）。
 
 文本降级配置优先级为：调用点显式 `fallback_models` > 全局多值 `ADR_CHAT_FALLBACK_MODELS` > 旧单值 `ADR_CHAT_FALLBACK_MODEL` > 主创/判断分档默认链。5xx 与模型下线错误会推进到下一模型；429 只在当前模型退避，不跨模型。Vision 同样遵循 429 原模型退避策略。
 
