@@ -12,6 +12,9 @@ ADR V8 — 字幕驱动纪录片自动生成管线
     OUTPUT_DIR       可选，默认 /tmp/adr_v8_output
     ADR_ALMIGHTY_MODEL       可选，Almighty 主模型，默认 WERYDANCE
     ADR_ALMIGHTY_FAST_MODEL  可选，Almighty 快速回退模型，默认 SEEDANCE_2_0_FAST_OS
+    ADR_CREATIVE_MODEL       可选，主创 LLM，默认 GPT_5_6_SOL
+    ADR_JUDGMENT_MODEL       可选，判断/JSON LLM，默认 GEMINI_3_7_FLASH
+    ADR_VISION_MODEL         可选，Vision 质检 LLM，默认 GEMINI_3_7_FLASH
 """
 import json
 import hashlib
@@ -701,11 +704,12 @@ def _llm_assign_voice_assets(turns: list[dict]) -> dict[int, str]:
 """
     try:
         raw = chat(
-            "GEMINI_25_FLASH",
+            JUDGMENT_MODEL,
             "你是 ADR 纪录片音色总监。只输出 JSON 数组，不解释。",
             prompt,
             max_tokens=2000,
             timeout=60,
+            fallback_route="judgment",
         )
     except Exception as e:
         log(f"LLM voice assign: chat 调用失败 {e}")
@@ -1648,6 +1652,52 @@ def _is_llm_retryable_server_error(error: object) -> bool:
     )
 
 
+def _is_llm_model_missing_error(error: object) -> bool:
+    """识别 WeryAI 的模型不存在/下线错误，包括不同字段与异常包装格式。"""
+    status_values: list[object] = []
+    text_parts: list[str] = []
+
+    def collect_mapping(value: object) -> None:
+        if not isinstance(value, dict):
+            return
+        status_values.extend(value.get(key) for key in ("status", "status_code", "code"))
+        data = value.get("data")
+        if isinstance(data, dict):
+            status_values.extend(data.get(key) for key in ("status", "status_code", "code"))
+        text_parts.append(json.dumps(value, ensure_ascii=False))
+
+    collect_mapping(error)
+    response = getattr(error, "response", None)
+    if response is not None:
+        status_values.append(getattr(response, "status_code", None))
+        try:
+            collect_mapping(response.json())
+        except Exception:
+            pass
+        text_parts.append(str(response))
+    text_parts.append(str(error))
+
+    for value in status_values:
+        try:
+            if int(value) == 1006:
+                return True
+        except (TypeError, ValueError):
+            pass
+
+    text = " ".join(text_parts).lower()
+    return (
+        re.search(
+            r"[\"']?(?:status|status_code|code)[\"']?\s*[:=]\s*[\"']?1006\b",
+            text,
+        ) is not None
+        or "does not exist" in text
+        or "model not found" in text
+        or "unknown model" in text
+        or "invalid model" in text
+        or "not model" in text
+    )
+
+
 # GPT_IMAGE_2 画质修正后缀（实测能有效消除颗粒感/脏感）
 # 大哥 2026-05-20 给的固定 suffix，避免逐处 prompt 都改
 # B87 (2026-06-04): 这条不再无差别碾压——它只是 clean 档。纹理由 LLM 美术总监
@@ -2101,32 +2151,76 @@ def poll_storyboard_task(task_id: str, label: str, max_wait: float) -> dict:
 # B43 (2026-05-28): review tier Flash Lite → Flash 2.5. Flash Lite 429 quota 严重 (观沧海 101437
 # run L16289 注脚 quota exhausted), review tier 量小迁出减少 Lite 压力. 真正治本是 B44 chat() 429
 # 智能退避 (Codex Stage 2 共识). WeryAI 不支持 Haiku, data tier 暂保持 Flash Lite 等 B44 兜底.
-# B81 (2026-06-03): 质量优先 — 台词/旁白/视觉导演/制片准则 升最强 Claude (env 可改 GEMINI_3_5_FLASH/GPT_5_5).
-# 机械档(分镜数/情感/BGM 描述/data tier)仍 25_FLASH: 要的是可靠 JSON, premium 模型啰嗦反伤解析。
-CREATIVE_MODEL = os.environ.get("ADR_CREATIVE_MODEL", "CLAUDE_4_8_OPUS")  # 列表里最强 Claude (out=1250)
+# B81 (2026-06-03): 质量优先 — 台词/旁白/视觉导演/制片准则走可配置主创档。
+# B89 (2026-09-06): 主创、判断与 Vision 拆成独立模型，各自使用独立降级链。
+def _read_model_list(env_name: str, default: str) -> tuple[str, ...]:
+    """读取逗号分隔的模型链，去空白与重复，保留声明顺序。"""
+    raw = os.environ.get(env_name, default)
+    values: list[str] = []
+    for item in str(raw or "").split(","):
+        model_name = item.strip()
+        if model_name and model_name not in values:
+            values.append(model_name)
+    return tuple(values)
+
+
+# B89 (2026-09-06): 同 prompt 实测后主创升 GPT_5_6_SOL；22 镜 JSON 22/22 完整。
+# Fable 5 出现超长/截断，Claude 4.8 Opus 有间歇 5xx，因此两者不作当前首选。
+CREATIVE_MODEL = os.environ.get("ADR_CREATIVE_MODEL", "GPT_5_6_SOL").strip() or "GPT_5_6_SOL"
+JUDGMENT_MODEL = os.environ.get("ADR_JUDGMENT_MODEL", "GEMINI_3_7_FLASH").strip() or "GEMINI_3_7_FLASH"
+VISION_MODEL = os.environ.get("ADR_VISION_MODEL", JUDGMENT_MODEL).strip() or JUDGMENT_MODEL
+CREATIVE_FALLBACK_MODELS = _read_model_list(
+    "ADR_CREATIVE_FALLBACK_MODELS",
+    "CLAUDE_4_8_OPUS,GEMINI_3_7_FLASH,GEMINI_25_FLASH",
+)
+JUDGMENT_FALLBACK_MODELS = _read_model_list(
+    "ADR_JUDGMENT_FALLBACK_MODELS",
+    "GEMINI_25_FLASH",
+)
+VISION_FALLBACK_MODELS = _read_model_list(
+    "ADR_VISION_FALLBACK_MODELS",
+    "GEMINI_25_FLASH",
+)
 _LLM_TIER = {
-    "producer":  CREATIVE_MODEL,             # Tier 1 决策性创意 (制片人, 导演 jiangwen) — B81 升 CREATIVE_MODEL
-    "creative":  "GEMINI_25_FLASH",          # Tier 2 创意输出 (台词/分镜 prompt 等)
-    "review":    "GEMINI_25_FLASH",          # Tier 3 审稿/规划 — B43 从 Flash Lite 迁出减压
-    "data":      "GEMINI_25_FLASH",          # B80 (2026-06-03): GEMINI_3_1_FLASH_LITE 被 weryai 下线(status 1006 not model)→ 全改 25_FLASH(唯一可用 Flash, 非 thinking 顺带根除 B77 类 MAX_TOKENS). 原 Tier 4 数据/机械任务
+    "producer":  CREATIVE_MODEL,             # Tier 1 决策性创意（台词/制片/视觉导演）
+    "creative":  JUDGMENT_MODEL,             # Tier 2 短创意 + 严格 JSON
+    "review":    JUDGMENT_MODEL,             # Tier 3 审稿/规划
+    "data":      JUDGMENT_MODEL,             # Tier 4 数据/机械任务
 }
 
 
 def tier_chat(tier: str, system: str, user: str, max_tokens: int = 4096, timeout: int = 180) -> str:
-    """PR-4: 按 tier 调用对应模型, 失败时回退到 chat() 直接传 model name."""
-    model = _LLM_TIER.get(tier, "GEMINI_25_FLASH")
-    return chat(model, system, user, max_tokens=max_tokens, timeout=timeout)
+    """PR-4/B89: 按 tier 调用对应模型与独立降级链。"""
+    model = _LLM_TIER.get(tier, JUDGMENT_MODEL)
+    fallback_route = "creative" if tier == "producer" else "judgment"
+    return chat(
+        model,
+        system,
+        user,
+        max_tokens=max_tokens,
+        timeout=timeout,
+        fallback_route=fallback_route,
+    )
 
 
-def chat(model: str, system: str, user: str, max_tokens: int = 4096, timeout: int = 180) -> str:
+def chat(
+    model: str,
+    system: str,
+    user: str,
+    max_tokens: int = 4096,
+    timeout: int = 180,
+    fallback_models: tuple[str, ...] | list[str] | str | None = None,
+    fallback_route: str | None = None,
+) -> str:
     """调用 WeryAI Chat Completion，返回回复文本。有限重试防瞬断/限流/无 choices。
     timeout 默认 180s，对慢推理模型（GPT-5.4 / Claude Opus / DeepSeek-R1）需传更大值如 600s。
 
     B44 (2026-05-28): 识别 429 quota 用 _LLM_RATE_LIMIT_BACKOFF 30s/60s/120s 退避
     (vs 通用 3s/6s 线性). Flash Lite quota 实测每 run 多次触发, 通用退避救不了.
 
-    2026-09-05 hotfix: 业务 status=5xx / HTTP 5xx 时立即切 ADR_CHAT_FALLBACK_MODEL。
-    常规总尝试预算仍为 3；若最后一次才发现需降级，额外保证一次 fallback 实际调用。
+    2026-09-05 hotfix: 业务 status=5xx / HTTP 5xx 时立即切换模型。
+    B89: 支持有序多级 fallback；429 仍留在当前模型退避，不跨模型。
+    常规总尝试预算仍为 3；若最后一次才发现需降级，额外保证新模型至少实际调用一次。
     """
     payload = {
         "model": model,
@@ -2137,14 +2231,42 @@ def chat(model: str, system: str, user: str, max_tokens: int = 4096, timeout: in
         "max_tokens": max_tokens,
         "temperature": 0.85,
     }
-    fallback_model = os.environ.get("ADR_CHAT_FALLBACK_MODEL", "GEMINI_25_FLASH").strip() or "GEMINI_25_FLASH"
+    if fallback_models is None:
+        multi = os.environ.get("ADR_CHAT_FALLBACK_MODELS", "").strip()
+        legacy = os.environ.get("ADR_CHAT_FALLBACK_MODEL", "").strip()
+        if multi:
+            candidates = list(_read_model_list("ADR_CHAT_FALLBACK_MODELS", ""))
+        elif legacy:
+            candidates = [legacy]
+        elif fallback_route == "creative":
+            candidates = list(CREATIVE_FALLBACK_MODELS)
+        elif fallback_route == "judgment":
+            candidates = list(JUDGMENT_FALLBACK_MODELS)
+        elif model == CREATIVE_MODEL:
+            candidates = list(CREATIVE_FALLBACK_MODELS)
+        elif model == JUDGMENT_MODEL:
+            candidates = list(JUDGMENT_FALLBACK_MODELS)
+        else:
+            candidates = ["GEMINI_25_FLASH"]
+    elif isinstance(fallback_models, str):
+        candidates = [item.strip() for item in fallback_models.split(",") if item.strip()]
+    else:
+        candidates = [str(item).strip() for item in fallback_models if str(item).strip()]
+
+    model_chain: list[str] = []
+    for candidate in [model, *candidates]:
+        if candidate and candidate not in model_chain:
+            model_chain.append(candidate)
+
     last_err = None
     models_tried: list[str] = []
+    model_index = 0
     attempt = 0
     max_attempts = 3
     while attempt < max_attempts:
         attempt += 1
-        active_model = str(payload["model"])
+        active_model = model_chain[model_index]
+        payload["model"] = active_model
         if not models_tried or models_tried[-1] != active_model:
             models_tried.append(active_model)
         is_quota_err = False
@@ -2157,16 +2279,16 @@ def chat(model: str, system: str, user: str, max_tokens: int = 4096, timeout: in
             is_quota_err = _is_llm_rate_limited_error(full_resp_text)
             # B80.1 (2026-06-03): 模型被 weryai 无预警下线/改名 (status 1006 / "model does not exist") → 自动
             # fallback 到已验证可用模型, 不让一次模型变动崩掉整管线 (B80 P0: GEMINI_3_1_FLASH_LITE 突然 1006 致全崩)。
-            _ltxt = full_resp_text.lower()
             fallback_reason = None
-            if active_model != fallback_model and ('"status": 1006' in full_resp_text
-                    or "does not exist" in _ltxt or "not model" in _ltxt):
+            has_next_model = model_index + 1 < len(model_chain)
+            if has_next_model and _is_llm_model_missing_error(resp):
                 fallback_reason = "B80.1 模型不可用(1006/not model)"
-            elif active_model != fallback_model and not is_quota_err and _is_llm_retryable_server_error(resp):
+            elif has_next_model and not is_quota_err and _is_llm_retryable_server_error(resp):
                 fallback_reason = "上游 5xx"
             if fallback_reason:
-                log(f"[chat/{active_model}] ⚠️ {fallback_reason}, 自动 fallback → {fallback_model}")
-                payload["model"] = fallback_model
+                model_index += 1
+                next_model = model_chain[model_index]
+                log(f"[chat/{active_model}] ⚠️ {fallback_reason}, 自动 fallback → {next_model}")
                 if attempt >= max_attempts:
                     max_attempts += 1  # 不允许在最后一次只改 model 却没有实际调用机会
                 continue  # 立即用 fallback 重试
@@ -2175,16 +2297,16 @@ def chat(model: str, system: str, user: str, max_tokens: int = 4096, timeout: in
         except Exception as e:
             last_err = f"{type(e).__name__}: {e}"
             is_quota_err = _is_llm_rate_limited_error(e)
-            _etxt = str(e).lower()
             fallback_reason = None
-            if active_model != fallback_model and ('"status": 1006' in str(e)  # B80.1/codex Med2: 1006 抛异常时也 fallback
-                    or "does not exist" in _etxt or "not model" in _etxt):
+            has_next_model = model_index + 1 < len(model_chain)
+            if has_next_model and _is_llm_model_missing_error(e):
                 fallback_reason = "B80.1 模型不可用(异常 1006/not model)"
-            elif active_model != fallback_model and not is_quota_err and _is_llm_retryable_server_error(e):
+            elif has_next_model and not is_quota_err and _is_llm_retryable_server_error(e):
                 fallback_reason = "上游 HTTP 5xx"
             if fallback_reason:
-                log(f"[chat/{active_model}] ⚠️ {fallback_reason}, 自动 fallback → {fallback_model}")
-                payload["model"] = fallback_model
+                model_index += 1
+                next_model = model_chain[model_index]
+                log(f"[chat/{active_model}] ⚠️ {fallback_reason}, 自动 fallback → {next_model}")
                 if attempt >= max_attempts:
                     max_attempts += 1
                 continue
@@ -2199,6 +2321,56 @@ def chat(model: str, system: str, user: str, max_tokens: int = 4096, timeout: in
             time.sleep(wait_s)
     route = " → ".join(models_tried)
     raise RuntimeError(f"chat({model}) {attempt} 次尝试全失败 (模型链: {route}): {last_err}")
+
+
+def _vision_chat_completion(payload: dict, timeout: int = 60) -> dict:
+    """Vision chat 的有序 5xx/1006 降级；429 在原模型有限退避，不跨模型。"""
+    requested_model = str(payload.get("model") or VISION_MODEL).strip() or VISION_MODEL
+    model_chain: list[str] = []
+    for candidate in [requested_model, *VISION_FALLBACK_MODELS]:
+        if candidate and candidate not in model_chain:
+            model_chain.append(candidate)
+
+    for model_index, active_model in enumerate(model_chain):
+        has_next_model = model_index + 1 < len(model_chain)
+        active_payload = {**payload, "model": active_model}
+        for quota_attempt in range(3):
+            try:
+                resp = req_post("/chat/completions", active_payload, timeout=timeout)
+            except Exception as exc:
+                is_quota_err = _is_llm_rate_limited_error(exc)
+                if is_quota_err and quota_attempt < 2:
+                    wait_s = _LLM_RATE_LIMIT_BACKOFF * (2 ** quota_attempt)
+                    log(f"[vision/{active_model}] 429 quota 退避 {wait_s:.0f}s")
+                    time.sleep(wait_s)
+                    continue
+                missing = _is_llm_model_missing_error(exc)
+                retryable = not is_quota_err and _is_llm_retryable_server_error(exc)
+                if has_next_model and (missing or retryable):
+                    next_model = model_chain[model_index + 1]
+                    reason = "模型不可用" if missing else "上游 HTTP 5xx"
+                    log(f"[vision/{active_model}] ⚠️ {reason}, 自动 fallback → {next_model}")
+                    break
+                raise
+
+            if isinstance(resp, dict) and resp.get("choices"):
+                return resp
+            is_quota_err = _is_llm_rate_limited_error(resp)
+            if is_quota_err and quota_attempt < 2:
+                wait_s = _LLM_RATE_LIMIT_BACKOFF * (2 ** quota_attempt)
+                log(f"[vision/{active_model}] 429 quota 退避 {wait_s:.0f}s")
+                time.sleep(wait_s)
+                continue
+            missing = _is_llm_model_missing_error(resp)
+            retryable = not is_quota_err and _is_llm_retryable_server_error(resp)
+            if has_next_model and (missing or retryable):
+                next_model = model_chain[model_index + 1]
+                reason = "模型不可用" if missing else "上游 5xx"
+                log(f"[vision/{active_model}] ⚠️ {reason}, 自动 fallback → {next_model}")
+                break
+            return resp
+
+    raise RuntimeError(f"Vision 模型链异常耗尽: {' → '.join(model_chain)}")
 
 
 def pick_image_model(aspect: str) -> tuple[str, str, dict]:
@@ -2245,7 +2417,7 @@ def detect_topic_meta(topic: str) -> dict:
 }}
 只输出 JSON，不加任何说明文字。"""
     try:
-        raw = chat("GEMINI_25_FLASH", "你是历史考证与电影视觉风格专家，只输出 JSON。", prompt, max_tokens=600)
+        raw = chat(JUDGMENT_MODEL, "你是历史考证与电影视觉风格专家，只输出 JSON。", prompt, max_tokens=600, fallback_route="judgment")
         s = raw.find('{'); e = raw.rfind('}')
         meta = json.loads(raw[s:e+1])
         if is_1919_global_topic(topic):
@@ -3329,7 +3501,7 @@ action_b    武戏 / 激烈对抗 / 突破冲击 镜头
     arr: list[dict] = []
     last_err = ""
     for attempt in range(2):
-        raw = chat(CREATIVE_MODEL, "你只输出严格 JSON 数组。", _build_prompt(last_err), max_tokens=3000, timeout=300)  # B81: ADSD 对话台词升最强 Claude (Opus 慢, timeout 300)
+        raw = chat(CREATIVE_MODEL, "你只输出严格 JSON 数组。", _build_prompt(last_err), max_tokens=3000, timeout=300, fallback_route="creative")  # B81/B89: ADSD 对话台词走主创模型
         try:
             arr = _extract_json_array(raw)
         except Exception as e:
@@ -3527,7 +3699,7 @@ turn 序列:
 - 不动 a_roll / action_b
 """
     try:
-        raw = chat("GEMINI_25_FLASH", "你只输出严格 JSON 对象。", prompt, max_tokens=1000, timeout=60)
+        raw = chat(JUDGMENT_MODEL, "你只输出严格 JSON 对象。", prompt, max_tokens=1000, timeout=60, fallback_route="judgment")
     except Exception as e:
         log(f"B-roll Reviewer LLM 异常: {e}")
         return
@@ -4006,7 +4178,7 @@ def step1_script(topic: str) -> list[dict]:
 • 诗词古文（唐诗、宋词、古诗、诗经、楚辞、汉赋、文言文、名篇诵读/赏析，如静夜思/将进酒/滕王阁序/沁园春雪/赤壁赋/出师表等——以呈现或赏析古典诗文本身为核心的题材）
 
 主题：{topic}"""
-    tone = chat("GEMINI_25_FLASH", "你是情感分析专家。", tone_prompt).strip()
+    tone = chat(JUDGMENT_MODEL, "你是情感分析专家。", tone_prompt, fallback_route="judgment").strip()
     if tone not in ("庄重", "轻松", "怀旧", "中性", "诗词古文"):
         tone = "中性"
     log(f"题材基调判断：{tone}")
@@ -4092,7 +4264,7 @@ def step1_script(topic: str) -> list[dict]:
         log(f"外部脚本注入预设分镜数：{num_lines}")
     else:
         try:
-            plan_raw = chat("GEMINI_25_FLASH", "你是纪录片分镜规划师。", plan_prompt)
+            plan_raw = chat(JUDGMENT_MODEL, "你是纪录片分镜规划师。", plan_prompt, fallback_route="judgment")
             fence = re.search(r'```(?:\w*)\s*\n?([\s\S]*?)```', plan_raw)
             plan_clean = fence.group(1).strip() if fence else plan_raw.strip()
             plan = json.loads(re.search(r'\{[\s\S]+\}', plan_clean).group())
@@ -4302,7 +4474,7 @@ def step1_script(topic: str) -> list[dict]:
         if not ADS_DIALOGUE_MODE:
             lines = []
             for _try in range(3):
-                raw_lines = chat(CREATIVE_MODEL, "你是纪录片旁白创作大师。", spielberg_prompt, timeout=300)  # B81: 旁白台词升最强 Claude
+                raw_lines = chat(CREATIVE_MODEL, "你是纪录片旁白创作大师。", spielberg_prompt, timeout=300, fallback_route="creative")  # B81/B89: 旁白台词走主创模型
                 lines = [l.strip() for l in raw_lines.strip().splitlines() if l.strip()][:num_lines]
                 if len(lines) < num_lines:
                     log(f"斯皮尔伯格只生成了 {len(lines)} 句（需要 {num_lines} 句），重试...")
@@ -4375,7 +4547,7 @@ THUMBNAIL_ANCHOR: Air Force One stairs, black leather jacket figure, glowing chi
 """
         log("外部脚本注入：使用确定性 Producer Brief，跳过重模型制片准则生成")
     else:
-        historical_context = chat(CREATIVE_MODEL, "你是总制片人，全能把关人，只输出严格结构化英文准则。", producer_prompt, timeout=300)  # B81: 制片准则升最强 Claude
+        historical_context = chat(CREATIVE_MODEL, "你是总制片人，全能把关人，只输出严格结构化英文准则。", producer_prompt, timeout=300, fallback_route="creative")  # B81/B89: 制片准则走主创模型
     tg(f"✅ 制片人准则就绪（已定调子 + 事实考证 + 价值观把关）\n\n姜文正在据此标注情绪 + 生成画面提示词...")
 
     # 老黄历主题：给每句台词标注板块名，让姜文生成针对性画面
@@ -4688,11 +4860,12 @@ shot_type/camera_angle/lighting/camera_motion 必须从上述 enum 选, 不能�
         log(f"外部脚本注入：使用确定性财经科技分镜 prompt，共 {len(visuals)} 个")
     else:
         raw_json = chat(
-            CREATIVE_MODEL,  # B81: jiangwen 视觉导演升最强 Claude
+            CREATIVE_MODEL,  # B81/B89: jiangwen 视觉导演走主创模型
             "你是精通各类电影镜头语言的导演。每个画面必须指定景别+机位+光影+视觉母题，严禁默认居中中景平庸画面。★ 输出限制：每条英文 prompt 严格 40-60 词（更长会撞 WeryAI gateway 504 timeout）。★ 绝对禁令：你输出的英文 prompt 里禁止出现任何具体导演/画家/艺术家姓名（Akira Kurosawa / Zhang Yimou / Ang Lee / Wong Kar-wai / Christopher Nolan / Caravaggio / Rembrandt / Sergio Leone 等都禁止），改用纯描述词。OpenAI GPT Image 2 对人名风格模仿触发版权 filter 强制拒绝。只输出 JSON。",
             jiangwen_prompt,
             max_tokens=3072,
             timeout=300,
+            fallback_route="creative",
         )
         # 直接定位 JSON 数组边界：第一个 [ 到最后一个 ]
         arr_start = raw_json.find('[')
@@ -5150,7 +5323,7 @@ shot_type/camera_angle/lighting/camera_motion 必须从上述 enum 选, 不能�
         tg(f"🎤 竖屏模式，使用女声：{picked_name}")
     else:
         try:
-            raw = chat("GEMINI_25_FLASH", "你是音频导演，只输出 JSON。", voice_prompt)
+            raw = chat(JUDGMENT_MODEL, "你是音频导演，只输出 JSON。", voice_prompt, fallback_route="judgment")
             voice_pick = json.loads(re.search(r'\{[\s\S]+\}', raw).group())
             picked_id = voice_pick["speaker_id"]
             picked_name = voice_pick["speaker_name"]
@@ -5415,11 +5588,12 @@ def _rewrite_adsd_tts_text_for_policy(text: str, speaker: str, err: Exception, l
     rewritten = ""
     try:
         rewritten = chat(
-            "GEMINI_25_FLASH",
+            JUDGMENT_MODEL,
             "你是历史短视频旁白编辑，只输出一行可播报、能过内容审核的中文。",
             prompt,
             max_tokens=180,
             timeout=90,
+            fallback_route="judgment",
         ).strip()
     except Exception as e:
         log(f"ADSD TTS policy 改写 LLM 失败(level={lv})，走规则兜底：{e}")
@@ -9150,7 +9324,7 @@ def _llm_topic_decomposition(topic: str, use_cache: bool = True) -> dict:
 
 只输出 JSON。"""
     try:
-        raw = chat("GEMINI_25_FLASH", "你只输出严格 JSON。", prompt, max_tokens=800, timeout=45)
+        raw = chat(JUDGMENT_MODEL, "你只输出严格 JSON。", prompt, max_tokens=800, timeout=45, fallback_route="judgment")
         start = raw.find("{")
         end = raw.rfind("}")
         if start < 0 or end <= start:
@@ -9394,7 +9568,7 @@ def _llm_infer_meta_grid_template(speaker: str, topic: str, ip: dict | None = No
 
 只输出 JSON。"""
     try:
-        raw = chat("GEMINI_25_FLASH", "你只输出严格 JSON。", prompt, max_tokens=600, timeout=30)
+        raw = chat(JUDGMENT_MODEL, "你只输出严格 JSON。", prompt, max_tokens=600, timeout=30, fallback_route="judgment")
         start = raw.find("{")
         end = raw.rfind("}")
         if start < 0 or end <= start:
@@ -9941,7 +10115,7 @@ def _llm_infer_ip_skeleton(speaker: str, brief: str) -> dict | None:
 
 只输出 JSON。"""
     try:
-        raw = chat("GEMINI_25_FLASH", "你只输出严格 JSON。", prompt, max_tokens=1500, timeout=90)
+        raw = chat(JUDGMENT_MODEL, "你只输出严格 JSON。", prompt, max_tokens=1500, timeout=90, fallback_route="judgment")
     except Exception as e:
         log(f"AUTO-IP {speaker} LLM 调用失败: {e}")
         return None
@@ -9995,8 +10169,8 @@ def _llm_pick_voice_asset_for_ip(voice_gender: str, voice_tone_hint: str) -> str
 
 只输出 1 个 voice_id 字符串，不要解释，不要 markdown。"""
     try:
-        # B77: 同 MAX_TOKENS 隐患里最毒的一个 — 80-token budget 在 thinking 模型 Lite 上几乎必撞空响应, 静默 fallback candidates[0] 会误选音色(与多音色问题相关). 改非 thinking 的 2.5-Flash + 300 余量.
-        raw = chat("GEMINI_25_FLASH", "你只输出一个 voice_id 字符串。", prompt, max_tokens=300, timeout=30)
+        # B77/B89: 避开 Lite thinking 的小 token 空响应，改走可配置判断模型 + 300 余量。
+        raw = chat(JUDGMENT_MODEL, "你只输出一个 voice_id 字符串。", prompt, max_tokens=300, timeout=30, fallback_route="judgment")
         vid = raw.strip().strip('"').strip("'").strip()
         valid = {a.get("voice_id") for a in candidates if a.get("voice_id")}  # B77/codex: 坏 catalog 缺 voice_id 不再 KeyError 静默 fallback
         if vid in valid:
@@ -11126,7 +11300,7 @@ def _llm_bgm_description(topic: str, tone: str) -> str | None:
 
 直接输出英文描述（一行）："""
     try:
-        out = chat("GEMINI_25_FLASH", "你是纪录片配乐导演，精通电影配乐风格与乐器编排。", prompt, max_tokens=1000, timeout=45).strip()
+        out = chat(JUDGMENT_MODEL, "你是纪录片配乐导演，精通电影配乐风格与乐器编排。", prompt, max_tokens=1000, timeout=45, fallback_route="judgment").strip()
         out = out.strip('"').strip("'").strip()
         out = out.split('\n')[0].strip()
         word_count = len(out.split())
@@ -11459,7 +11633,7 @@ def _mtv_build_plan(topic: str, singer: str, singer_ip: dict) -> dict:
 - 若主题是《短歌行》，歌词应以曹操原诗为主体，可以加极少量副歌式重复，但不要改坏原文。
 只输出 JSON。"""
     try:
-        raw = chat("GEMINI_25_FLASH", "你只输出严格 JSON 对象。", prompt, max_tokens=3500, timeout=120)
+        raw = chat(JUDGMENT_MODEL, "你只输出严格 JSON 对象。", prompt, max_tokens=3500, timeout=120, fallback_route="judgment")
         plan = _extract_json_object(raw)
     except Exception as e:
         log(f"MTV plan LLM 失败，使用 fallback: {e}")
@@ -12731,7 +12905,7 @@ def step6_parallel(script: list[dict], topic: str, pregenerated_bgm_path: str | 
                             else:
                                 hist_block = ""
                                 ref_req = "• 场景与人物描述必须与台词内容直接相关\n"
-                            new_prompt = chat("GEMINI_25_FLASH", "你是画面导演，只输出英文。",
+                            new_prompt = chat(JUDGMENT_MODEL, "你是画面导演，只输出英文。",
                                 f"上一个画面提示词生成的图片不符合要求，请重写一个完全不同的画面提示词。\n\n"
                                 f"台词：{script[i]['text']}\n"
                                 f"情绪：{script[i]['emotion']}\n"
@@ -12741,7 +12915,8 @@ def step6_parallel(script: list[dict], topic: str, pregenerated_bgm_path: str | 
                                 f"• 50~80 词英文，{style_req}\n"
                                 f"• 换一个完全不同的构图/视角/场景\n"
                                 f"{ref_req}"
-                                f"只输出提示词本身。")
+                                f"只输出提示词本身。",
+                                fallback_route="judgment")
                             script[i]["prompt"] = new_prompt.strip()
                             tg(f"✏️ 图 {i+1} 新提示词就绪，重新生成...")
                             regen_futs[i] = ex.submit(generate_image, script[i], i)
@@ -12807,7 +12982,7 @@ def _generate_motion_prompts(script: list[dict]) -> list[str]:
             for i, sc in enumerate(script)
         )
         raw = chat(
-            "GEMINI_25_FLASH",
+            JUDGMENT_MODEL,
             "You are an action-oriented cinematographer giving motion direction for still documentary frames. Output strict JSON only.",
             f"""Generate {n} motion prompts for a Chinese documentary. Each scene already has a static keyframe image; describe camera movement plus one clear in-frame action beat (40-60 words, English).
 
@@ -12827,7 +13002,8 @@ Rules:
 {adsd_motion_guide}
 
 Output strict JSON array of {n} strings:
-["motion1", "motion2", ...]"""
+["motion1", "motion2", ...]""",
+            fallback_route="judgment",
         )
         import re as _re
         m = _re.search(r'\[[\s\S]+\]', raw)
@@ -14307,7 +14483,7 @@ def _b92_propose_path(scene: dict) -> dict | None:
         "(如前景细节→扫升到远景主体)。不适合就 {\"suitable\": false}。只输出 JSON。"
     )
     try:
-        raw = chat("GEMINI_25_FLASH", "你是电影摄影指导, 只输出严格 JSON。", prompt, max_tokens=300, timeout=40)
+        raw = chat(JUDGMENT_MODEL, "你是电影摄影指导, 只输出严格 JSON。", prompt, max_tokens=300, timeout=40, fallback_route="judgment")
         a = raw.find("{"); b = raw.rfind("}")
         if a < 0 or b <= a:
             return None
@@ -19765,7 +19941,7 @@ def step8_subtitles(script: list[dict]) -> str:
 [["第1句第1行", "第1句第2行"], ["第2句第1行"], ...]
 只输出 JSON，不加任何说明。"""
         try:
-            raw = chat("GEMINI_25_FLASH", "你是专业字幕编辑，只输出 JSON。", prompt)
+            raw = chat(JUDGMENT_MODEL, "你是专业字幕编辑，只输出 JSON。", prompt, fallback_route="judgment")
             arr_start = raw.find('[')
             arr_end = raw.rfind(']')
             if arr_start >= 0 and arr_end > arr_start:
@@ -20815,7 +20991,7 @@ def _generate_caption(topic: str, script: list[dict]) -> tuple[str, str, str]:
         best_score = -1
         best = (caption, short_title, hashtags)  # 默认兜底
         for _try_i in range(3):
-            raw = chat("GEMINI_25_FLASH", "你是能出爆款的短视频文案策划师，熟悉视频号/抖音/小红书的点击钩子规律，会根据题材基调灵活切换受众和套路。",
+            raw = chat(JUDGMENT_MODEL, "你是能出爆款的短视频文案策划师，熟悉视频号/抖音/小红书的点击钩子规律，会根据题材基调灵活切换受众和套路。",
                 f"为以下短视频生成文案 + 短标题：\n\n"
                 f"主题：{display_topic}\n"
                 f"基调：{tone}\n"
@@ -20840,7 +21016,8 @@ def _generate_caption(topic: str, script: list[dict]) -> tuple[str, str, str]:
                 f"输出格式（严格遵守，三行各一项）：\n"
                 f"CAPTION: 文案主体（纯文案，无任何 # 号）\n"
                 f"TITLE: 短标题\n"
-                f"HASHTAGS: #标签1 #标签2 #标签3 ...（8-10 个）")
+                f"HASHTAGS: #标签1 #标签2 #标签3 ...（8-10 个）",
+                fallback_route="judgment")
             # 局部变量每次重置
             _c, _t, _h = caption, short_title, hashtags
             for line in raw.strip().splitlines():
@@ -21155,8 +21332,8 @@ def _llm_bottom_note(topic: str, script_texts: list) -> str:
         f"只输出注脚本身一行，不加任何解释。"
     )
     try:
-        # B77: 原 tier_chat("data") 走 thinking 模型 GEMINI_3_1_FLASH_LITE, 推理 token 计入 maxOutputTokens, 200 budget 被吃光 → finishReason=MAX_TOKENS 空响应. 改用非 thinking 的 2.5-Flash + 600 余量 (注脚正文仅 ~30-50 token, 12x headroom), 顺带卸 Lite 429 压力.
-        raw = chat("GEMINI_25_FLASH", "你是中国古典编辑，擅长从典籍节气物象里提炼诗意注脚。", prompt, max_tokens=600, timeout=45).strip()
+        # B77/B89: 避开 Lite thinking 吃完小 token budget，改走可配置判断模型 + 600 余量。
+        raw = chat(JUDGMENT_MODEL, "你是中国古典编辑，擅长从典籍节气物象里提炼诗意注脚。", prompt, max_tokens=600, timeout=45, fallback_route="judgment").strip()
         raw = raw.split("\n")[0].strip()
         # 清洗：去掉标点 / 英文 / 特殊字符（保留中点 · 和中文）
         raw = re.sub(r"[《》\"'【】\[\]()（）!?！？#。，、；：—…-]", '', raw)
@@ -21286,7 +21463,7 @@ def _shrink_to_b64(img_path: str, max_width: int = 720) -> str:
 
 
 def _llm_check_scenes_anomalies(script: list) -> set:
-    """v0.2 智能异常检测：22 张分镜并发独立 Vision call（绕过 ffmpeg tile filter 的多 input 限制）。
+    """v0.2 智能异常检测：分镜并发独立 Vision call（模型由 ADR_VISION_MODEL 配置）。
     返回需要审批的 idx 集合（0-indexed）。
     异常类型：① 文字渲染错（数字/日期/中文乱字）② 内容严重偏离板块主题
     """
@@ -21299,7 +21476,7 @@ def _llm_check_scenes_anomalies(script: list) -> set:
         try:
             b64 = _shrink_to_b64(scene["img_path"])  # v0.5 缩图避 413
             payload = {
-                "model": "GEMINI_25_FLASH",
+                "model": VISION_MODEL,
                 "messages": [{
                     "role": "user",
                     "content": [
@@ -21317,7 +21494,7 @@ def _llm_check_scenes_anomalies(script: list) -> set:
                 }],
                 "max_tokens": 10,
             }
-            resp = req_post("/chat/completions", payload, timeout=60)
+            resp = _vision_chat_completion(payload, timeout=60)
             verdict = resp.get("choices", [{}])[0].get("message", {}).get("content", "").strip().upper()
             return (i, "ANOMALY" in verdict)
         except Exception as e:
@@ -21339,11 +21516,11 @@ def _llm_check_scenes_anomalies(script: list) -> set:
 
 
 def _llm_check_cover_unique(cover_path: str) -> bool:
-    """用 Gemini Vision 判断封面主标题是否唯一（未重复）。True=OK, False=重复需重做。"""
+    """用可配置 Vision 模型判断封面主标题是否唯一。True=OK, False=重复需重做。"""
     try:
         b64 = _shrink_to_b64(cover_path)  # v0.5 缩图避 413
         payload = {
-            "model": "GEMINI_25_FLASH",
+            "model": VISION_MODEL,
             "messages": [{
                 "role": "user",
                 "content": [
@@ -21359,7 +21536,7 @@ def _llm_check_cover_unique(cover_path: str) -> bool:
             }],
             "max_tokens": 10,
         }
-        resp = req_post("/chat/completions", payload, timeout=60)
+        resp = _vision_chat_completion(payload, timeout=60)
         verdict = resp.get("choices", [{}])[0].get("message", {}).get("content", "").strip().upper()
         log(f"[OCR 检测] 主标题: {verdict}")
         return "UNIQUE" in verdict
@@ -21378,7 +21555,7 @@ def _llm_check_cover_quality(cover_path: str, expected_footer: str = "") -> dict
         b64 = _shrink_to_b64(cover_path)  # v0.5 缩图避 413
         footer_hint = f"（应为 \"{expected_footer}\"）" if expected_footer else ""
         payload = {
-            "model": "GEMINI_25_FLASH",
+            "model": VISION_MODEL,
             "messages": [{
                 "role": "user",
                 "content": [
@@ -21394,7 +21571,7 @@ def _llm_check_cover_quality(cover_path: str, expected_footer: str = "") -> dict
             }],
             "max_tokens": 60,
         }
-        resp = req_post("/chat/completions", payload, timeout=60)
+        resp = _vision_chat_completion(payload, timeout=60)
         raw = resp.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
         s_idx = raw.find("{")
         e_idx = raw.rfind("}")
@@ -21679,7 +21856,7 @@ def _generate_cover_image(topic: str, short_title: str, script: list[dict]) -> s
         first_line = script[0]["text"] if script else ""
         try:
             _raw_ill = chat(
-                "GEMINI_25_FLASH",
+                JUDGMENT_MODEL,
                 "你是中国水墨插画师，只按严格格式输出两行。",
                 (
                     f"为短视频封面插画场景写英文描述。\n"
@@ -21693,6 +21870,7 @@ def _generate_cover_image(topic: str, short_title: str, script: list[dict]) -> s
                     f"ILLUSTRATION: <60-90 词英文插画场景描述，Kinfolk/ink-wash 风格，具体场景，匹配视觉调性，不要提主标题文字>\n"
                     f"BOTANICAL: <2-3 个英文植物名，逗号分隔，从这些挑 [{_botanical_hint}]>"
                 ),
+                fallback_route="judgment",
             )
             _illustration = "soft Chinese ink-wash watercolor scene"
             _botanical = _botanical_hint.split(",")[0].strip() if "," in _botanical_hint else _botanical_hint

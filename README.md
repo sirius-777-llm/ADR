@@ -140,7 +140,14 @@ python3 run_adr_v8.py "唐宋八大家" h --no-motion          # 罕用：HADR �
 | `ADR_DEFAULT_FEMALE_VOICE_ASSET` | `external_by2_e7gn_001` | 默认女声音色资产 |
 | `ADR_DEFAULT_VOICE_ASSET` | 空 | 全局强制默认音色资产 |
 | `ADR_MOTION_VOICE_STRICT_LOCK` | `1` | 严格锁定音色和人物性别 |
-| `ADR_CHAT_FALLBACK_MODEL` | `GEMINI_25_FLASH` | LLM 主模型遇到 5xx/下线时的备用模型 |
+| `ADR_CREATIVE_MODEL` | `GPT_5_6_SOL` | 旁白、对话、Producer Brief 与视觉导演主模型 |
+| `ADR_CREATIVE_FALLBACK_MODELS` | `CLAUDE_4_8_OPUS,GEMINI_3_7_FLASH,GEMINI_25_FLASH` | 主创节点的有序多级降级链 |
+| `ADR_JUDGMENT_MODEL` | `GEMINI_3_7_FLASH` | 题材、基调、规划、审稿及严格 JSON 任务 |
+| `ADR_JUDGMENT_FALLBACK_MODELS` | `GEMINI_25_FLASH` | 判断/JSON 节点的降级链 |
+| `ADR_VISION_MODEL` | `GEMINI_3_7_FLASH` | 分镜异常检测与封面质检 Vision 模型 |
+| `ADR_VISION_FALLBACK_MODELS` | `GEMINI_25_FLASH` | Vision 遇 5xx/模型下线时的有序降级链 |
+| `ADR_CHAT_FALLBACK_MODELS` | 空 | 任意直接 `chat()` 调用的逗号分隔多级备用；优先于旧单值 |
+| `ADR_CHAT_FALLBACK_MODEL` | `GEMINI_25_FLASH` | 旧单备用配置，仅在未设多级链时使用 |
 | `ADR_ADS_REPORTER_ALLOW_ENV` | 空 | 允许环境变量触发 reporter，默认不允许 |
 | `ADR_ADS_REPORTER` | 空 | reporter 环境开关，需配合上一项 |
 | `ADR_TG_PROGRESS_MODE` | `dashboard` | TG 推送模式：`dashboard` / `compact` / `verbose` / `silent` |
@@ -152,6 +159,10 @@ python3 run_adr_v8.py "唐宋八大家" h --no-motion          # 罕用：HADR �
 | `ADR_GPT_IMAGE2_STORYBOARD_POLL_WORKERS` | `20` | 单图 storyboard fallback 并发轮询/下载 worker 数 |
 | `ADR_MOTION_BRIDGE_REFS_SUBMIT_STAGGER` | `12` | motion bridge end keyframe 错峰提交间隔 |
 | `ADR_MOTION_BRIDGE_REFS_POLL_WORKERS` | `20` | motion bridge end keyframe 并发轮询/下载 worker 数 |
+
+2026-09-06 同 prompt 主创 A/B：`GPT_5_6_SOL` 在 22 镜视觉 JSON 中实现 22/22 对象、8/8 字段及所有 enum/字数/首尾约束通过；`CLAUDE_FABLE_5` 有超长与截断，`CLAUDE_4_8_OPUS` 出现间歇 5xx，因此未设为首选。
+
+文本降级配置优先级为：调用点显式 `fallback_models` > 全局多值 `ADR_CHAT_FALLBACK_MODELS` > 旧单值 `ADR_CHAT_FALLBACK_MODEL` > 主创/判断分档默认链。5xx 与模型下线错误会推进到下一模型；429 只在当前模型退避，不跨模型。Vision 同样遵循 429 原模型退避策略。
 
 ## Telegram 进度策略
 
